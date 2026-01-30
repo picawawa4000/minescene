@@ -20,6 +20,8 @@ let package = Package(
             name: "minescene",
             dependencies: [
                 .product(name: "VulkanBindings", package: "swift-vulkan-bindings"),
+                .product(name: "Vulkan", package: "swift-vulkan-bindings"),
+                .product(name: "SwiftSDL", package: "SwiftSDL"),
                 .product(name: "DPReader", package: "dpreader-swift")
             ]
         ),

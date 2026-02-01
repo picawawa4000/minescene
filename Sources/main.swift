@@ -66,7 +66,9 @@ let map = try BiomeMapRenderer.render(
     topLeftX: 0,
     topLeftZ: 0,
     width: 128,
-    height: 128
+    height: 128,
+    stride: 4,
+    sampleY: 256
 )
 let vertices = BiomeMapRenderer.makeVertices2D(from: map)
 

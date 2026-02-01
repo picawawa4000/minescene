@@ -89,6 +89,7 @@ struct BiomeMapRenderer {
         topLeftZ: Int,
         width: Int,
         height: Int,
+        stride: Int = 1,
         dimension: DPReader.RegistryKey<DPReader.Dimension> = DPReader.RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld"),
         sampleY: Int = 0
     ) throws -> BiomePixelMap {
@@ -99,7 +100,11 @@ struct BiomeMapRenderer {
             width: width,
             height: height,
             biomeSampler: { generator, x, z in
-                let pos = PosInt3D(x: Int32(x), y: Int32(sampleY), z: Int32(z))
+                let pos = PosInt3D(
+                    x: Int32(x),
+                    y: Int32(sampleY),
+                    z: Int32(z)
+                )
                 let biomeKey = try generator.sampleBiome(at: pos, in: dimension)
                 return biomeKey?.name ?? "unknown"
             }
@@ -112,9 +117,13 @@ struct BiomeMapRenderer {
         topLeftZ: Int,
         width: Int,
         height: Int,
+        stride: Int = 1,
         biomeSampler: (WorldGenerator, Int, Int) throws -> String
     ) throws -> BiomePixelMap {
         guard width > 0, height > 0 else {
+            throw BiomeMapRendererError.invalidSize
+        }
+        guard stride > 0 else {
             throw BiomeMapRendererError.invalidSize
         }
 
@@ -123,9 +132,11 @@ struct BiomeMapRenderer {
 
         for z in 0..<height {
             for x in 0..<width {
-                let worldX = topLeftX + x
-                let worldZ = topLeftZ + z
-                let biomeId = try biomeSampler(worldGenerator, worldX, worldZ)
+                let biomeId = try biomeSampler(
+                    worldGenerator,
+                    topLeftX + (x / stride) * stride,
+                    topLeftZ + (z / stride) * stride
+                )
                 let color = biomeColors[biomeId] ?? fallbackColor
                 pixels.append(color.0)
                 pixels.append(color.1)
@@ -158,8 +169,9 @@ struct BiomeMapRenderer {
                 let a = Float(map.pixelsRGBA8[baseIndex + 3]) / 255.0
                 let color = SIMD4<Float>(x: r, y: g, z: b, w: a)
 
+                let yFlipped = map.height - 1 - y
                 let ndcX0 = -1.0 + Float(x) * pixelWidth
-                let ndcY0 = 1.0 - Float(y) * pixelHeight
+                let ndcY0 = 1.0 - Float(yFlipped) * pixelHeight
                 let ndcX1 = ndcX0 + pixelWidth
                 let ndcY1 = ndcY0 - pixelHeight
 

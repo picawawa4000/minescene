@@ -48,12 +48,30 @@ final class VulkanEngine {
         let descriptorSetLayout: VulkanOwnedDescriptorSetLayout
         let pipelineLayout: VulkanOwnedPipelineLayout
         let pipeline: VulkanOwnedPipeline
+        let descriptorPool: VulkanOwnedDescriptorPool
+        let descriptorSet: VkDescriptorSet
+        let uniformBuffer: VulkanOwnedBuffer
+        let uniformMemory: VulkanOwnedDeviceMemory
     }
 
     struct DrawingMode3D {
         let descriptorSetLayout: VulkanOwnedDescriptorSetLayout
         let pipelineLayout: VulkanOwnedPipelineLayout
         let pipeline: VulkanOwnedPipeline?
+    }
+
+    final class VulkanOwnedDescriptorPool {
+        let descriptorPool: VkDescriptorPool
+        private let device: VkDevice
+
+        init(device: VkDevice, descriptorPool: VkDescriptorPool) {
+            self.device = device
+            self.descriptorPool = descriptorPool
+        }
+
+        deinit {
+            vkDestroyDescriptorPool(self.device, self.descriptorPool, nil)
+        }
     }
 
     let instance: VulkanInstance
@@ -91,10 +109,17 @@ final class VulkanEngine {
         fragSpirv: [UInt32],
         vertSpirv3D: [UInt32]? = nil,
         fragSpirv3D: [UInt32]? = nil,
+        validationLayers: [String]? = nil,
         desiredExtent: VkExtent2D = VkExtent2D(width: 640, height: 480)
     ) throws {
         self.instance = instance
         self.surface = surface.surface
+        let enabledValidationLayers: [String]
+#if DEBUG
+        enabledValidationLayers = validationLayers ?? ["VK_LAYER_KHRONOS_validation"]
+#else
+        enabledValidationLayers = validationLayers ?? []
+#endif
 
         let physicalDevices = try instance.enumeratePhysicalDevices()
         let selection = try VulkanEngine.selectPhysicalDevice(from: physicalDevices, surface: self.surface)
@@ -102,7 +127,8 @@ final class VulkanEngine {
         self.queueFamilyIndex = selection.queueFamilyIndex
         let deviceBundle = try VulkanEngine.createDeviceAndQueue(
             physicalDevice: self.physicalDevice,
-            queueFamilyIndex: self.queueFamilyIndex
+            queueFamilyIndex: self.queueFamilyIndex,
+            enabledLayers: enabledValidationLayers
         )
         self.device = deviceBundle.device
         self.graphicsQueue = deviceBundle.queue
@@ -143,19 +169,47 @@ final class VulkanEngine {
             device: self.device,
             descriptorSetLayout: mode2DLayout
         )
+        let mode2DDescriptorPool = try VulkanEngine.createDescriptorPool(
+            device: self.device,
+            maxSets: 1,
+            poolSizes: [
+                VkDescriptorPoolSize(type: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, descriptorCount: 1)
+            ]
+        )
+        let mode2DDescriptorSet = try VulkanEngine.allocateDescriptorSet(
+            device: self.device,
+            descriptorPool: mode2DDescriptorPool,
+            layout: mode2DLayout
+        )
+        let (mode2DUniformBuffer, mode2DUniformMemory) = try VulkanEngine.createUniformBuffer2D(
+            device: self.device,
+            physicalDevice: self.physicalDevice
+        )
+        VulkanEngine.updateDescriptorSet(
+            device: self.device,
+            descriptorSet: mode2DDescriptorSet,
+            binding: DescriptorBindings2D.transform,
+            buffer: mode2DUniformBuffer,
+            range: VkDeviceSize(MemoryLayout<Float>.size * 16)
+        )
         let pipeline2D = try VulkanEngine.createPipeline(
             device: self.device,
             renderPass: self.renderPass,
             extent: self.swapchainExtent,
             pipelineLayout: mode2DPipelineLayout,
             vertexInput: VulkanEngine.vertexInput2D(),
+            cullMode: VkCullModeFlags(VK_CULL_MODE_NONE.rawValue),
             vertSpirv: vertSpirv,
             fragSpirv: fragSpirv
         )
         self.mode2D = DrawingMode2D(
             descriptorSetLayout: mode2DLayout,
             pipelineLayout: mode2DPipelineLayout,
-            pipeline: pipeline2D
+            pipeline: pipeline2D,
+            descriptorPool: mode2DDescriptorPool,
+            descriptorSet: mode2DDescriptorSet,
+            uniformBuffer: mode2DUniformBuffer,
+            uniformMemory: mode2DUniformMemory
         )
 
         let mode3DLayout = try VulkanEngine.createDescriptorSetLayout3D(device: self.device)
@@ -171,6 +225,7 @@ final class VulkanEngine {
                 extent: self.swapchainExtent,
                 pipelineLayout: mode3DPipelineLayout,
                 vertexInput: VulkanEngine.vertexInput3D(),
+                cullMode: VkCullModeFlags(VK_CULL_MODE_BACK_BIT.rawValue),
                 vertSpirv: vertSpirv3D,
                 fragSpirv: fragSpirv3D
             )
@@ -191,6 +246,7 @@ final class VulkanEngine {
         fragSpirvPath: String,
         vertSpirv3DPath: String? = nil,
         fragSpirv3DPath: String? = nil,
+        validationLayers: [String]? = nil,
         desiredExtent: VkExtent2D = VkExtent2D(width: 640, height: 480)
     ) throws {
         let vertCode = try VulkanEngine.loadSpirvWords(from: vertSpirvPath)
@@ -204,6 +260,7 @@ final class VulkanEngine {
             fragSpirv: fragCode,
             vertSpirv3D: vertCode3D,
             fragSpirv3D: fragCode3D,
+            validationLayers: validationLayers,
             desiredExtent: desiredExtent
         )
     }
@@ -270,7 +327,8 @@ final class VulkanEngine {
 
     private static func createDeviceAndQueue(
         physicalDevice: VulkanPhysicalDevice,
-        queueFamilyIndex: UInt32
+        queueFamilyIndex: UInt32,
+        enabledLayers: [String]
     ) throws -> (device: VulkanOwnedDevice, queue: VkQueue) {
         let queuePriority: Float = 1.0
         let queueCreateInfo = withUnsafePointer(to: queuePriority) { prioritiesPtr in
@@ -285,7 +343,7 @@ final class VulkanEngine {
         let deviceExtensions = VulkanEngine.deviceExtensions(for: physicalDevice)
         let device = try physicalDevice.createDevice(
             queueCreateInfos: [queueCreateInfo],
-            enabledLayers: [],
+            enabledLayers: enabledLayers,
             enabledExtensions: deviceExtensions
         )
         let queue = device.getQueue(familyIndex: queueFamilyIndex, queueIndex: 0)
@@ -380,7 +438,7 @@ final class VulkanEngine {
             flags: 0,
             format: format,
             samples: VK_SAMPLE_COUNT_1_BIT,
-            loadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
             storeOp: VK_ATTACHMENT_STORE_OP_STORE,
             stencilLoadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             stencilStoreOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -450,6 +508,7 @@ final class VulkanEngine {
         extent: VkExtent2D,
         pipelineLayout: VulkanOwnedPipelineLayout,
         vertexInput: VertexInputDescription,
+        cullMode: VkCullModeFlags = VkCullModeFlags(VK_CULL_MODE_NONE.rawValue),
         vertSpirv: [UInt32],
         fragSpirv: [UInt32]
     ) throws -> VulkanOwnedPipeline {
@@ -513,7 +572,7 @@ final class VulkanEngine {
                 depthClampEnable: VK_FALSE,
                 rasterizerDiscardEnable: VK_FALSE,
                 polygonMode: VK_POLYGON_MODE_FILL,
-                cullMode: VkCullModeFlags(VK_CULL_MODE_BACK_BIT.rawValue),
+                cullMode: cullMode,
                 frontFace: VK_FRONT_FACE_COUNTER_CLOCKWISE,
                 depthBiasEnable: VK_FALSE,
                 depthBiasConstantFactor: 0,
@@ -731,6 +790,128 @@ final class VulkanEngine {
         }
     }
 
+    private static func createDescriptorPool(
+        device: VulkanOwnedDevice,
+        maxSets: UInt32,
+        poolSizes: [VkDescriptorPoolSize]
+    ) throws -> VulkanOwnedDescriptorPool {
+        var pool: VkDescriptorPool?
+        return try poolSizes.withUnsafeBufferPointer { poolSizesPtr in
+            var createInfo = VkDescriptorPoolCreateInfo(
+                sType: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                pNext: nil,
+                flags: 0,
+                maxSets: maxSets,
+                poolSizeCount: UInt32(poolSizesPtr.count),
+                pPoolSizes: poolSizesPtr.baseAddress
+            )
+            try VulkanEngine.vulkanResultCheck(vkCreateDescriptorPool(device.device, &createInfo, nil, &pool))
+            return VulkanOwnedDescriptorPool(device: device.device, descriptorPool: pool!)
+        }
+    }
+
+    private static func allocateDescriptorSet(
+        device: VulkanOwnedDevice,
+        descriptorPool: VulkanOwnedDescriptorPool,
+        layout: VulkanOwnedDescriptorSetLayout
+    ) throws -> VkDescriptorSet {
+        var set: VkDescriptorSet?
+        var layoutHandle: VkDescriptorSetLayout? = layout.descriptorSetLayout
+        return try withUnsafePointer(to: &layoutHandle) { layoutPtr in
+            var allocInfo = VkDescriptorSetAllocateInfo(
+                sType: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                pNext: nil,
+                descriptorPool: descriptorPool.descriptorPool,
+                descriptorSetCount: 1,
+                pSetLayouts: layoutPtr
+            )
+            try VulkanEngine.vulkanResultCheck(vkAllocateDescriptorSets(device.device, &allocInfo, &set))
+            return set!
+        }
+    }
+
+    private static func updateDescriptorSet(
+        device: VulkanOwnedDevice,
+        descriptorSet: VkDescriptorSet,
+        binding: UInt32,
+        buffer: VulkanOwnedBuffer,
+        range: VkDeviceSize
+    ) {
+        var bufferInfo = VkDescriptorBufferInfo(
+            buffer: buffer.buffer,
+            offset: 0,
+            range: range
+        )
+        withUnsafePointer(to: &bufferInfo) { bufferInfoPtr in
+            var write = VkWriteDescriptorSet(
+                sType: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                pNext: nil,
+                dstSet: descriptorSet,
+                dstBinding: binding,
+                dstArrayElement: 0,
+                descriptorCount: 1,
+                descriptorType: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                pImageInfo: nil,
+                pBufferInfo: bufferInfoPtr,
+                pTexelBufferView: nil
+            )
+            vkUpdateDescriptorSets(device.device, 1, &write, 0, nil)
+        }
+    }
+
+    private static func createUniformBuffer2D(
+        device: VulkanOwnedDevice,
+        physicalDevice: VulkanPhysicalDevice
+    ) throws -> (VulkanOwnedBuffer, VulkanOwnedDeviceMemory) {
+        let identity: [Float] = [
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        ]
+        return try createUniformBuffer(device: device, physicalDevice: physicalDevice, data: identity)
+    }
+
+    private static func createUniformBuffer<T>(
+        device: VulkanOwnedDevice,
+        physicalDevice: VulkanPhysicalDevice,
+        data: [T]
+    ) throws -> (VulkanOwnedBuffer, VulkanOwnedDeviceMemory) {
+        let bufferSize = VkDeviceSize(MemoryLayout<T>.stride * data.count)
+        var bufferCreateInfo = VkBufferCreateInfo(
+            sType: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            pNext: nil,
+            flags: 0,
+            size: bufferSize,
+            usage: VkBufferUsageFlags(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT.rawValue),
+            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            queueFamilyIndexCount: 0,
+            pQueueFamilyIndices: nil
+        )
+        let buffer = try device.createBuffer(&bufferCreateInfo)
+        let requirements = device.getBufferMemoryRequirements(buffer)
+        let memoryTypeIndex = try findMemoryTypeIndex(
+            physicalDevice,
+            typeBits: requirements.memoryTypeBits,
+            properties: VkMemoryPropertyFlags(
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.rawValue |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.rawValue
+            )
+        )
+        var allocInfo = VkMemoryAllocateInfo.create(
+            allocationSize: requirements.size,
+            memoryTypeIndex: memoryTypeIndex
+        )
+        let memory = try device.allocateMemory(&allocInfo)
+        try device.bindBufferMemory(buffer: buffer, memory: memory)
+        let mapped = try device.mapMemory(memory, offset: 0, size: bufferSize)
+        data.withUnsafeBytes { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(memory)
+        return (buffer, memory)
+    }
+
     private struct VertexInputDescription {
         let bindings: [VkVertexInputBindingDescription]
         let attributes: [VkVertexInputAttributeDescription]
@@ -808,38 +989,105 @@ final class VulkanEngine {
     }
 
     func uploadVertices2D(_ vertices: [Vertex2D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
-        try uploadVertices(vertices, pipeline: mode2D.pipeline)
+        try uploadVertices(
+            vertices,
+            pipeline: mode2D.pipeline,
+            pipelineLayout: mode2D.pipelineLayout,
+            descriptorSet: mode2D.descriptorSet
+        )
     }
 
     func uploadVertices3D(_ vertices: [Vertex3D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         guard let pipeline = mode3D.pipeline else {
             throw Errors.missing3DPipeline
         }
-        return try uploadVertices(vertices, pipeline: pipeline)
+        return try uploadVertices(
+            vertices,
+            pipeline: pipeline,
+            pipelineLayout: mode3D.pipelineLayout,
+            descriptorSet: nil
+        )
     }
 
     func uploadVertices2D(_ vertices: [Vertex2D], framebufferIndex: Int) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
-        try uploadVertices(vertices, pipeline: mode2D.pipeline, framebufferIndex: framebufferIndex)
+        try uploadVertices(
+            vertices,
+            pipeline: mode2D.pipeline,
+            pipelineLayout: mode2D.pipelineLayout,
+            descriptorSet: mode2D.descriptorSet,
+            framebufferIndex: framebufferIndex
+        )
+    }
+
+    func uploadVertices2D(
+        _ vertices: [Vertex2D],
+        framebufferIndex: Int,
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
+    ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        try uploadVertices(
+            vertices,
+            pipeline: mode2D.pipeline,
+            pipelineLayout: mode2D.pipelineLayout,
+            descriptorSet: mode2D.descriptorSet,
+            framebufferIndex: framebufferIndex,
+            waitSemaphores: waitSemaphores,
+            signalSemaphores: signalSemaphores
+        )
     }
 
     func uploadVertices3D(_ vertices: [Vertex3D], framebufferIndex: Int) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         guard let pipeline = mode3D.pipeline else {
             throw Errors.missing3DPipeline
         }
-        return try uploadVertices(vertices, pipeline: pipeline, framebufferIndex: framebufferIndex)
+        return try uploadVertices(
+            vertices,
+            pipeline: pipeline,
+            pipelineLayout: mode3D.pipelineLayout,
+            descriptorSet: nil,
+            framebufferIndex: framebufferIndex
+        )
+    }
+
+    func uploadVertices3D(
+        _ vertices: [Vertex3D],
+        framebufferIndex: Int,
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
+    ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        guard let pipeline = mode3D.pipeline else {
+            throw Errors.missing3DPipeline
+        }
+        return try uploadVertices(
+            vertices,
+            pipeline: pipeline,
+            pipelineLayout: mode3D.pipelineLayout,
+            descriptorSet: nil,
+            framebufferIndex: framebufferIndex,
+            waitSemaphores: waitSemaphores,
+            signalSemaphores: signalSemaphores
+        )
     }
 
     private func uploadVertices<T>(
         _ vertices: [T],
         pipeline: VulkanOwnedPipeline,
-        framebufferIndex: Int = 0
+        pipelineLayout: VulkanOwnedPipelineLayout,
+        descriptorSet: VkDescriptorSet?,
+        framebufferIndex: Int = 0,
+        waitSemaphores: [VkSemaphore] = [],
+        signalSemaphores: [VkSemaphore] = []
     ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         let (buffer, memory) = try createVertexBuffer(vertices)
         try drawVertices(
             buffer: buffer,
             vertexCount: UInt32(vertices.count),
             pipeline: pipeline,
-            framebufferIndex: framebufferIndex
+            pipelineLayout: pipelineLayout,
+            descriptorSet: descriptorSet,
+            framebufferIndex: framebufferIndex,
+            waitSemaphores: waitSemaphores,
+            signalSemaphores: signalSemaphores
         )
         return (buffer, memory)
     }
@@ -888,7 +1136,11 @@ final class VulkanEngine {
         buffer: VulkanOwnedBuffer,
         vertexCount: UInt32,
         pipeline: VulkanOwnedPipeline,
-        framebufferIndex: Int
+        pipelineLayout: VulkanOwnedPipelineLayout,
+        descriptorSet: VkDescriptorSet?,
+        framebufferIndex: Int,
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
     ) throws {
         guard framebufferIndex >= 0 && framebufferIndex < swapchainFramebuffers.count else {
             throw Errors.invalidFramebufferIndex
@@ -900,17 +1152,38 @@ final class VulkanEngine {
         }
 
         try commandBuffer.begin()
+        var clearValue = VkClearValue(
+            color: VkClearColorValue(float32: (0.0, 0.0, 0.9, 1.0))
+        )
         var renderPassBeginInfo = VkRenderPassBeginInfo(
             sType: VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             pNext: nil,
             renderPass: renderPass.renderPass,
             framebuffer: swapchainFramebuffers[framebufferIndex].framebuffer,
             renderArea: VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: swapchainExtent),
-            clearValueCount: 0,
+            clearValueCount: 1,
             pClearValues: nil
         )
-        commandBuffer.beginRenderPass(renderPassBeginInfo: &renderPassBeginInfo, contents: VK_SUBPASS_CONTENTS_INLINE)
+        withUnsafePointer(to: &clearValue) { clearPtr in
+            renderPassBeginInfo.pClearValues = clearPtr
+            commandBuffer.beginRenderPass(renderPassBeginInfo: &renderPassBeginInfo, contents: VK_SUBPASS_CONTENTS_INLINE)
+        }
         commandBuffer.bindPipeline(bindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline: pipeline.pipeline)
+        if let descriptorSet {
+            var set: VkDescriptorSet? = descriptorSet
+            withUnsafePointer(to: &set) { setPtr in
+                vkCmdBindDescriptorSets(
+                    commandBuffer.commandBuffer,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    pipelineLayout.pipelineLayout,
+                    0,
+                    1,
+                    setPtr,
+                    0,
+                    nil
+                )
+            }
+        }
 
         var vertexBuffer: VkBuffer? = buffer.buffer
         var offset: VkDeviceSize = 0
@@ -925,17 +1198,26 @@ final class VulkanEngine {
 
         let fence = try device.createFence()
         var commandBufferOptional: VkCommandBuffer? = commandBuffer.commandBuffer
-        try withUnsafePointer(to: &commandBufferOptional) { commandBufferPtr in
-            let submitInfo = VkSubmitInfo.create(
-                waitSemaphoreCount: 0,
-                pWaitSemaphores: nil,
-                pWaitDstStageMask: nil,
-                commandBufferCount: 1,
-                pCommandBuffers: commandBufferPtr,
-                signalSemaphoreCount: 0,
-                pSignalSemaphores: nil
-            )
-            try device.submit(queue: graphicsQueue, submits: [submitInfo], fence: fence.fence)
+        let waitOptional = waitSemaphores.map { Optional($0) }
+        let signalOptional = signalSemaphores.map { Optional($0) }
+        var waitStages = [VkPipelineStageFlags](repeating: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue, count: waitOptional.count)
+        try waitOptional.withUnsafeBufferPointer { waitPtr in
+            try waitStages.withUnsafeMutableBufferPointer { stagesPtr in
+                try signalOptional.withUnsafeBufferPointer { signalPtr in
+                    try withUnsafePointer(to: &commandBufferOptional) { commandBufferPtr in
+                        let submitInfo = VkSubmitInfo.create(
+                            waitSemaphoreCount: UInt32(waitPtr.count),
+                            pWaitSemaphores: waitPtr.baseAddress,
+                            pWaitDstStageMask: stagesPtr.baseAddress,
+                            commandBufferCount: 1,
+                            pCommandBuffers: commandBufferPtr,
+                            signalSemaphoreCount: UInt32(signalPtr.count),
+                            pSignalSemaphores: signalPtr.baseAddress
+                        )
+                        try device.submit(queue: graphicsQueue, submits: [submitInfo], fence: fence.fence)
+                    }
+                }
+            }
         }
         try device.waitForFences([fence.fence], waitAll: true, timeout: UInt64.max)
     }

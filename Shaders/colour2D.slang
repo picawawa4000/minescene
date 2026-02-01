@@ -12,14 +12,14 @@ struct VSOutput {
 
 [[vk::binding(0, 0)]]
 cbuffer Transform : register(b0) {
-    float3x3 uTransform;
+    float4x4 uTransform;
 };
 
 [shader("vertex")]
 VSOutput mainVS(VSInput input) {
-    float3 pos = mul(uTransform, float3(input.position, 1.0));
+    float4 pos = mul(uTransform, float4(input.position, 0.0, 1.0));
     VSOutput output;
-    output.position = float4(pos.x, pos.y, 0.0, 1.0);
+    output.position = pos;
     output.color = input.color;
     return output;
 }

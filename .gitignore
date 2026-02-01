@@ -10,3 +10,5 @@ Package.resolved
 .vscode
 # Compiled shaders (will ship compiled shaders eventually, but it's really not that hard to compile them yourself)
 Shaders/SPIRV
+# Extracted vanilla datapacks (obtained using the script from DPReader)
+vanilla

@@ -236,9 +236,9 @@ final class MineSceneApp {
 
         // Map-space pixels -> viewport-space (top-left origin) -> NDC.
         let sx = 2.0 / viewportW
-        let sy = -2.0 / viewportH
+        let sy = 2.0 / viewportH
         let tx = -1.0 - 2.0 * offsetPixelsX / viewportW
-        let ty = 1.0 + 2.0 * offsetPixelsZ / viewportH
+        let ty = -1.0 - 2.0 * offsetPixelsZ / viewportH
         let transform = simd_float4x4(
             SIMD4<Float>(sx, 0.0, 0.0, 0.0),
             SIMD4<Float>(0.0, sy, 0.0, 0.0),

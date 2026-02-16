@@ -4,11 +4,73 @@ import VulkanBindings
 import Vulkan
 
 final class VulkanEngine {
+    private final class Resources {
+        var commandPool: VulkanOwnedCommandPool?
+        let commandBuffer: VulkanCommandBuffer
+
+        var swapchain: VulkanOwnedSwapchain?
+        let swapchainImages: [VkImage]
+        var swapchainImageViews: [VulkanOwnedImageView]?
+        var swapchainFramebuffers: [VulkanOwnedFramebuffer]?
+        let swapchainFormat: VkFormat
+        let swapchainExtent: VkExtent2D
+
+        var renderPass: VulkanOwnedRenderPass?
+        var mode2D: DrawingMode2D?
+        var mode3D: DrawingMode3D?
+
+        init(
+            commandPool: VulkanOwnedCommandPool,
+            commandBuffer: VulkanCommandBuffer,
+            swapchain: VulkanOwnedSwapchain,
+            swapchainImages: [VkImage],
+            swapchainImageViews: [VulkanOwnedImageView],
+            swapchainFramebuffers: [VulkanOwnedFramebuffer],
+            swapchainFormat: VkFormat,
+            swapchainExtent: VkExtent2D,
+            renderPass: VulkanOwnedRenderPass,
+            mode2D: DrawingMode2D,
+            mode3D: DrawingMode3D
+        ) {
+            self.commandPool = commandPool
+            self.commandBuffer = commandBuffer
+            self.swapchain = swapchain
+            self.swapchainImages = swapchainImages
+            self.swapchainImageViews = swapchainImageViews
+            self.swapchainFramebuffers = swapchainFramebuffers
+            self.swapchainFormat = swapchainFormat
+            self.swapchainExtent = swapchainExtent
+            self.renderPass = renderPass
+            self.mode2D = mode2D
+            self.mode3D = mode3D
+        }
+
+        deinit {
+            // Explicit teardown order: pipelines -> framebuffers -> render pass -> views -> swapchain -> command pool.
+            mode3D = nil
+            mode2D = nil
+            swapchainFramebuffers = nil
+            renderPass = nil
+            swapchainImageViews = nil
+            swapchain = nil
+            commandPool = nil
+        }
+    }
+
     @inline(__always)
     private static func vulkanResultCheck(_ result: VkResult) throws {
         if result != VK_SUCCESS {
             throw Errors.vulkanFailure(result)
         }
+    }
+
+    deinit {
+        shutdown()
+    }
+
+    func shutdown() {
+        _ = vkDeviceWaitIdle(device.device)
+        resources = nil
     }
     enum DescriptorBindings2D {
         static let transform: UInt32 = 0
@@ -80,20 +142,21 @@ final class VulkanEngine {
     let device: VulkanOwnedDevice
     let graphicsQueue: VkQueue
     let queueFamilyIndex: UInt32
+    private var resources: Resources?
 
-    let commandPool: VulkanOwnedCommandPool
-    let commandBuffer: VulkanCommandBuffer
+    var commandPool: VulkanOwnedCommandPool { resources!.commandPool! }
+    var commandBuffer: VulkanCommandBuffer { resources!.commandBuffer }
 
-    let swapchain: VulkanOwnedSwapchain
-    let swapchainImages: [VkImage]
-    let swapchainImageViews: [VulkanOwnedImageView]
-    let swapchainFramebuffers: [VulkanOwnedFramebuffer]
-    let swapchainFormat: VkFormat
-    let swapchainExtent: VkExtent2D
+    var swapchain: VulkanOwnedSwapchain { resources!.swapchain! }
+    var swapchainImages: [VkImage] { resources!.swapchainImages }
+    var swapchainImageViews: [VulkanOwnedImageView] { resources!.swapchainImageViews ?? [] }
+    var swapchainFramebuffers: [VulkanOwnedFramebuffer] { resources!.swapchainFramebuffers ?? [] }
+    var swapchainFormat: VkFormat { resources!.swapchainFormat }
+    var swapchainExtent: VkExtent2D { resources!.swapchainExtent }
 
-    let renderPass: VulkanOwnedRenderPass
-    let mode2D: DrawingMode2D
-    let mode3D: DrawingMode3D
+    var renderPass: VulkanOwnedRenderPass { resources!.renderPass! }
+    var mode2D: DrawingMode2D { resources!.mode2D! }
+    var mode3D: DrawingMode3D { resources!.mode3D! }
 
     /// Creates a new Vulkan engine.
     /// Parameters:
@@ -137,8 +200,6 @@ final class VulkanEngine {
             device: self.device,
             queueFamilyIndex: self.queueFamilyIndex
         )
-        self.commandPool = commandBundle.commandPool
-        self.commandBuffer = commandBundle.commandBuffer
 
         let swapchainBundle = try VulkanEngine.createSwapchainBundle(
             device: self.device,
@@ -146,22 +207,16 @@ final class VulkanEngine {
             surface: self.surface,
             desiredExtent: desiredExtent
         )
-        self.swapchain = swapchainBundle.swapchain
-        self.swapchainImages = swapchainBundle.images
-        self.swapchainImageViews = swapchainBundle.imageViews
-        self.swapchainFormat = swapchainBundle.format
-        self.swapchainExtent = swapchainBundle.extent
-
-        self.renderPass = try VulkanEngine.createRenderPass(
+        let renderPass = try VulkanEngine.createRenderPass(
             device: self.device,
-            format: self.swapchainFormat
+            format: swapchainBundle.format
         )
 
-        self.swapchainFramebuffers = try VulkanEngine.createFramebuffers(
+        let swapchainFramebuffers = try VulkanEngine.createFramebuffers(
             device: self.device,
-            renderPass: self.renderPass,
-            imageViews: self.swapchainImageViews,
-            extent: self.swapchainExtent
+            renderPass: renderPass,
+            imageViews: swapchainBundle.imageViews,
+            extent: swapchainBundle.extent
         )
 
         let mode2DLayout = try VulkanEngine.createDescriptorSetLayout2D(device: self.device)
@@ -194,15 +249,15 @@ final class VulkanEngine {
         )
         let pipeline2D = try VulkanEngine.createPipeline(
             device: self.device,
-            renderPass: self.renderPass,
-            extent: self.swapchainExtent,
+            renderPass: renderPass,
+            extent: swapchainBundle.extent,
             pipelineLayout: mode2DPipelineLayout,
             vertexInput: VulkanEngine.vertexInput2D(),
             cullMode: VkCullModeFlags(VK_CULL_MODE_NONE.rawValue),
             vertSpirv: vertSpirv,
             fragSpirv: fragSpirv
         )
-        self.mode2D = DrawingMode2D(
+        let mode2D = DrawingMode2D(
             descriptorSetLayout: mode2DLayout,
             pipelineLayout: mode2DPipelineLayout,
             pipeline: pipeline2D,
@@ -221,8 +276,8 @@ final class VulkanEngine {
         if let vertSpirv3D, let fragSpirv3D {
             pipeline3D = try VulkanEngine.createPipeline(
                 device: self.device,
-                renderPass: self.renderPass,
-                extent: self.swapchainExtent,
+                renderPass: renderPass,
+                extent: swapchainBundle.extent,
                 pipelineLayout: mode3DPipelineLayout,
                 vertexInput: VulkanEngine.vertexInput3D(),
                 cullMode: VkCullModeFlags(VK_CULL_MODE_BACK_BIT.rawValue),
@@ -232,10 +287,24 @@ final class VulkanEngine {
         } else {
             pipeline3D = nil
         }
-        self.mode3D = DrawingMode3D(
+        let mode3D = DrawingMode3D(
             descriptorSetLayout: mode3DLayout,
             pipelineLayout: mode3DPipelineLayout,
             pipeline: pipeline3D
+        )
+
+        self.resources = Resources(
+            commandPool: commandBundle.commandPool,
+            commandBuffer: commandBundle.commandBuffer,
+            swapchain: swapchainBundle.swapchain,
+            swapchainImages: swapchainBundle.images,
+            swapchainImageViews: swapchainBundle.imageViews,
+            swapchainFramebuffers: swapchainFramebuffers,
+            swapchainFormat: swapchainBundle.format,
+            swapchainExtent: swapchainBundle.extent,
+            renderPass: renderPass,
+            mode2D: mode2D,
+            mode3D: mode3D
         )
     }
 
@@ -269,8 +338,8 @@ final class VulkanEngine {
         let extensions = physicalDevice.enumerateDeviceExtensionProperties()
         let available = Set(extensions.map { extensionNameString($0) })
         var enabled = [VK_KHR_SWAPCHAIN_EXTENSION_NAME]
-        if available.contains(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) {
-            enabled.append(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)
+        if available.contains("VK_KHR_portability_subset") {
+            enabled.append("VK_KHR_portability_subset")
         }
         return enabled
     }
@@ -1067,6 +1136,16 @@ final class VulkanEngine {
             waitSemaphores: waitSemaphores,
             signalSemaphores: signalSemaphores
         )
+    }
+
+    func updateTransform2D(_ transform: simd_float4x4) throws {
+        let size = VkDeviceSize(MemoryLayout<simd_float4x4>.size)
+        let mapped = try device.mapMemory(mode2D.uniformMemory, offset: 0, size: size)
+        var local = transform
+        withUnsafeBytes(of: &local) { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(mode2D.uniformMemory)
     }
 
     private func uploadVertices<T>(

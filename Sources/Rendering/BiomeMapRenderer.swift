@@ -453,8 +453,7 @@ struct BiomeMapRenderer {
                 let color = SIMD4<Float>(x: r, y: g, z: b, w: a)
 
                 let px0 = Float(x)
-                // Keep world Z increasing downward while matching screen-space row order.
-                let py0 = Float(map.height - y - 1)
+                let py0 = Float(y)
                 let px1 = px0 + 1.0
                 let py1 = py0 + 1.0
 

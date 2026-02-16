@@ -163,12 +163,14 @@ final class MineSceneApp {
                 let x = state.mouseX
                 let y = state.mouseY
                 let dx = x - state.lastMouseX
-                let dy = y - state.lastMouseY
-                if dx != 0 || dy != 0 {
+                let invertedY = -y
+                let invertedLastY = -state.lastMouseY
+                let dz = invertedY - invertedLastY
+                if dx != 0 || dz != 0 {
                     state.lastMouseX = x
                     state.lastMouseY = y
                     state.topLeftX -= dx * state.scale
-                    state.topLeftZ += dy * state.scale
+                    state.topLeftZ -= dz * state.scale
                     state.dirty = true
                 }
             }

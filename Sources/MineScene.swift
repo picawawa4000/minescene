@@ -170,7 +170,7 @@ final class MineSceneApp {
                     state.lastMouseX = x
                     state.lastMouseY = y
                     state.topLeftX -= dx * state.scale
-                    state.topLeftZ -= dz * state.scale
+                    state.topLeftZ += dz * state.scale
                     state.dirty = true
                 }
             }

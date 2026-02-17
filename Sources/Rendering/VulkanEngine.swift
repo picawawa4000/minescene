@@ -92,6 +92,11 @@ final class VulkanEngine {
         var color: SIMD4<Float>
     }
 
+    struct DrawBatch2D {
+        let buffer: VulkanOwnedBuffer
+        let vertexCount: UInt32
+    }
+
     final class VulkanOwnedDescriptorSetLayout {
         let descriptorSetLayout: VkDescriptorSetLayout
         private let device: VkDevice
@@ -1066,6 +1071,28 @@ final class VulkanEngine {
         )
     }
 
+    func createVertexBuffer2D(_ vertices: [Vertex2D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        try createVertexBuffer(vertices)
+    }
+
+    func drawBatches2D(
+        _ batches: [DrawBatch2D],
+        framebufferIndex: Int,
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
+    ) throws {
+        let internalBatches = batches.map { ($0.buffer, $0.vertexCount) }
+        try drawVertexBuffers(
+            buffers: internalBatches,
+            pipeline: mode2D.pipeline,
+            pipelineLayout: mode2D.pipelineLayout,
+            descriptorSet: mode2D.descriptorSet,
+            framebufferIndex: framebufferIndex,
+            waitSemaphores: waitSemaphores,
+            signalSemaphores: signalSemaphores
+        )
+    }
+
     func uploadVertices3D(_ vertices: [Vertex3D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         guard let pipeline = mode3D.pipeline else {
             throw Errors.missing3DPipeline
@@ -1158,9 +1185,8 @@ final class VulkanEngine {
         signalSemaphores: [VkSemaphore] = []
     ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         let (buffer, memory) = try createVertexBuffer(vertices)
-        try drawVertices(
-            buffer: buffer,
-            vertexCount: UInt32(vertices.count),
+        try drawVertexBuffers(
+            buffers: [(buffer, UInt32(vertices.count))],
             pipeline: pipeline,
             pipelineLayout: pipelineLayout,
             descriptorSet: descriptorSet,
@@ -1211,9 +1237,8 @@ final class VulkanEngine {
         return (buffer, memory)
     }
 
-    private func drawVertices(
-        buffer: VulkanOwnedBuffer,
-        vertexCount: UInt32,
+    private func drawVertexBuffers(
+        buffers: [(buffer: VulkanOwnedBuffer, vertexCount: UInt32)],
         pipeline: VulkanOwnedPipeline,
         pipelineLayout: VulkanOwnedPipelineLayout,
         descriptorSet: VkDescriptorSet?,
@@ -1221,6 +1246,9 @@ final class VulkanEngine {
         waitSemaphores: [VkSemaphore],
         signalSemaphores: [VkSemaphore]
     ) throws {
+        guard !buffers.isEmpty else {
+            return
+        }
         guard framebufferIndex >= 0 && framebufferIndex < swapchainFramebuffers.count else {
             throw Errors.invalidFramebufferIndex
         }
@@ -1264,14 +1292,16 @@ final class VulkanEngine {
             }
         }
 
-        var vertexBuffer: VkBuffer? = buffer.buffer
-        var offset: VkDeviceSize = 0
-        withUnsafePointer(to: &vertexBuffer) { bufferPtr in
-            withUnsafePointer(to: &offset) { offsetPtr in
-                vkCmdBindVertexBuffers(commandBuffer.commandBuffer, 0, 1, bufferPtr, offsetPtr)
+        for batch in buffers where batch.vertexCount > 0 {
+            var vertexBuffer: VkBuffer? = batch.buffer.buffer
+            var offset: VkDeviceSize = 0
+            withUnsafePointer(to: &vertexBuffer) { bufferPtr in
+                withUnsafePointer(to: &offset) { offsetPtr in
+                    vkCmdBindVertexBuffers(commandBuffer.commandBuffer, 0, 1, bufferPtr, offsetPtr)
+                }
             }
+            commandBuffer.draw(vertexCount: batch.vertexCount)
         }
-        commandBuffer.draw(vertexCount: vertexCount)
         commandBuffer.endRenderPass()
         try commandBuffer.end()
 

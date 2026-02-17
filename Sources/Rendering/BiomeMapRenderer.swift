@@ -15,14 +15,44 @@ enum BiomeMapRendererError: Error {
 
 final class BiomeQuadTreeCache {
     struct TreeKey: Hashable {
-        let scale: Int
         let sampleY: Int
+    }
+
+    private struct TileCoord: Hashable {
+        let x: Int
+        let z: Int
     }
 
     struct PendingKey: Hashable {
         let tileXIndex: Int
         let tileZIndex: Int
         let tree: TreeKey
+    }
+
+    private struct ProfileTotals {
+        var fillCalls: Int = 0
+        var fillTotalNs: UInt64 = 0
+        var fillSnapshotNs: UInt64 = 0
+        var fillSampleNs: UInt64 = 0
+        var fillMissingTiles: Int = 0
+        var fillVisibleTiles: Int = 0
+        var verticesCalls: Int = 0
+        var verticesBuildNs: UInt64 = 0
+        var verticesBuilt: Int = 0
+        var batchesScheduled: Int = 0
+        var tilesScheduled: Int = 0
+        var boundingTilesScheduled: Int = 0
+        var batchesCompleted: Int = 0
+        var tilesCompleted: Int = 0
+        var boundingTilesCompleted: Int = 0
+        var batchesFailed: Int = 0
+        var batchRenderNs: UInt64 = 0
+        var batchInsertNs: UInt64 = 0
+        var lastReportNs: UInt64
+
+        init(nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+            self.lastReportNs = nowNs
+        }
     }
 
     private final class QuadNode {
@@ -118,15 +148,32 @@ final class BiomeQuadTreeCache {
     }
 
     let tileSize: Int
+    let baseScale: Int
     private let lockQueue = DispatchQueue(label: "BiomeTileCache.lock", attributes: .concurrent)
     private let workerQueue = DispatchQueue(label: "BiomeTileCache.worker", qos: .userInitiated)
+    private let profileQueue = DispatchQueue(label: "BiomeTileCache.profile")
     private var trees: [TreeKey: QuadTree] = [:]
     private var pending: Set<PendingKey> = []
     private var version: UInt64 = 0
+    private var profileTotals = ProfileTotals()
+    private let profilingEnabled: Bool = {
+        #if DEBUG
+        true
+        #else
+        ProcessInfo.processInfo.environment["MINESCENE_PROFILE"] == "1"
+        #endif
+    }()
+    private let profileReportIntervalNs: UInt64 = 2_000_000_000
     private let placeholderColor: (UInt8, UInt8, UInt8, UInt8) = (255, 0, 255, 255)
 
-    init(tileSize: Int = 256) {
+    init(tileSize: Int = 256, baseScale: Int = 4) {
         self.tileSize = tileSize
+        self.baseScale = max(1, baseScale)
+    }
+
+    func currentVersion(sampleY: Int = 256) -> UInt64 {
+        _ = sampleY
+        return lockQueue.sync { version }
     }
 
     func mapAsync(
@@ -145,108 +192,285 @@ final class BiomeQuadTreeCache {
             throw BiomeMapRendererError.invalidSize
         }
 
-        let treeKey = TreeKey(scale: scale, sampleY: sampleY)
-        let tileWorldSize = tileSize * scale
-        let tileOriginXIndex = BiomeQuadTreeCache.floorDiv(topLeftX, tileWorldSize)
-        let tileOriginZIndex = BiomeQuadTreeCache.floorDiv(topLeftZ, tileWorldSize)
-        let tileOriginX = tileOriginXIndex * tileWorldSize
-        let tileOriginZ = tileOriginZIndex * tileWorldSize
-        let tilesX = (width + tileSize - 1) / tileSize
-        let tilesZ = (height + tileSize - 1) / tileSize
+        let treeKey = TreeKey(sampleY: sampleY)
+        let tileOriginX = topLeftX
+        let tileOriginZ = topLeftZ
 
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        var isComplete = true
-
-        for tz in 0..<tilesZ {
-            for tx in 0..<tilesX {
-                let tileXIndex = tileOriginXIndex + tx
-                let tileZIndex = tileOriginZIndex + tz
-                let tileWorldX = tileXIndex * tileWorldSize
-                let tileWorldZ = tileZIndex * tileWorldSize
-                let tile: BiomePixelMap?
-                tile = lockQueue.sync {
-                    trees[treeKey]?.value(at: tileXIndex, tileZIndex)
-                }
-                if tile == nil {
-                    isComplete = false
-                    scheduleTileGeneration(
-                        tileXIndex: tileXIndex,
-                        tileZIndex: tileZIndex,
-                        treeKey: treeKey,
-                        worldGenerator: worldGenerator,
-                        topLeftX: tileWorldX,
-                        topLeftZ: tileWorldZ,
-                        scale: scale,
-                        sampleY: sampleY
-                    )
-                }
-
-                let copyWidth = min(tileSize, width - tx * tileSize)
-                let copyHeight = min(tileSize, height - tz * tileSize)
-                for y in 0..<copyHeight {
-                    let destRow = (tz * tileSize + y) * width * 4
-                    let destStart = destRow + tx * tileSize * 4
-                    let count = copyWidth * 4
-                    if let tile {
-                        let srcRow = y * tile.width * 4
-                        let srcStart = srcRow
-                        pixels.replaceSubrange(destStart..<(destStart + count), with: tile.pixelsRGBA8[srcStart..<(srcStart + count)])
-                    } else {
-                        for i in 0..<copyWidth {
-                            let base = destStart + i * 4
-                            pixels[base] = placeholderColor.0
-                            pixels[base + 1] = placeholderColor.1
-                            pixels[base + 2] = placeholderColor.2
-                            pixels[base + 3] = placeholderColor.3
-                        }
-                    }
-                }
-            }
-        }
+        let isComplete = fillPixelsFromTiles(
+            worldGenerator: worldGenerator,
+            treeKey: treeKey,
+            topLeftX: topLeftX,
+            topLeftZ: topLeftZ,
+            width: width,
+            height: height,
+            scale: scale,
+            sampleY: sampleY,
+            pixels: &pixels
+        )
 
         let map = BiomePixelMap(width: width, height: height, pixelsRGBA8: pixels)
         let currentVersion = lockQueue.sync { version }
         return (map, tileOriginX, tileOriginZ, currentVersion, isComplete)
     }
 
-    private func scheduleTileGeneration(
-        tileXIndex: Int,
-        tileZIndex: Int,
-        treeKey: TreeKey,
+    func verticesAsync(
         worldGenerator: WorldGenerator,
         topLeftX: Int,
         topLeftZ: Int,
+        width: Int,
+        height: Int,
         scale: Int,
-        sampleY: Int
-    ) {
-        let pendingKey = PendingKey(tileXIndex: tileXIndex, tileZIndex: tileZIndex, tree: treeKey)
-        let shouldSchedule: Bool = lockQueue.sync { !pending.contains(pendingKey) }
-        guard shouldSchedule else { return }
-        lockQueue.async(flags: .barrier) {
-            self.pending.insert(pendingKey)
+        sampleY: Int = 256
+    ) throws -> (vertices: [VulkanEngine.Vertex2D], tileOriginX: Int, tileOriginZ: Int, version: UInt64, isComplete: Bool) {
+        guard width > 0, height > 0 else {
+            throw BiomeMapRendererError.invalidSize
         }
-        workerQueue.async { [weak self] in
-            guard let self else { return }
-            let generated: BiomePixelMap?
-            generated = try? BiomeMapRenderer.render(
+        guard scale > 0 else {
+            throw BiomeMapRendererError.invalidSize
+        }
+
+        let treeKey = TreeKey(sampleY: sampleY)
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let isComplete = fillPixelsFromTiles(
+            worldGenerator: worldGenerator,
+            treeKey: treeKey,
+            topLeftX: topLeftX,
+            topLeftZ: topLeftZ,
+            width: width,
+            height: height,
+            scale: scale,
+            sampleY: sampleY,
+            pixels: &pixels
+        )
+
+        var vertices: [VulkanEngine.Vertex2D] = []
+        vertices.reserveCapacity(width * height * 6)
+        let vertexBuildStartNs = DispatchTime.now().uptimeNanoseconds
+
+        for y in 0..<height {
+            for x in 0..<width {
+                let baseIndex = (y * width + x) * 4
+                let r = Float(pixels[baseIndex]) / 255.0
+                let g = Float(pixels[baseIndex + 1]) / 255.0
+                let b = Float(pixels[baseIndex + 2]) / 255.0
+                let a = Float(pixels[baseIndex + 3]) / 255.0
+                let color = SIMD4<Float>(x: r, y: g, z: b, w: a)
+
+                let px0 = Float(x)
+                let py0 = Float(y)
+                let px1 = px0 + 1.0
+                let py1 = py0 + 1.0
+
+                vertices.append(.init(position: SIMD2<Float>(x: px0, y: py1), color: color))
+                vertices.append(.init(position: SIMD2<Float>(x: px1, y: py1), color: color))
+                vertices.append(.init(position: SIMD2<Float>(x: px1, y: py0), color: color))
+                vertices.append(.init(position: SIMD2<Float>(x: px0, y: py1), color: color))
+                vertices.append(.init(position: SIMD2<Float>(x: px1, y: py0), color: color))
+                vertices.append(.init(position: SIMD2<Float>(x: px0, y: py0), color: color))
+            }
+        }
+        let vertexBuildNs = DispatchTime.now().uptimeNanoseconds - vertexBuildStartNs
+        recordVertexBuildProfile(vertexCount: vertices.count, elapsedNs: vertexBuildNs)
+
+        let currentVersion = lockQueue.sync { version }
+        return (vertices, topLeftX, topLeftZ, currentVersion, isComplete)
+    }
+
+    private func fillPixelsFromTiles(
+        worldGenerator: WorldGenerator,
+        treeKey: TreeKey,
+        topLeftX: Int,
+        topLeftZ: Int,
+        width: Int,
+        height: Int,
+        scale: Int,
+        sampleY: Int,
+        pixels: inout [UInt8]
+    ) -> Bool {
+        let fillStartNs = DispatchTime.now().uptimeNanoseconds
+        let tileWorldSize = tileSize * baseScale
+        let maxWorldX = topLeftX + max(0, width - 1) * scale
+        let maxWorldZ = topLeftZ + max(0, height - 1) * scale
+        let minTileX = BiomeQuadTreeCache.floorDiv(topLeftX, tileWorldSize)
+        let maxTileX = BiomeQuadTreeCache.floorDiv(maxWorldX, tileWorldSize)
+        let minTileZ = BiomeQuadTreeCache.floorDiv(topLeftZ, tileWorldSize)
+        let maxTileZ = BiomeQuadTreeCache.floorDiv(maxWorldZ, tileWorldSize)
+
+        var hasMissingTiles = false
+        var cachedTiles: [TileCoord: BiomePixelMap] = [:]
+        var tilesToSchedule: [TileCoord] = []
+        cachedTiles.reserveCapacity((maxTileX - minTileX + 1) * (maxTileZ - minTileZ + 1))
+
+        let snapshotStartNs = DispatchTime.now().uptimeNanoseconds
+        lockQueue.sync {
+            let tree = trees[treeKey]
+            for tileZIndex in minTileZ...maxTileZ {
+                for tileXIndex in minTileX...maxTileX {
+                    let key = TileCoord(x: tileXIndex, z: tileZIndex)
+                    if let tile = tree?.value(at: tileXIndex, tileZIndex) {
+                        cachedTiles[key] = tile
+                    } else {
+                        hasMissingTiles = true
+                        let pendingKey = PendingKey(tileXIndex: tileXIndex, tileZIndex: tileZIndex, tree: treeKey)
+                        if !pending.contains(pendingKey) {
+                            tilesToSchedule.append(key)
+                        }
+                    }
+                }
+            }
+        }
+        let snapshotNs = DispatchTime.now().uptimeNanoseconds - snapshotStartNs
+
+        if !tilesToSchedule.isEmpty {
+            scheduleTileGenerationBatch(
+                tileCoords: tilesToSchedule,
+                treeKey: treeKey,
                 worldGenerator: worldGenerator,
-                topLeftX: topLeftX,
-                topLeftZ: topLeftZ,
-                width: self.tileSize,
-                height: self.tileSize,
-                scale: scale,
                 sampleY: sampleY
             )
+        }
+
+        let samplingStartNs = DispatchTime.now().uptimeNanoseconds
+        let localStep = max(1, scale / baseScale)
+        for y in 0..<height {
+            let worldZ = topLeftZ + y * scale
+            let tileZIndex = BiomeQuadTreeCache.floorDiv(worldZ, tileWorldSize)
+            let localZ = BiomeQuadTreeCache.floorMod(worldZ, tileWorldSize) / baseScale
+            var tileXIndex = BiomeQuadTreeCache.floorDiv(topLeftX, tileWorldSize)
+            var localX = BiomeQuadTreeCache.floorMod(topLeftX, tileWorldSize) / baseScale
+            var cachedTileXIndex = Int.min
+            var rowTile: BiomePixelMap?
+            for x in 0..<width {
+                if tileXIndex != cachedTileXIndex {
+                    cachedTileXIndex = tileXIndex
+                    rowTile = cachedTiles[TileCoord(x: tileXIndex, z: tileZIndex)]
+                }
+                let base = (y * width + x) * 4
+
+                if let tile = rowTile {
+                    let srcBase = (localZ * tile.width + localX) * 4
+                    pixels[base] = tile.pixelsRGBA8[srcBase]
+                    pixels[base + 1] = tile.pixelsRGBA8[srcBase + 1]
+                    pixels[base + 2] = tile.pixelsRGBA8[srcBase + 2]
+                    pixels[base + 3] = tile.pixelsRGBA8[srcBase + 3]
+                } else {
+                    pixels[base] = placeholderColor.0
+                    pixels[base + 1] = placeholderColor.1
+                    pixels[base + 2] = placeholderColor.2
+                    pixels[base + 3] = placeholderColor.3
+                }
+
+                localX += localStep
+                if localX >= tileSize {
+                    localX -= tileSize
+                    tileXIndex += 1
+                }
+            }
+        }
+        let samplingNs = DispatchTime.now().uptimeNanoseconds - samplingStartNs
+        let visibleTiles = (maxTileX - minTileX + 1) * (maxTileZ - minTileZ + 1)
+        let missingTiles = max(0, visibleTiles - cachedTiles.count)
+        let totalNs = DispatchTime.now().uptimeNanoseconds - fillStartNs
+        recordFillProfile(
+            totalNs: totalNs,
+            snapshotNs: snapshotNs,
+            sampleNs: samplingNs,
+            missingTiles: missingTiles,
+            visibleTiles: visibleTiles
+        )
+
+        return !hasMissingTiles
+    }
+
+    private func scheduleTileGenerationBatch(
+        tileCoords: [TileCoord],
+        treeKey: TreeKey,
+        worldGenerator: WorldGenerator,
+        sampleY: Int
+    ) {
+        guard !tileCoords.isEmpty else { return }
+
+        let minTileX = tileCoords.map(\.x).min()!
+        let maxTileX = tileCoords.map(\.x).max()!
+        let minTileZ = tileCoords.map(\.z).min()!
+        let maxTileZ = tileCoords.map(\.z).max()!
+        let regionTileWidth = maxTileX - minTileX + 1
+        let regionTileHeight = maxTileZ - minTileZ + 1
+        let regionTileCount = regionTileWidth * regionTileHeight
+        let regionTopLeftX = minTileX * tileSize * baseScale
+        let regionTopLeftZ = minTileZ * tileSize * baseScale
+        let tileCoordsSet = Set(tileCoords)
+        recordBatchScheduled(tileCount: tileCoords.count, boundingTileCount: regionTileCount)
+
+        lockQueue.sync(flags: .barrier) {
+            for coord in tileCoords {
+                pending.insert(PendingKey(tileXIndex: coord.x, tileZIndex: coord.z, tree: treeKey))
+            }
+        }
+
+        workerQueue.async { [weak self] in
+            guard let self else { return }
+            let renderStartNs = DispatchTime.now().uptimeNanoseconds
+            let generated = try? BiomeMapRenderer.render(
+                worldGenerator: worldGenerator,
+                topLeftX: regionTopLeftX,
+                topLeftZ: regionTopLeftZ,
+                width: regionTileWidth * self.tileSize,
+                height: regionTileHeight * self.tileSize,
+                scale: self.baseScale,
+                sampleY: sampleY
+            )
+            let renderNs = DispatchTime.now().uptimeNanoseconds - renderStartNs
             self.lockQueue.async(flags: .barrier) {
+                let insertStartNs = DispatchTime.now().uptimeNanoseconds
                 if let generated {
                     let tree = self.trees[treeKey] ?? QuadTree()
-                    tree.insert(generated, at: tileXIndex, tileZIndex)
+                    for tileZ in minTileZ...maxTileZ {
+                        for tileX in minTileX...maxTileX {
+                            let coord = TileCoord(x: tileX, z: tileZ)
+                            if !tileCoordsSet.contains(coord) {
+                                continue
+                            }
+                            let tile = self.extractTile(
+                                from: generated,
+                                tileXOffset: tileX - minTileX,
+                                tileZOffset: tileZ - minTileZ
+                            )
+                            tree.insert(tile, at: tileX, tileZ)
+                        }
+                    }
                     self.trees[treeKey] = tree
                     self.version &+= 1
                 }
-                self.pending.remove(pendingKey)
+                for coord in tileCoords {
+                    self.pending.remove(PendingKey(tileXIndex: coord.x, tileZIndex: coord.z, tree: treeKey))
+                }
+                let insertNs = DispatchTime.now().uptimeNanoseconds - insertStartNs
+                self.recordBatchCompleted(
+                    tileCount: tileCoords.count,
+                    boundingTileCount: regionTileCount,
+                    renderNs: renderNs,
+                    insertNs: insertNs,
+                    success: generated != nil
+                )
             }
         }
+    }
+
+    private func extractTile(
+        from source: BiomePixelMap,
+        tileXOffset: Int,
+        tileZOffset: Int
+    ) -> BiomePixelMap {
+        var tilePixels = [UInt8](repeating: 0, count: tileSize * tileSize * 4)
+        for row in 0..<tileSize {
+            let srcStart = (((tileZOffset * tileSize) + row) * source.width + tileXOffset * tileSize) * 4
+            let srcEnd = srcStart + tileSize * 4
+            let dstStart = row * tileSize * 4
+            tilePixels.replaceSubrange(dstStart..<(dstStart + tileSize * 4), with: source.pixelsRGBA8[srcStart..<srcEnd])
+        }
+        return BiomePixelMap(width: tileSize, height: tileSize, pixelsRGBA8: tilePixels)
     }
 
     private static func floorDiv(_ value: Int, _ divisor: Int) -> Int {
@@ -255,9 +479,146 @@ final class BiomeQuadTreeCache {
         }
         return -(((-value) + divisor - 1) / divisor)
     }
+
+    private static func floorMod(_ value: Int, _ divisor: Int) -> Int {
+        let result = value % divisor
+        return result >= 0 ? result : result + divisor
+    }
+
+    private func recordFillProfile(
+        totalNs: UInt64,
+        snapshotNs: UInt64,
+        sampleNs: UInt64,
+        missingTiles: Int,
+        visibleTiles: Int
+    ) {
+        guard profilingEnabled else { return }
+        profileQueue.async {
+            self.profileTotals.fillCalls += 1
+            self.profileTotals.fillTotalNs += totalNs
+            self.profileTotals.fillSnapshotNs += snapshotNs
+            self.profileTotals.fillSampleNs += sampleNs
+            self.profileTotals.fillMissingTiles += missingTiles
+            self.profileTotals.fillVisibleTiles += visibleTiles
+            self.maybeReportProfileLocked(nowNs: DispatchTime.now().uptimeNanoseconds)
+        }
+    }
+
+    private func recordVertexBuildProfile(vertexCount: Int, elapsedNs: UInt64) {
+        guard profilingEnabled else { return }
+        profileQueue.async {
+            self.profileTotals.verticesCalls += 1
+            self.profileTotals.verticesBuildNs += elapsedNs
+            self.profileTotals.verticesBuilt += vertexCount
+            self.maybeReportProfileLocked(nowNs: DispatchTime.now().uptimeNanoseconds)
+        }
+    }
+
+    private func recordBatchScheduled(tileCount: Int, boundingTileCount: Int) {
+        guard profilingEnabled else { return }
+        profileQueue.async {
+            self.profileTotals.batchesScheduled += 1
+            self.profileTotals.tilesScheduled += tileCount
+            self.profileTotals.boundingTilesScheduled += boundingTileCount
+            self.maybeReportProfileLocked(nowNs: DispatchTime.now().uptimeNanoseconds)
+        }
+    }
+
+    private func recordBatchCompleted(
+        tileCount: Int,
+        boundingTileCount: Int,
+        renderNs: UInt64,
+        insertNs: UInt64,
+        success: Bool
+    ) {
+        guard profilingEnabled else { return }
+        profileQueue.async {
+            self.profileTotals.batchesCompleted += 1
+            self.profileTotals.tilesCompleted += tileCount
+            self.profileTotals.boundingTilesCompleted += boundingTileCount
+            self.profileTotals.batchRenderNs += renderNs
+            self.profileTotals.batchInsertNs += insertNs
+            if !success {
+                self.profileTotals.batchesFailed += 1
+            }
+            self.maybeReportProfileLocked(nowNs: DispatchTime.now().uptimeNanoseconds)
+        }
+    }
+
+    private func maybeReportProfileLocked(nowNs: UInt64) {
+        guard nowNs - profileTotals.lastReportNs >= profileReportIntervalNs else { return }
+
+        let fillCalls = max(1, profileTotals.fillCalls)
+        let batchesCompleted = max(1, profileTotals.batchesCompleted)
+        let avgFillMs = Self.nsToMs(profileTotals.fillTotalNs) / Double(fillCalls)
+        let avgSnapshotMs = Self.nsToMs(profileTotals.fillSnapshotNs) / Double(fillCalls)
+        let avgSampleMs = Self.nsToMs(profileTotals.fillSampleNs) / Double(fillCalls)
+        let avgMissingPct = profileTotals.fillVisibleTiles > 0
+            ? 100.0 * Double(profileTotals.fillMissingTiles) / Double(profileTotals.fillVisibleTiles)
+            : 0.0
+        let avgRenderMs = Self.nsToMs(profileTotals.batchRenderNs) / Double(batchesCompleted)
+        let avgInsertMs = Self.nsToMs(profileTotals.batchInsertNs) / Double(batchesCompleted)
+        let avgBatchCoveragePct = profileTotals.boundingTilesCompleted > 0
+            ? 100.0 * Double(profileTotals.tilesCompleted) / Double(profileTotals.boundingTilesCompleted)
+            : 100.0
+        let verticesCalls = max(1, profileTotals.verticesCalls)
+        let avgVerticesBuildMs = Self.nsToMs(profileTotals.verticesBuildNs) / Double(verticesCalls)
+        let avgVerticesCount = Double(profileTotals.verticesBuilt) / Double(verticesCalls)
+
+        let line = String(
+            format: "[Profiler][BiomeCache] fill:%d avg=%.2fms (snapshot=%.2fms sample=%.2fms missing=%.1f%%) vertices:%d avgBuild=%.2fms avgCount=%.0f queued:%d/%dtiles (bbox=%d) completed:%d/%dtiles (bbox=%d coverage=%.1f%%) failed:%d batch(avg render=%.2fms insert=%.2fms)",
+            profileTotals.fillCalls,
+            avgFillMs,
+            avgSnapshotMs,
+            avgSampleMs,
+            avgMissingPct,
+            profileTotals.verticesCalls,
+            avgVerticesBuildMs,
+            avgVerticesCount,
+            profileTotals.batchesScheduled,
+            profileTotals.tilesScheduled,
+            profileTotals.boundingTilesScheduled,
+            profileTotals.batchesCompleted,
+            profileTotals.tilesCompleted,
+            profileTotals.boundingTilesCompleted,
+            avgBatchCoveragePct,
+            profileTotals.batchesFailed,
+            avgRenderMs,
+            avgInsertMs
+        )
+        print(line)
+        profileTotals = ProfileTotals(nowNs: nowNs)
+    }
+
+    private static func nsToMs(_ ns: UInt64) -> Double {
+        Double(ns) / 1_000_000.0
+    }
 }
 
 struct BiomeMapRenderer {
+    private struct RenderProfileTotals {
+        var calls: Int = 0
+        var totalNs: UInt64 = 0
+        var generateNs: UInt64 = 0
+        var mapNs: UInt64 = 0
+        var samples: Int = 0
+        var lastReportNs: UInt64
+
+        init(nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+            self.lastReportNs = nowNs
+        }
+    }
+
+    private static let renderProfileQueue = DispatchQueue(label: "BiomeMapRenderer.profile")
+    private static let renderProfilingEnabled: Bool = {
+        #if DEBUG
+        true
+        #else
+        ProcessInfo.processInfo.environment["MINESCENE_PROFILE"] == "1"
+        #endif
+    }()
+    private static let renderProfileIntervalNs: UInt64 = 2_000_000_000
+
     private static let biomeColors: [String: (UInt8, UInt8, UInt8, UInt8)] = [
         "minecraft:badlands": (200, 120, 60, 255),
         "minecraft:bamboo_jungle": (40, 170, 70, 255),
@@ -334,6 +695,7 @@ struct BiomeMapRenderer {
         width: Int,
         height: Int,
         scale: Int = 4,
+        forceNoBaking: Bool = false,
         dimension: DPReader.RegistryKey<DPReader.Dimension> = DPReader.RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld"),
         sampleY: Int = 256
     ) throws -> BiomePixelMap {
@@ -357,14 +719,14 @@ struct BiomeMapRenderer {
         let alignedToZ = Int(toScaledZ * scaleI)
 
         let fromPos = makePosInt2D(x: alignedFromX, z: alignedFromZ)
-        let toPos = makePosInt2D(x: alignedToX, z: alignedToZ)
-        let overworld = DPReader.RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld")
+        let toPos: PosInt2D = makePosInt2D(x: alignedToX, z: alignedToZ)
         let biomes = try worldGenerator.generateBiomesInSquare(
             from: fromPos,
             to: toPos,
             atY: Int32(sampleY),
-            in: overworld,
-            scale: Int32(scale)
+            in: RegistryKey(referencing: "minecraft:overworld"),
+            scale: Int32(scale),
+            forceNoBaking: forceNoBaking
         )
 
         let sampleWidth = Int(toScaledX - fromScaledX)

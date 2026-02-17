@@ -21,15 +21,30 @@ final class MineSceneApp {
     }
 
     private struct State {
-        var topLeftX: Int = 0
-        var topLeftZ: Int = 0
-        var scale: Int = 4
+        var topLeftX: Double = 0
+        var topLeftZ: Double = 0
+        var zoom: Double = 4
         var dragging = false
         var lastMouseX = 0
         var lastMouseY = 0
         var mouseX = 0
         var mouseY = 0
         var dirty = true
+    }
+
+    private struct FrameProfileTotals {
+        var frames: Int = 0
+        var totalNs: UInt64 = 0
+        var tileFetchNs: UInt64 = 0
+        var hoverLookupNs: UInt64 = 0
+        var uploadNs: UInt64 = 0
+        var presentNs: UInt64 = 0
+        var waitIdleNs: UInt64 = 0
+        var lastReportNs: UInt64
+
+        init(nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+            self.lastReportNs = nowNs
+        }
     }
 
     private var state = State()
@@ -48,7 +63,22 @@ final class MineSceneApp {
     private var cachedTileOriginZ = 0
     private var cachedScale = 0
     private var cachedVersion: UInt64 = 0
-    private var cachedVertices: [VulkanEngine.Vertex2D] = []
+    private var cachedMapVertexBuffer: VulkanOwnedBuffer?
+    private var cachedMapVertexMemory: VulkanOwnedDeviceMemory?
+    private var cachedMapVertexCount: UInt32 = 0
+    private var hoveredBiomeCacheX: Int?
+    private var hoveredBiomeCacheZ: Int?
+    private var hoveredBiomeCacheID: String = "UNKNOWN"
+    private var waitingForVisibleTiles = false
+    private var frameProfileTotals = FrameProfileTotals()
+    private let frameProfilingEnabled: Bool = {
+        #if DEBUG
+        true
+        #else
+        ProcessInfo.processInfo.environment["MINESCENE_PROFILE"] == "1"
+        #endif
+    }()
+    private let frameProfileIntervalNs: UInt64 = 2_000_000_000
 
     init() throws {
         self.sdl = try SDLRuntime()
@@ -147,11 +177,23 @@ final class MineSceneApp {
                     }
                 case .mouseWheel:
                     let dy = event.wheel.y
-                    if dy > 0 {
-                        state.scale = max(1, state.scale / 4)
-                        state.dirty = true
-                    } else if dy < 0 {
-                        state.scale = min(64, state.scale * 4)
+                    if dy != 0 {
+                        var windowW: Int32 = 800
+                        var windowH: Int32 = 800
+                        if let windowHandle = window {
+                            SDL_GetWindowSize(windowHandle.pointer, &windowW, &windowH)
+                        }
+                        let mouseMapX = Double(state.mouseX) * Double(viewportWidth) / max(1.0, Double(windowW))
+                        let mouseMapY = Double(state.mouseY) * Double(viewportHeight) / max(1.0, Double(windowH))
+                        let anchoredWorldX = state.topLeftX + mouseMapX * state.zoom
+                        let anchoredWorldZ = state.topLeftZ + mouseMapY * state.zoom
+
+                        let zoomStep: Double = 0.85
+                        let nextZoom = state.zoom * pow(zoomStep, Double(dy))
+                        state.zoom = min(64.0, max(4.0, nextZoom))
+
+                        state.topLeftX = anchoredWorldX - mouseMapX * state.zoom
+                        state.topLeftZ = anchoredWorldZ - mouseMapY * state.zoom
                         state.dirty = true
                     }
                 default:
@@ -169,8 +211,15 @@ final class MineSceneApp {
                 if dx != 0 || dz != 0 {
                     state.lastMouseX = x
                     state.lastMouseY = y
-                    state.topLeftX -= dx * state.scale
-                    state.topLeftZ += dz * state.scale
+                    state.topLeftX -= Double(dx) * state.zoom
+                    state.topLeftZ += Double(dz) * state.zoom
+                    state.dirty = true
+                }
+            }
+
+            if waitingForVisibleTiles {
+                let latestVersion = tileCache.currentVersion(sampleY: 256)
+                if latestVersion != cachedVersion {
                     state.dirty = true
                 }
             }
@@ -186,6 +235,9 @@ final class MineSceneApp {
         if let engine {
             _ = try? engine.device.waitIdle()
         }
+        cachedMapVertexBuffer = nil
+        cachedMapVertexMemory = nil
+        cachedMapVertexCount = 0
         imageAvailable = nil
         renderFinished = nil
         engine?.shutdown()
@@ -196,49 +248,58 @@ final class MineSceneApp {
     }
 
     private func renderFrame() throws {
+        let frameStartNs = DispatchTime.now().uptimeNanoseconds
         guard let worldGenerator, let engine else {
             return
         }
-        let tileWorldSize = tileCache.tileSize * state.scale
-        let tileOriginX = floorDiv(state.topLeftX, tileWorldSize) * tileWorldSize - tileWorldSize
-        let tileOriginZ = floorDiv(state.topLeftZ, tileWorldSize) * tileWorldSize - tileWorldSize
-        let mapWidth = viewportWidth + tileCache.tileSize * 2
-        let mapHeight = viewportHeight + tileCache.tileSize * 2
+        let sampleScale = currentSampleScale()
+        let displayScale = Double(sampleScale) / state.zoom
+        let tileWorldSize = tileCache.tileSize * sampleScale
+        let topLeftXInt = Int(floor(state.topLeftX))
+        let topLeftZInt = Int(floor(state.topLeftZ))
+        let tileOriginX = floorDiv(topLeftXInt, tileWorldSize) * tileWorldSize
+        let tileOriginZ = floorDiv(topLeftZInt, tileWorldSize) * tileWorldSize
+        let mapWidth = Int(ceil(Double(viewportWidth) / displayScale)) + tileCache.tileSize
+        let mapHeight = Int(ceil(Double(viewportHeight) / displayScale)) + tileCache.tileSize
 
-        let mapResult = try tileCache.mapAsync(
-            worldGenerator: worldGenerator,
-            topLeftX: tileOriginX,
-            topLeftZ: tileOriginZ,
-            width: mapWidth,
-            height: mapHeight,
-            scale: state.scale
-        )
-
-        if cachedVertices.isEmpty ||
+        let latestVersion = tileCache.currentVersion(sampleY: 256)
+        let needsVertexRefresh = cachedMapVertexBuffer == nil ||
             tileOriginX != cachedTileOriginX ||
             tileOriginZ != cachedTileOriginZ ||
-            state.scale != cachedScale ||
-            mapResult.version != cachedVersion {
-            cachedVertices = BiomeMapRenderer.makeVertices2D(from: mapResult.map)
-            cachedTileOriginX = mapResult.tileOriginX
-            cachedTileOriginZ = mapResult.tileOriginZ
-            cachedScale = state.scale
-            cachedVersion = mapResult.version
-        }
-        if !mapResult.isComplete {
-            state.dirty = true
-        }
+            sampleScale != cachedScale ||
+            latestVersion != cachedVersion
 
-        let offsetPixelsX = Float(state.topLeftX - cachedTileOriginX) / Float(state.scale)
-        let offsetPixelsZ = Float(state.topLeftZ - cachedTileOriginZ) / Float(state.scale)
-        let viewportW = Float(viewportWidth)
-        let viewportH = Float(viewportHeight)
+        var tileFetchNs: UInt64 = 0
+        if needsVertexRefresh {
+            let tileFetchStartNs = DispatchTime.now().uptimeNanoseconds
+            let verticesResult = try tileCache.verticesAsync(
+                worldGenerator: worldGenerator,
+                topLeftX: tileOriginX,
+                topLeftZ: tileOriginZ,
+                width: mapWidth,
+                height: mapHeight,
+                scale: sampleScale
+            )
+            tileFetchNs = DispatchTime.now().uptimeNanoseconds - tileFetchStartNs
+
+            let (mapBuffer, mapMemory) = try engine.createVertexBuffer2D(verticesResult.vertices)
+            cachedMapVertexBuffer = mapBuffer
+            cachedMapVertexMemory = mapMemory
+            cachedMapVertexCount = UInt32(verticesResult.vertices.count)
+            cachedTileOriginX = verticesResult.tileOriginX
+            cachedTileOriginZ = verticesResult.tileOriginZ
+            cachedScale = sampleScale
+            cachedVersion = verticesResult.version
+            waitingForVisibleTiles = !verticesResult.isComplete
+        }
 
         // Map-space pixels -> viewport-space (top-left origin) -> NDC.
-        let sx = 2.0 / viewportW
-        let sy = 2.0 / viewportH
-        let tx = -1.0 - 2.0 * offsetPixelsX / viewportW
-        let ty = -1.0 - 2.0 * offsetPixelsZ / viewportH
+        let offsetPixelsX = (state.topLeftX - Double(cachedTileOriginX)) / Double(sampleScale)
+        let offsetPixelsZ = (state.topLeftZ - Double(cachedTileOriginZ)) / Double(sampleScale)
+        let sx = Float(2.0 * displayScale / Double(viewportWidth))
+        let sy = Float(2.0 * displayScale / Double(viewportHeight))
+        let tx = Float(-1.0 - 2.0 * offsetPixelsX * displayScale / Double(viewportWidth))
+        let ty = Float(-1.0 - 2.0 * offsetPixelsZ * displayScale / Double(viewportHeight))
         let transform = simd_float4x4(
             SIMD4<Float>(sx, 0.0, 0.0, 0.0),
             SIMD4<Float>(0.0, sy, 0.0, 0.0),
@@ -253,11 +314,22 @@ final class MineSceneApp {
             SDL_GetWindowSize(windowHandle.pointer, &windowW, &windowH)
         }
 
-        let mapMouseX = Int(Float(state.mouseX) * Float(viewportWidth) / max(1.0, Float(windowW)))
-        let mapMouseY = Int(Float(state.mouseY) * Float(viewportHeight) / max(1.0, Float(windowH)))
-        let worldMouseX = state.topLeftX + mapMouseX * state.scale
-        let worldMouseZ = state.topLeftZ + mapMouseY * state.scale
-        let biomeID = hoveredBiomeID(atWorldX: worldMouseX, worldZ: worldMouseZ)
+        let mapMouseX = Double(state.mouseX) * Double(viewportWidth) / max(1.0, Double(windowW))
+        let mapMouseY = Double(state.mouseY) * Double(viewportHeight) / max(1.0, Double(windowH))
+        let worldMouseX = Int(floor(state.topLeftX + mapMouseX * state.zoom))
+        let worldMouseZ = Int(floor(state.topLeftZ + mapMouseY * state.zoom))
+        let biomeID: String
+        var hoverLookupNs: UInt64 = 0
+        if hoveredBiomeCacheX == worldMouseX, hoveredBiomeCacheZ == worldMouseZ {
+            biomeID = hoveredBiomeCacheID
+        } else {
+            let hoverStartNs = DispatchTime.now().uptimeNanoseconds
+            biomeID = hoveredBiomeID(atWorldX: worldMouseX, worldZ: worldMouseZ)
+            hoverLookupNs = DispatchTime.now().uptimeNanoseconds - hoverStartNs
+            hoveredBiomeCacheX = worldMouseX
+            hoveredBiomeCacheZ = worldMouseZ
+            hoveredBiomeCacheID = biomeID
+        }
 
         let inverseTransform = simd_inverse(transform)
         let overlayVertices = makeCoordinateOverlayVertices(
@@ -270,16 +342,25 @@ final class MineSceneApp {
         guard let imageAvailable, let renderFinished else {
             return
         }
+        guard let cachedMapVertexBuffer else {
+            return
+        }
+        let uploadStartNs = DispatchTime.now().uptimeNanoseconds
         let imageIndex = try engine.device.acquireNextImage(from: engine.swapchain, semaphore: imageAvailable.semaphore)
-        var frameVertices = cachedVertices
-        frameVertices.append(contentsOf: overlayVertices)
-        let (_vertexBuffer, _vertexMemory) = try engine.uploadVertices2D(
-            frameVertices,
+        let (overlayBuffer, overlayMemory) = try engine.createVertexBuffer2D(overlayVertices)
+        try engine.drawBatches2D(
+            [
+                .init(buffer: cachedMapVertexBuffer, vertexCount: cachedMapVertexCount),
+                .init(buffer: overlayBuffer, vertexCount: UInt32(overlayVertices.count))
+            ],
             framebufferIndex: Int(imageIndex),
             waitSemaphores: [imageAvailable.semaphore],
             signalSemaphores: [renderFinished.semaphore]
         )
+        _ = overlayMemory
+        let uploadNs = DispatchTime.now().uptimeNanoseconds - uploadStartNs
 
+        let presentStartNs = DispatchTime.now().uptimeNanoseconds
         var swapchainHandle: VkSwapchainKHR? = engine.swapchain.swapchain
         var imageIndexVar = imageIndex
         try withUnsafePointer(to: &swapchainHandle) { swapchainPtr in
@@ -300,8 +381,20 @@ final class MineSceneApp {
                 }
             }
         }
+        let presentNs = DispatchTime.now().uptimeNanoseconds - presentStartNs
 
+        let waitIdleStartNs = DispatchTime.now().uptimeNanoseconds
         try engine.device.waitIdle()
+        let waitIdleNs = DispatchTime.now().uptimeNanoseconds - waitIdleStartNs
+        let frameNs = DispatchTime.now().uptimeNanoseconds - frameStartNs
+        recordFrameProfile(
+            frameNs: frameNs,
+            tileFetchNs: tileFetchNs,
+            hoverLookupNs: hoverLookupNs,
+            uploadNs: uploadNs,
+            presentNs: presentNs,
+            waitIdleNs: waitIdleNs
+        )
     }
 
     private func floorDiv(_ value: Int, _ divisor: Int) -> Int {
@@ -386,18 +479,16 @@ final class MineSceneApp {
             return "UNKNOWN"
         }
 
-        let scale = Int32(max(1, state.scale))
+        let scale = Int32(currentSampleScale())
         let from = DPReader.PosInt2D(x: Int32(worldX), z: Int32(worldZ))
         let to = DPReader.PosInt2D(x: Int32(worldX) + scale, z: Int32(worldZ) + scale)
-        let overworld = DPReader.RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld")
-
         do {
             guard
                 let biomes = try worldGenerator.generateBiomesInSquare(
                     from: from,
                     to: to,
                     atY: sampleY,
-                    in: overworld,
+                    in: RegistryKey(referencing: "minecraft:overworld"),
                     scale: scale
                 ),
                 let biome = biomes.first
@@ -412,6 +503,52 @@ final class MineSceneApp {
 
     private func sanitizeOverlayText(_ text: String) -> String {
         String(text.map { Self.glyphs[$0] == nil ? "?" : $0 })
+    }
+
+    private func currentSampleScale() -> Int {
+        if state.zoom >= 64.0 {
+            return 64
+        }
+        if state.zoom >= 16.0 {
+            return 16
+        }
+        return 4
+    }
+
+    private func recordFrameProfile(
+        frameNs: UInt64,
+        tileFetchNs: UInt64,
+        hoverLookupNs: UInt64,
+        uploadNs: UInt64,
+        presentNs: UInt64,
+        waitIdleNs: UInt64
+    ) {
+        guard frameProfilingEnabled else { return }
+        frameProfileTotals.frames += 1
+        frameProfileTotals.totalNs += frameNs
+        frameProfileTotals.tileFetchNs += tileFetchNs
+        frameProfileTotals.hoverLookupNs += hoverLookupNs
+        frameProfileTotals.uploadNs += uploadNs
+        frameProfileTotals.presentNs += presentNs
+        frameProfileTotals.waitIdleNs += waitIdleNs
+
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        guard nowNs - frameProfileTotals.lastReportNs >= frameProfileIntervalNs else { return }
+
+        let frames = max(1, frameProfileTotals.frames)
+        print(
+            String(
+                format: "[Profiler][Frame] frames=%d avg=%.2fms tileFetch=%.2fms hover=%.2fms upload=%.2fms present=%.2fms waitIdle=%.2fms",
+                frameProfileTotals.frames,
+                Double(frameProfileTotals.totalNs) / Double(frames) / 1_000_000.0,
+                Double(frameProfileTotals.tileFetchNs) / Double(frames) / 1_000_000.0,
+                Double(frameProfileTotals.hoverLookupNs) / Double(frames) / 1_000_000.0,
+                Double(frameProfileTotals.uploadNs) / Double(frames) / 1_000_000.0,
+                Double(frameProfileTotals.presentNs) / Double(frames) / 1_000_000.0,
+                Double(frameProfileTotals.waitIdleNs) / Double(frames) / 1_000_000.0
+            )
+        )
+        frameProfileTotals = FrameProfileTotals(nowNs: nowNs)
     }
 
     private func appendQuadNDC(

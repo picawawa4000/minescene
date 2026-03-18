@@ -150,8 +150,10 @@ final class BiomeQuadTreeCache {
     let tileSize: Int
     let baseScale: Int
     private let lockQueue = DispatchQueue(label: "BiomeTileCache.lock", attributes: .concurrent)
-    private let workerQueue = DispatchQueue(label: "BiomeTileCache.worker", qos: .userInitiated)
+    private let workerQueue = DispatchQueue(label: "BiomeTileCache.worker", qos: .userInitiated, attributes: .concurrent)
     private let profileQueue = DispatchQueue(label: "BiomeTileCache.profile")
+    private let generationSlots: DispatchSemaphore
+    private let maxBatchSpanTiles: Int
     private var trees: [TreeKey: QuadTree] = [:]
     private var pending: Set<PendingKey> = []
     private var version: UInt64 = 0
@@ -169,6 +171,11 @@ final class BiomeQuadTreeCache {
     init(tileSize: Int = 256, baseScale: Int = 4) {
         self.tileSize = tileSize
         self.baseScale = max(1, baseScale)
+        let envWorkers = ProcessInfo.processInfo.environment["MINESCENE_TILE_WORKERS"].flatMap(Int.init)
+        let cpuWorkers = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
+        let workerCount = max(1, min(8, envWorkers ?? min(2, cpuWorkers)))
+        self.generationSlots = DispatchSemaphore(value: workerCount)
+        self.maxBatchSpanTiles = 2
     }
 
     func currentVersion(sampleY: Int = 256) -> UInt64 {
@@ -391,6 +398,28 @@ final class BiomeQuadTreeCache {
     ) {
         guard !tileCoords.isEmpty else { return }
 
+        // Keep generation batches spatially tight; this lowers worst-case render spikes.
+        if tileCoords.count > maxBatchSpanTiles * maxBatchSpanTiles {
+            var grouped: [TileCoord: [TileCoord]] = [:]
+            grouped.reserveCapacity(tileCoords.count)
+            for coord in tileCoords {
+                let group = TileCoord(
+                    x: BiomeQuadTreeCache.floorDiv(coord.x, maxBatchSpanTiles),
+                    z: BiomeQuadTreeCache.floorDiv(coord.z, maxBatchSpanTiles)
+                )
+                grouped[group, default: []].append(coord)
+            }
+            for group in grouped.values {
+                scheduleTileGenerationBatch(
+                    tileCoords: group,
+                    treeKey: treeKey,
+                    worldGenerator: worldGenerator,
+                    sampleY: sampleY
+                )
+            }
+            return
+        }
+
         let minTileX = tileCoords.map(\.x).min()!
         let maxTileX = tileCoords.map(\.x).max()!
         let minTileZ = tileCoords.map(\.z).min()!
@@ -411,6 +440,10 @@ final class BiomeQuadTreeCache {
 
         workerQueue.async { [weak self] in
             guard let self else { return }
+            self.generationSlots.wait()
+            defer {
+                self.generationSlots.signal()
+            }
             let renderStartNs = DispatchTime.now().uptimeNanoseconds
             let generated = try? BiomeMapRenderer.render(
                 worldGenerator: worldGenerator,

@@ -7,6 +7,7 @@ final class VulkanEngine {
     private final class Resources {
         var commandPool: VulkanOwnedCommandPool?
         let commandBuffer: VulkanCommandBuffer
+        var inFlightFence: VulkanOwnedFence?
 
         var swapchain: VulkanOwnedSwapchain?
         let swapchainImages: [VkImage]
@@ -22,6 +23,7 @@ final class VulkanEngine {
         init(
             commandPool: VulkanOwnedCommandPool,
             commandBuffer: VulkanCommandBuffer,
+            inFlightFence: VulkanOwnedFence,
             swapchain: VulkanOwnedSwapchain,
             swapchainImages: [VkImage],
             swapchainImageViews: [VulkanOwnedImageView],
@@ -34,6 +36,7 @@ final class VulkanEngine {
         ) {
             self.commandPool = commandPool
             self.commandBuffer = commandBuffer
+            self.inFlightFence = inFlightFence
             self.swapchain = swapchain
             self.swapchainImages = swapchainImages
             self.swapchainImageViews = swapchainImageViews
@@ -53,6 +56,7 @@ final class VulkanEngine {
             renderPass = nil
             swapchainImageViews = nil
             swapchain = nil
+            inFlightFence = nil
             commandPool = nil
         }
     }
@@ -97,6 +101,11 @@ final class VulkanEngine {
         let vertexCount: UInt32
     }
 
+    struct DrawBatch3D {
+        let buffer: VulkanOwnedBuffer
+        let vertexCount: UInt32
+    }
+
     final class VulkanOwnedDescriptorSetLayout {
         let descriptorSetLayout: VkDescriptorSetLayout
         private let device: VkDevice
@@ -125,6 +134,14 @@ final class VulkanEngine {
         let descriptorSetLayout: VulkanOwnedDescriptorSetLayout
         let pipelineLayout: VulkanOwnedPipelineLayout
         let pipeline: VulkanOwnedPipeline?
+        let descriptorPool: VulkanOwnedDescriptorPool
+        let descriptorSet: VkDescriptorSet
+        let transformUniformBuffer: VulkanOwnedBuffer
+        let transformUniformMemory: VulkanOwnedDeviceMemory
+        let modelUniformBuffer: VulkanOwnedBuffer
+        let modelUniformMemory: VulkanOwnedDeviceMemory
+        let viewUniformBuffer: VulkanOwnedBuffer
+        let viewUniformMemory: VulkanOwnedDeviceMemory
     }
 
     final class VulkanOwnedDescriptorPool {
@@ -148,9 +165,11 @@ final class VulkanEngine {
     let graphicsQueue: VkQueue
     let queueFamilyIndex: UInt32
     private var resources: Resources?
+    private var clearColor = SIMD4<Float>(0.0, 0.0, 0.9, 1.0)
 
     var commandPool: VulkanOwnedCommandPool { resources!.commandPool! }
     var commandBuffer: VulkanCommandBuffer { resources!.commandBuffer }
+    var inFlightFence: VulkanOwnedFence { resources!.inFlightFence! }
 
     var swapchain: VulkanOwnedSwapchain { resources!.swapchain! }
     var swapchainImages: [VkImage] { resources!.swapchainImages }
@@ -277,6 +296,51 @@ final class VulkanEngine {
             device: self.device,
             descriptorSetLayout: mode3DLayout
         )
+        let mode3DDescriptorPool = try VulkanEngine.createDescriptorPool(
+            device: self.device,
+            maxSets: 1,
+            poolSizes: [
+                VkDescriptorPoolSize(type: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, descriptorCount: 3)
+            ]
+        )
+        let mode3DDescriptorSet = try VulkanEngine.allocateDescriptorSet(
+            device: self.device,
+            descriptorPool: mode3DDescriptorPool,
+            layout: mode3DLayout
+        )
+        let (mode3DTransformUniformBuffer, mode3DTransformUniformMemory) = try VulkanEngine.createUniformBuffer3D(
+            device: self.device,
+            physicalDevice: self.physicalDevice
+        )
+        let (mode3DModelUniformBuffer, mode3DModelUniformMemory) = try VulkanEngine.createUniformBuffer3D(
+            device: self.device,
+            physicalDevice: self.physicalDevice
+        )
+        let (mode3DViewUniformBuffer, mode3DViewUniformMemory) = try VulkanEngine.createUniformBuffer3D(
+            device: self.device,
+            physicalDevice: self.physicalDevice
+        )
+        VulkanEngine.updateDescriptorSet(
+            device: self.device,
+            descriptorSet: mode3DDescriptorSet,
+            binding: DescriptorBindings3D.transform,
+            buffer: mode3DTransformUniformBuffer,
+            range: VkDeviceSize(MemoryLayout<Float>.size * 16)
+        )
+        VulkanEngine.updateDescriptorSet(
+            device: self.device,
+            descriptorSet: mode3DDescriptorSet,
+            binding: DescriptorBindings3D.model,
+            buffer: mode3DModelUniformBuffer,
+            range: VkDeviceSize(MemoryLayout<Float>.size * 16)
+        )
+        VulkanEngine.updateDescriptorSet(
+            device: self.device,
+            descriptorSet: mode3DDescriptorSet,
+            binding: DescriptorBindings3D.view,
+            buffer: mode3DViewUniformBuffer,
+            range: VkDeviceSize(MemoryLayout<Float>.size * 16)
+        )
         let pipeline3D: VulkanOwnedPipeline?
         if let vertSpirv3D, let fragSpirv3D {
             pipeline3D = try VulkanEngine.createPipeline(
@@ -295,12 +359,21 @@ final class VulkanEngine {
         let mode3D = DrawingMode3D(
             descriptorSetLayout: mode3DLayout,
             pipelineLayout: mode3DPipelineLayout,
-            pipeline: pipeline3D
+            pipeline: pipeline3D,
+            descriptorPool: mode3DDescriptorPool,
+            descriptorSet: mode3DDescriptorSet,
+            transformUniformBuffer: mode3DTransformUniformBuffer,
+            transformUniformMemory: mode3DTransformUniformMemory,
+            modelUniformBuffer: mode3DModelUniformBuffer,
+            modelUniformMemory: mode3DModelUniformMemory,
+            viewUniformBuffer: mode3DViewUniformBuffer,
+            viewUniformMemory: mode3DViewUniformMemory
         )
 
         self.resources = Resources(
             commandPool: commandBundle.commandPool,
             commandBuffer: commandBundle.commandBuffer,
+            inFlightFence: commandBundle.inFlightFence,
             swapchain: swapchainBundle.swapchain,
             swapchainImages: swapchainBundle.images,
             swapchainImageViews: swapchainBundle.imageViews,
@@ -358,6 +431,71 @@ final class VulkanEngine {
             let wordBuffer = rawBuffer.bindMemory(to: UInt32.self)
             return Array(wordBuffer)
         }
+    }
+
+    private struct SpirvEntryPoint {
+        let executionModel: UInt32
+        let name: String
+    }
+
+    private static let spirvOpEntryPoint: UInt32 = 15
+    private static let spirvExecutionModelVertex: UInt32 = 0
+    private static let spirvExecutionModelFragment: UInt32 = 4
+
+    private static func decodeSpirvString(_ words: ArraySlice<UInt32>) -> String {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(words.count * 4)
+        for word in words {
+            let b0 = UInt8(word & 0xFF)
+            if b0 == 0 { break }
+            bytes.append(b0)
+            let b1 = UInt8((word >> 8) & 0xFF)
+            if b1 == 0 { break }
+            bytes.append(b1)
+            let b2 = UInt8((word >> 16) & 0xFF)
+            if b2 == 0 { break }
+            bytes.append(b2)
+            let b3 = UInt8((word >> 24) & 0xFF)
+            if b3 == 0 { break }
+            bytes.append(b3)
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func parseSpirvEntryPoints(_ spirv: [UInt32]) -> [SpirvEntryPoint] {
+        guard spirv.count >= 5 else { return [] }
+        var ret: [SpirvEntryPoint] = []
+        var index = 5
+        while index < spirv.count {
+            let instruction = spirv[index]
+            let wordCount = Int(instruction >> 16)
+            let opcode = instruction & 0xFFFF
+            guard wordCount > 0, index + wordCount <= spirv.count else {
+                break
+            }
+            if opcode == spirvOpEntryPoint, wordCount >= 4 {
+                let executionModel = spirv[index + 1]
+                let nameStart = index + 3
+                let nameEnd = index + wordCount
+                let name = decodeSpirvString(spirv[nameStart..<nameEnd])
+                ret.append(.init(executionModel: executionModel, name: name))
+            }
+            index += wordCount
+        }
+        return ret
+    }
+
+    private static func preferredEntryPointName(
+        from entryPoints: [SpirvEntryPoint],
+        executionModel: UInt32,
+        preferredNames: [String]
+    ) -> String? {
+        let names = entryPoints.filter { $0.executionModel == executionModel }.map(\.name)
+        guard !names.isEmpty else { return nil }
+        for preferred in preferredNames where names.contains(preferred) {
+            return preferred
+        }
+        return names[0]
     }
 
     private static func selectPhysicalDevice(
@@ -427,10 +565,11 @@ final class VulkanEngine {
     private static func createCommandResources(
         device: VulkanOwnedDevice,
         queueFamilyIndex: UInt32
-    ) throws -> (commandPool: VulkanOwnedCommandPool, commandBuffer: VulkanCommandBuffer) {
-        let commandPool = try device.createCommandPool(queueFamilyIndex: queueFamilyIndex)
+    ) throws -> (commandPool: VulkanOwnedCommandPool, commandBuffer: VulkanCommandBuffer, inFlightFence: VulkanOwnedFence) {
+        let commandPool = try device.createCommandPool(flags: [.resetCommandBuffer], queueFamilyIndex: queueFamilyIndex)
         let commandBuffer = try device.allocateCommandBuffers(from: commandPool, count: 1).first!
-        return (commandPool, commandBuffer)
+        let inFlightFence = try device.createFence(flags: [.signaled])
+        return (commandPool, commandBuffer, inFlightFence)
     }
 
     private static func createSwapchainBundle(
@@ -588,146 +727,162 @@ final class VulkanEngine {
     ) throws -> VulkanOwnedPipeline {
         let vertModule = try device.createShaderModule(code: vertSpirv)
         let fragModule = try device.createShaderModule(code: fragSpirv)
+        let vertexEntryPoints = parseSpirvEntryPoints(vertSpirv)
+        let fragmentEntryPoints = parseSpirvEntryPoints(fragSpirv)
+        guard let vertexEntry = preferredEntryPointName(
+            from: vertexEntryPoints,
+            executionModel: spirvExecutionModelVertex,
+            preferredNames: ["mainVS", "main"]
+        ),
+        let fragmentEntry = preferredEntryPointName(
+            from: fragmentEntryPoints,
+            executionModel: spirvExecutionModelFragment,
+            preferredNames: ["mainPS", "main"]
+        ) else {
+            throw Errors.invalidSpirvData
+        }
 
-        let pipeline = try "main".withCString { entryPoint in
-            var shaderStages = [
-                VkPipelineShaderStageCreateInfo(
-                    sType: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        return try vertexEntry.withCString { vertexEntryPoint in
+            try fragmentEntry.withCString { fragmentEntryPoint in
+                var shaderStages = [
+                    VkPipelineShaderStageCreateInfo(
+                        sType: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        pNext: nil,
+                        flags: 0,
+                        stage: VK_SHADER_STAGE_VERTEX_BIT,
+                        module: vertModule.shaderModule,
+                        pName: vertexEntryPoint,
+                        pSpecializationInfo: nil
+                    ),
+                    VkPipelineShaderStageCreateInfo(
+                        sType: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        pNext: nil,
+                        flags: 0,
+                        stage: VK_SHADER_STAGE_FRAGMENT_BIT,
+                        module: fragModule.shaderModule,
+                        pName: fragmentEntryPoint,
+                        pSpecializationInfo: nil
+                    )
+                ]
+
+                var inputAssembly = VkPipelineInputAssemblyStateCreateInfo(
+                    sType: VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                     pNext: nil,
                     flags: 0,
-                    stage: VK_SHADER_STAGE_VERTEX_BIT,
-                    module: vertModule.shaderModule,
-                    pName: entryPoint,
-                    pSpecializationInfo: nil
-                ),
-                VkPipelineShaderStageCreateInfo(
-                    sType: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    topology: VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                    primitiveRestartEnable: VK_FALSE
+                )
+                var viewport = VkViewport(
+                    x: 0,
+                    y: 0,
+                    width: Float(extent.width),
+                    height: Float(extent.height),
+                    minDepth: 0,
+                    maxDepth: 1
+                )
+                var scissor = VkRect2D(
+                    offset: VkOffset2D(x: 0, y: 0),
+                    extent: extent
+                )
+                var viewportState = VkPipelineViewportStateCreateInfo(
+                    sType: VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
                     pNext: nil,
                     flags: 0,
-                    stage: VK_SHADER_STAGE_FRAGMENT_BIT,
-                    module: fragModule.shaderModule,
-                    pName: entryPoint,
-                    pSpecializationInfo: nil
+                    viewportCount: 1,
+                    pViewports: nil,
+                    scissorCount: 1,
+                    pScissors: nil
                 )
-            ]
-
-            var inputAssembly = VkPipelineInputAssemblyStateCreateInfo(
-                sType: VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                pNext: nil,
-                flags: 0,
-                topology: VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-                primitiveRestartEnable: VK_FALSE
-            )
-            var viewport = VkViewport(
-                x: 0,
-                y: 0,
-                width: Float(extent.width),
-                height: Float(extent.height),
-                minDepth: 0,
-                maxDepth: 1
-            )
-            var scissor = VkRect2D(
-                offset: VkOffset2D(x: 0, y: 0),
-                extent: extent
-            )
-            var viewportState = VkPipelineViewportStateCreateInfo(
-                sType: VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-                pNext: nil,
-                flags: 0,
-                viewportCount: 1,
-                pViewports: nil,
-                scissorCount: 1,
-                pScissors: nil
-            )
-            var rasterization = VkPipelineRasterizationStateCreateInfo(
-                sType: VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                pNext: nil,
-                flags: 0,
-                depthClampEnable: VK_FALSE,
-                rasterizerDiscardEnable: VK_FALSE,
-                polygonMode: VK_POLYGON_MODE_FILL,
-                cullMode: cullMode,
-                frontFace: VK_FRONT_FACE_COUNTER_CLOCKWISE,
-                depthBiasEnable: VK_FALSE,
-                depthBiasConstantFactor: 0,
-                depthBiasClamp: 0,
-                depthBiasSlopeFactor: 0,
-                lineWidth: 1
-            )
-            var multisample = VkPipelineMultisampleStateCreateInfo(
-                sType: VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                pNext: nil,
-                flags: 0,
-                rasterizationSamples: VK_SAMPLE_COUNT_1_BIT,
-                sampleShadingEnable: VK_FALSE,
-                minSampleShading: 1,
-                pSampleMask: nil,
-                alphaToCoverageEnable: VK_FALSE,
-                alphaToOneEnable: VK_FALSE
-            )
-            var colorBlendAttachment = VkPipelineColorBlendAttachmentState(
-                blendEnable: VK_FALSE,
-                srcColorBlendFactor: VK_BLEND_FACTOR_ONE,
-                dstColorBlendFactor: VK_BLEND_FACTOR_ZERO,
-                colorBlendOp: VK_BLEND_OP_ADD,
-                srcAlphaBlendFactor: VK_BLEND_FACTOR_ONE,
-                dstAlphaBlendFactor: VK_BLEND_FACTOR_ZERO,
-                alphaBlendOp: VK_BLEND_OP_ADD,
-                colorWriteMask: VkColorComponentFlags(
-                    VK_COLOR_COMPONENT_R_BIT.rawValue |
-                    VK_COLOR_COMPONENT_G_BIT.rawValue |
-                    VK_COLOR_COMPONENT_B_BIT.rawValue |
-                    VK_COLOR_COMPONENT_A_BIT.rawValue
+                var rasterization = VkPipelineRasterizationStateCreateInfo(
+                    sType: VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                    pNext: nil,
+                    flags: 0,
+                    depthClampEnable: VK_FALSE,
+                    rasterizerDiscardEnable: VK_FALSE,
+                    polygonMode: VK_POLYGON_MODE_FILL,
+                    cullMode: cullMode,
+                    frontFace: VK_FRONT_FACE_COUNTER_CLOCKWISE,
+                    depthBiasEnable: VK_FALSE,
+                    depthBiasConstantFactor: 0,
+                    depthBiasClamp: 0,
+                    depthBiasSlopeFactor: 0,
+                    lineWidth: 1
                 )
-            )
-            var colorBlend = VkPipelineColorBlendStateCreateInfo(
-                sType: VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-                pNext: nil,
-                flags: 0,
-                logicOpEnable: VK_FALSE,
-                logicOp: VK_LOGIC_OP_COPY,
-                attachmentCount: 1,
-                pAttachments: nil,
-                blendConstants: (0, 0, 0, 0)
-            )
+                var multisample = VkPipelineMultisampleStateCreateInfo(
+                    sType: VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                    pNext: nil,
+                    flags: 0,
+                    rasterizationSamples: VK_SAMPLE_COUNT_1_BIT,
+                    sampleShadingEnable: VK_FALSE,
+                    minSampleShading: 1,
+                    pSampleMask: nil,
+                    alphaToCoverageEnable: VK_FALSE,
+                    alphaToOneEnable: VK_FALSE
+                )
+                var colorBlendAttachment = VkPipelineColorBlendAttachmentState(
+                    blendEnable: VK_FALSE,
+                    srcColorBlendFactor: VK_BLEND_FACTOR_ONE,
+                    dstColorBlendFactor: VK_BLEND_FACTOR_ZERO,
+                    colorBlendOp: VK_BLEND_OP_ADD,
+                    srcAlphaBlendFactor: VK_BLEND_FACTOR_ONE,
+                    dstAlphaBlendFactor: VK_BLEND_FACTOR_ZERO,
+                    alphaBlendOp: VK_BLEND_OP_ADD,
+                    colorWriteMask: VkColorComponentFlags(
+                        VK_COLOR_COMPONENT_R_BIT.rawValue |
+                            VK_COLOR_COMPONENT_G_BIT.rawValue |
+                            VK_COLOR_COMPONENT_B_BIT.rawValue |
+                            VK_COLOR_COMPONENT_A_BIT.rawValue
+                    )
+                )
+                var colorBlend = VkPipelineColorBlendStateCreateInfo(
+                    sType: VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                    pNext: nil,
+                    flags: 0,
+                    logicOpEnable: VK_FALSE,
+                    logicOp: VK_LOGIC_OP_COPY,
+                    attachmentCount: 1,
+                    pAttachments: nil,
+                    blendConstants: (0, 0, 0, 0)
+                )
 
-            return try shaderStages.withUnsafeMutableBufferPointer { stagesPtr in
-                try vertexInput.withUnsafePointers { vertexInputStatePtr in
-                    try withUnsafePointer(to: &inputAssembly) { inputAssemblyPtr in
-                        try withUnsafePointer(to: &viewport) { viewportPtr in
-                            try withUnsafePointer(to: &scissor) { scissorPtr in
-                                viewportState.pViewports = viewportPtr
-                                viewportState.pScissors = scissorPtr
-                                return try withUnsafePointer(to: &viewportState) { viewportStatePtr in
-                                    try withUnsafePointer(to: &rasterization) { rasterizationPtr in
-                                        try withUnsafePointer(to: &multisample) { multisamplePtr in
-                                            try withUnsafePointer(to: &colorBlendAttachment) { colorBlendAttachmentPtr in
-                                                colorBlend.pAttachments = colorBlendAttachmentPtr
-                                                return try withUnsafePointer(to: &colorBlend) { colorBlendPtr in
-                                                    var graphicsPipelineCreateInfo = VkGraphicsPipelineCreateInfo(
-                                                        sType: VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-                                                        pNext: nil,
-                                                        flags: 0,
-                                                        stageCount: UInt32(stagesPtr.count),
-                                                        pStages: stagesPtr.baseAddress,
-                                                        pVertexInputState: vertexInputStatePtr,
-                                                        pInputAssemblyState: inputAssemblyPtr,
-                                                        pTessellationState: nil,
-                                                        pViewportState: viewportStatePtr,
-                                                        pRasterizationState: rasterizationPtr,
-                                                        pMultisampleState: multisamplePtr,
-                                                        pDepthStencilState: nil,
-                                                        pColorBlendState: colorBlendPtr,
-                                                        pDynamicState: nil,
-                                                        layout: pipelineLayout.pipelineLayout,
-                                                        renderPass: renderPass.renderPass,
-                                                        subpass: 0,
-                                                        basePipelineHandle: nil,
-                                                        basePipelineIndex: 0
-                                                    )
-                                                    return try device.createGraphicsPipeline(
-                                                        createInfo: &graphicsPipelineCreateInfo
-                                                    )
+                return try shaderStages.withUnsafeMutableBufferPointer { stagesPtr in
+                    try vertexInput.withUnsafePointers { vertexInputStatePtr in
+                        try withUnsafePointer(to: &inputAssembly) { inputAssemblyPtr in
+                            try withUnsafePointer(to: &viewport) { viewportPtr in
+                                try withUnsafePointer(to: &scissor) { scissorPtr in
+                                    viewportState.pViewports = viewportPtr
+                                    viewportState.pScissors = scissorPtr
+                                    return try withUnsafePointer(to: &viewportState) { viewportStatePtr in
+                                        try withUnsafePointer(to: &rasterization) { rasterizationPtr in
+                                            try withUnsafePointer(to: &multisample) { multisamplePtr in
+                                                try withUnsafePointer(to: &colorBlendAttachment) { colorBlendAttachmentPtr in
+                                                    colorBlend.pAttachments = colorBlendAttachmentPtr
+                                                    return try withUnsafePointer(to: &colorBlend) { colorBlendPtr in
+                                                        var graphicsPipelineCreateInfo = VkGraphicsPipelineCreateInfo(
+                                                            sType: VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                                            pNext: nil,
+                                                            flags: 0,
+                                                            stageCount: UInt32(stagesPtr.count),
+                                                            pStages: stagesPtr.baseAddress,
+                                                            pVertexInputState: vertexInputStatePtr,
+                                                            pInputAssemblyState: inputAssemblyPtr,
+                                                            pTessellationState: nil,
+                                                            pViewportState: viewportStatePtr,
+                                                            pRasterizationState: rasterizationPtr,
+                                                            pMultisampleState: multisamplePtr,
+                                                            pDepthStencilState: nil,
+                                                            pColorBlendState: colorBlendPtr,
+                                                            pDynamicState: nil,
+                                                            layout: pipelineLayout.pipelineLayout,
+                                                            renderPass: renderPass.renderPass,
+                                                            subpass: 0,
+                                                            basePipelineHandle: nil,
+                                                            basePipelineIndex: 0
+                                                        )
+                                                        return try device.createGraphicsPipeline(
+                                                            createInfo: &graphicsPipelineCreateInfo
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
@@ -739,8 +894,6 @@ final class VulkanEngine {
                 }
             }
         }
-
-        return pipeline
     }
 
     private static func querySwapchainSupport(
@@ -946,6 +1099,19 @@ final class VulkanEngine {
         return try createUniformBuffer(device: device, physicalDevice: physicalDevice, data: identity)
     }
 
+    private static func createUniformBuffer3D(
+        device: VulkanOwnedDevice,
+        physicalDevice: VulkanPhysicalDevice
+    ) throws -> (VulkanOwnedBuffer, VulkanOwnedDeviceMemory) {
+        let identity: [Float] = [
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        ]
+        return try createUniformBuffer(device: device, physicalDevice: physicalDevice, data: identity)
+    }
+
     private static func createUniformBuffer<T>(
         device: VulkanOwnedDevice,
         physicalDevice: VulkanPhysicalDevice,
@@ -1075,6 +1241,78 @@ final class VulkanEngine {
         try createVertexBuffer(vertices)
     }
 
+    func createVertexBuffer3D(_ vertices: [Vertex3D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        try createVertexBuffer(vertices)
+    }
+
+    func createVertexBuffer2DCapacity(_ vertexCapacity: Int) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        guard vertexCapacity > 0 else {
+            throw Errors.emptyVertexData
+        }
+        let byteCount = VkDeviceSize(MemoryLayout<Vertex2D>.stride * vertexCapacity)
+        return try createBufferWithMemory(size: byteCount)
+    }
+
+    func createVertexBuffer3DCapacity(_ vertexCapacity: Int) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        guard vertexCapacity > 0 else {
+            throw Errors.emptyVertexData
+        }
+        let byteCount = VkDeviceSize(MemoryLayout<Vertex3D>.stride * vertexCapacity)
+        return try createBufferWithMemory(size: byteCount)
+    }
+
+    func updateVertexBuffer2D(
+        _ vertices: [Vertex2D],
+        buffer: VulkanOwnedBuffer,
+        memory: VulkanOwnedDeviceMemory,
+        capacity: Int
+    ) throws -> UInt32 {
+        guard capacity > 0 else {
+            throw Errors.emptyVertexData
+        }
+        if vertices.count > capacity {
+            throw Errors.vertexDataExceedsCapacity
+        }
+        guard !vertices.isEmpty else {
+            return 0
+        }
+
+        let copySize = VkDeviceSize(MemoryLayout<Vertex2D>.stride * vertices.count)
+        let mapped = try device.mapMemory(memory, offset: 0, size: copySize)
+        vertices.withUnsafeBytes { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(memory)
+        _ = buffer
+        return UInt32(vertices.count)
+    }
+
+    func updateVertexBuffer3D(
+        _ vertices: [Vertex3D],
+        buffer: VulkanOwnedBuffer,
+        memory: VulkanOwnedDeviceMemory,
+        capacity: Int
+    ) throws -> UInt32 {
+        guard capacity > 0 else {
+            throw Errors.emptyVertexData
+        }
+        if vertices.count > capacity {
+            throw Errors.vertexDataExceedsCapacity
+        }
+        guard !vertices.isEmpty else {
+            return 0
+        }
+
+        let copySize = VkDeviceSize(MemoryLayout<Vertex3D>.stride * vertices.count)
+        let mapped = try device.mapMemory(memory, offset: 0, size: copySize)
+        vertices.withUnsafeBytes { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(memory)
+        _ = buffer
+        return UInt32(vertices.count)
+    }
+
     func drawBatches2D(
         _ batches: [DrawBatch2D],
         framebufferIndex: Int,
@@ -1093,6 +1331,81 @@ final class VulkanEngine {
         )
     }
 
+    func drawBatches3D(
+        _ batches: [DrawBatch3D],
+        framebufferIndex: Int,
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
+    ) throws {
+        guard let pipeline = mode3D.pipeline else {
+            throw Errors.missing3DPipeline
+        }
+        let internalBatches = batches.map { ($0.buffer, $0.vertexCount) }
+        try drawVertexBuffers(
+            buffers: internalBatches,
+            pipeline: pipeline,
+            pipelineLayout: mode3D.pipelineLayout,
+            descriptorSet: mode3D.descriptorSet,
+            framebufferIndex: framebufferIndex,
+            waitSemaphores: waitSemaphores,
+            signalSemaphores: signalSemaphores
+        )
+    }
+
+    func drawBatches3DAnd2D(
+        batches3D: [DrawBatch3D],
+        batches2D: [DrawBatch2D],
+        framebufferIndex: Int,
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
+    ) throws {
+        guard let pipeline3D = mode3D.pipeline else {
+            throw Errors.missing3DPipeline
+        }
+        guard framebufferIndex >= 0 && framebufferIndex < swapchainFramebuffers.count else {
+            throw Errors.invalidFramebufferIndex
+        }
+
+        try device.waitForFences([inFlightFence.fence], waitAll: true, timeout: UInt64.max)
+        try device.resetFences([inFlightFence.fence])
+        try VulkanEngine.vulkanResultCheck(vkResetCommandBuffer(commandBuffer.commandBuffer, 0))
+        try commandBuffer.begin()
+
+        var clearValue = VkClearValue(
+            color: VkClearColorValue(float32: (clearColor.x, clearColor.y, clearColor.z, clearColor.w))
+        )
+        var renderPassBeginInfo = VkRenderPassBeginInfo(
+            sType: VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            pNext: nil,
+            renderPass: renderPass.renderPass,
+            framebuffer: swapchainFramebuffers[framebufferIndex].framebuffer,
+            renderArea: VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: swapchainExtent),
+            clearValueCount: 1,
+            pClearValues: nil
+        )
+        withUnsafePointer(to: &clearValue) { clearPtr in
+            renderPassBeginInfo.pClearValues = clearPtr
+            commandBuffer.beginRenderPass(renderPassBeginInfo: &renderPassBeginInfo, contents: VK_SUBPASS_CONTENTS_INLINE)
+        }
+
+        recordDrawBatches(
+            batches3D.map { ($0.buffer, $0.vertexCount) },
+            pipeline: pipeline3D,
+            pipelineLayout: mode3D.pipelineLayout,
+            descriptorSet: mode3D.descriptorSet
+        )
+        recordDrawBatches(
+            batches2D.map { ($0.buffer, $0.vertexCount) },
+            pipeline: mode2D.pipeline,
+            pipelineLayout: mode2D.pipelineLayout,
+            descriptorSet: mode2D.descriptorSet
+        )
+
+        commandBuffer.endRenderPass()
+        try commandBuffer.end()
+        try submitRecordedFrame(waitSemaphores: waitSemaphores, signalSemaphores: signalSemaphores)
+    }
+
     func uploadVertices3D(_ vertices: [Vertex3D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         guard let pipeline = mode3D.pipeline else {
             throw Errors.missing3DPipeline
@@ -1101,7 +1414,7 @@ final class VulkanEngine {
             vertices,
             pipeline: pipeline,
             pipelineLayout: mode3D.pipelineLayout,
-            descriptorSet: nil
+            descriptorSet: mode3D.descriptorSet
         )
     }
 
@@ -1140,7 +1453,7 @@ final class VulkanEngine {
             vertices,
             pipeline: pipeline,
             pipelineLayout: mode3D.pipelineLayout,
-            descriptorSet: nil,
+            descriptorSet: mode3D.descriptorSet,
             framebufferIndex: framebufferIndex
         )
     }
@@ -1158,7 +1471,7 @@ final class VulkanEngine {
             vertices,
             pipeline: pipeline,
             pipelineLayout: mode3D.pipelineLayout,
-            descriptorSet: nil,
+            descriptorSet: mode3D.descriptorSet,
             framebufferIndex: framebufferIndex,
             waitSemaphores: waitSemaphores,
             signalSemaphores: signalSemaphores
@@ -1173,6 +1486,40 @@ final class VulkanEngine {
             mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
         }
         device.unmapMemory(mode2D.uniformMemory)
+    }
+
+    func updateTransform3D(_ transform: simd_float4x4) throws {
+        let size = VkDeviceSize(MemoryLayout<simd_float4x4>.size)
+        let mapped = try device.mapMemory(mode3D.transformUniformMemory, offset: 0, size: size)
+        var local = transform
+        withUnsafeBytes(of: &local) { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(mode3D.transformUniformMemory)
+    }
+
+    func updateModel3D(_ model: simd_float4x4) throws {
+        let size = VkDeviceSize(MemoryLayout<simd_float4x4>.size)
+        let mapped = try device.mapMemory(mode3D.modelUniformMemory, offset: 0, size: size)
+        var local = model
+        withUnsafeBytes(of: &local) { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(mode3D.modelUniformMemory)
+    }
+
+    func updateView3D(_ view: simd_float4x4) throws {
+        let size = VkDeviceSize(MemoryLayout<simd_float4x4>.size)
+        let mapped = try device.mapMemory(mode3D.viewUniformMemory, offset: 0, size: size)
+        var local = view
+        withUnsafeBytes(of: &local) { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(mode3D.viewUniformMemory)
+    }
+
+    func setClearColor(_ color: SIMD4<Float>) {
+        clearColor = color
     }
 
     private func uploadVertices<T>(
@@ -1202,6 +1549,17 @@ final class VulkanEngine {
             throw Errors.emptyVertexData
         }
         let bufferSize = VkDeviceSize(MemoryLayout<T>.stride * vertices.count)
+        let (buffer, memory) = try createBufferWithMemory(size: bufferSize)
+
+        let mapped = try device.mapMemory(memory, offset: 0, size: bufferSize)
+        vertices.withUnsafeBytes { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(memory)
+        return (buffer, memory)
+    }
+
+    private func createBufferWithMemory(size bufferSize: VkDeviceSize) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         var bufferCreateInfo = VkBufferCreateInfo(
             sType: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             pNext: nil,
@@ -1228,12 +1586,6 @@ final class VulkanEngine {
         )
         let memory = try device.allocateMemory(&allocInfo)
         try device.bindBufferMemory(buffer: buffer, memory: memory)
-
-        let mapped = try device.mapMemory(memory, offset: 0, size: bufferSize)
-        vertices.withUnsafeBytes { bytes in
-            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
-        }
-        device.unmapMemory(memory)
         return (buffer, memory)
     }
 
@@ -1246,21 +1598,16 @@ final class VulkanEngine {
         waitSemaphores: [VkSemaphore],
         signalSemaphores: [VkSemaphore]
     ) throws {
-        guard !buffers.isEmpty else {
-            return
-        }
         guard framebufferIndex >= 0 && framebufferIndex < swapchainFramebuffers.count else {
             throw Errors.invalidFramebufferIndex
         }
 
-        let commandBuffer = try device.allocateCommandBuffers(from: commandPool, count: 1).first!
-        defer {
-            device.freeCommandBuffers(from: commandPool, commandBuffers: [commandBuffer])
-        }
-
+        try device.waitForFences([inFlightFence.fence], waitAll: true, timeout: UInt64.max)
+        try device.resetFences([inFlightFence.fence])
+        try VulkanEngine.vulkanResultCheck(vkResetCommandBuffer(commandBuffer.commandBuffer, 0))
         try commandBuffer.begin()
         var clearValue = VkClearValue(
-            color: VkClearColorValue(float32: (0.0, 0.0, 0.9, 1.0))
+            color: VkClearColorValue(float32: (clearColor.x, clearColor.y, clearColor.z, clearColor.w))
         )
         var renderPassBeginInfo = VkRenderPassBeginInfo(
             sType: VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -1275,6 +1622,23 @@ final class VulkanEngine {
             renderPassBeginInfo.pClearValues = clearPtr
             commandBuffer.beginRenderPass(renderPassBeginInfo: &renderPassBeginInfo, contents: VK_SUBPASS_CONTENTS_INLINE)
         }
+        recordDrawBatches(
+            buffers,
+            pipeline: pipeline,
+            pipelineLayout: pipelineLayout,
+            descriptorSet: descriptorSet
+        )
+        commandBuffer.endRenderPass()
+        try commandBuffer.end()
+        try submitRecordedFrame(waitSemaphores: waitSemaphores, signalSemaphores: signalSemaphores)
+    }
+
+    private func recordDrawBatches(
+        _ buffers: [(buffer: VulkanOwnedBuffer, vertexCount: UInt32)],
+        pipeline: VulkanOwnedPipeline,
+        pipelineLayout: VulkanOwnedPipelineLayout,
+        descriptorSet: VkDescriptorSet?
+    ) {
         commandBuffer.bindPipeline(bindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline: pipeline.pipeline)
         if let descriptorSet {
             var set: VkDescriptorSet? = descriptorSet
@@ -1302,10 +1666,12 @@ final class VulkanEngine {
             }
             commandBuffer.draw(vertexCount: batch.vertexCount)
         }
-        commandBuffer.endRenderPass()
-        try commandBuffer.end()
+    }
 
-        let fence = try device.createFence()
+    private func submitRecordedFrame(
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
+    ) throws {
         var commandBufferOptional: VkCommandBuffer? = commandBuffer.commandBuffer
         let waitOptional = waitSemaphores.map { Optional($0) }
         let signalOptional = signalSemaphores.map { Optional($0) }
@@ -1323,12 +1689,11 @@ final class VulkanEngine {
                             signalSemaphoreCount: UInt32(signalPtr.count),
                             pSignalSemaphores: signalPtr.baseAddress
                         )
-                        try device.submit(queue: graphicsQueue, submits: [submitInfo], fence: fence.fence)
+                        try device.submit(queue: graphicsQueue, submits: [submitInfo], fence: inFlightFence.fence)
                     }
                 }
             }
         }
-        try device.waitForFences([fence.fence], waitAll: true, timeout: UInt64.max)
     }
 
     private static func findMemoryTypeIndex(
@@ -1359,6 +1724,7 @@ final class VulkanEngine {
         case swapchainUnsupported
         case noSuitableMemoryType
         case emptyVertexData
+        case vertexDataExceedsCapacity
         case invalidFramebufferIndex
         case missing3DPipeline
         case vulkanFailure(VkResult)

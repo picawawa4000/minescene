@@ -167,8 +167,10 @@ final class BiomeQuadTreeCache {
     }()
     private let profileReportIntervalNs: UInt64 = 2_000_000_000
     private let placeholderColor: (UInt8, UInt8, UInt8, UInt8) = (255, 0, 255, 255)
+    private let palette: BiomeColorPalette
 
-    init(tileSize: Int = 256, baseScale: Int = 4) {
+    init(palette: BiomeColorPalette, tileSize: Int = 256, baseScale: Int = 4) {
+        self.palette = palette
         self.tileSize = tileSize
         self.baseScale = max(1, baseScale)
         let envWorkers = ProcessInfo.processInfo.environment["MINESCENE_TILE_WORKERS"].flatMap(Int.init)
@@ -445,7 +447,7 @@ final class BiomeQuadTreeCache {
                 self.generationSlots.signal()
             }
             let renderStartNs = DispatchTime.now().uptimeNanoseconds
-            let generated = try? BiomeMapRenderer.render(
+            let generated = try? BiomeMapRenderer(palette: self.palette).render(
                 worldGenerator: worldGenerator,
                 topLeftX: regionTopLeftX,
                 topLeftZ: regionTopLeftZ,
@@ -629,6 +631,8 @@ final class BiomeQuadTreeCache {
 }
 
 struct BiomeMapRenderer {
+    let palette: BiomeColorPalette
+
     private struct RenderProfileTotals {
         var calls: Int = 0
         var totalNs: UInt64 = 0
@@ -652,76 +656,7 @@ struct BiomeMapRenderer {
     }()
     private static let renderProfileIntervalNs: UInt64 = 2_000_000_000
 
-    private static let biomeColors: [String: (UInt8, UInt8, UInt8, UInt8)] = [
-        "minecraft:badlands": (200, 120, 60, 255),
-        "minecraft:bamboo_jungle": (40, 170, 70, 255),
-        "minecraft:basalt_deltas": (60, 60, 60, 255),
-        "minecraft:beach": (230, 220, 170, 255),
-        "minecraft:birch_forest": (80, 170, 80, 255),
-        "minecraft:cherry_grove": (220, 160, 180, 255),
-        "minecraft:cold_ocean": (40, 80, 180, 255),
-        "minecraft:crimson_forest": (130, 20, 20, 255),
-        "minecraft:dark_forest": (20, 80, 20, 255),
-        "minecraft:deep_cold_ocean": (30, 70, 150, 255),
-        "minecraft:deep_dark": (20, 30, 35, 255),
-        "minecraft:deep_frozen_ocean": (90, 130, 200, 255),
-        "minecraft:deep_lukewarm_ocean": (50, 140, 190, 255),
-        "minecraft:deep_ocean": (20, 50, 120, 255),
-        "minecraft:desert": (235, 220, 130, 255),
-        "minecraft:dripstone_caves": (150, 120, 90, 255),
-        "minecraft:end_barrens": (170, 180, 100, 255),
-        "minecraft:end_highlands": (190, 200, 110, 255),
-        "minecraft:end_midlands": (190, 200, 110, 255),
-        "minecraft:eroded_badlands": (190, 110, 55, 255),
-        "minecraft:flower_forest": (60, 170, 60, 255),
-        "minecraft:forest": (34, 139, 34, 255),
-        "minecraft:frozen_ocean": (120, 170, 230, 255),
-        "minecraft:frozen_peaks": (210, 225, 240, 255),
-        "minecraft:frozen_river": (160, 200, 255, 255),
-        "minecraft:grove": (180, 220, 180, 255),
-        "minecraft:ice_spikes": (200, 230, 255, 255),
-        "minecraft:jagged_peaks": (200, 210, 230, 255),
-        "minecraft:jungle": (30, 150, 50, 255),
-        "minecraft:lukewarm_ocean": (60, 170, 210, 255),
-        "minecraft:lush_caves": (60, 150, 80, 255),
-        "minecraft:mangrove_swamp": (80, 100, 50, 255),
-        "minecraft:meadow": (90, 180, 90, 255),
-        "minecraft:mushroom_fields": (160, 80, 160, 255),
-        "minecraft:nether_wastes": (160, 60, 40, 255),
-        "minecraft:ocean": (30, 70, 160, 255),
-        "minecraft:old_growth_birch_forest": (60, 150, 70, 255),
-        "minecraft:old_growth_pine_taiga": (50, 110, 90, 255),
-        "minecraft:old_growth_spruce_taiga": (45, 100, 85, 255),
-        "minecraft:pale_garden": (140, 150, 140, 255),
-        "minecraft:plains": (120, 180, 70, 255),
-        "minecraft:river": (60, 110, 200, 255),
-        "minecraft:savanna": (180, 180, 80, 255),
-        "minecraft:savanna_plateau": (170, 170, 70, 255),
-        "minecraft:small_end_islands": (180, 190, 105, 255),
-        "minecraft:snowy_beach": (230, 240, 250, 255),
-        "minecraft:snowy_plains": (230, 240, 250, 255),
-        "minecraft:snowy_slopes": (220, 230, 240, 255),
-        "minecraft:snowy_taiga": (190, 210, 220, 255),
-        "minecraft:soul_sand_valley": (100, 80, 60, 255),
-        "minecraft:sparse_jungle": (50, 160, 60, 255),
-        "minecraft:stony_peaks": (130, 130, 130, 255),
-        "minecraft:stony_shore": (120, 120, 120, 255),
-        "minecraft:sunflower_plains": (130, 190, 75, 255),
-        "minecraft:swamp": (70, 90, 50, 255),
-        "minecraft:taiga": (60, 120, 100, 255),
-        "minecraft:the_end": (200, 210, 120, 255),
-        "minecraft:the_void": (0, 0, 0, 255),
-        "minecraft:warm_ocean": (70, 200, 220, 255),
-        "minecraft:warped_forest": (30, 130, 120, 255),
-        "minecraft:windswept_forest": (70, 130, 90, 255),
-        "minecraft:windswept_gravelly_hills": (110, 110, 110, 255),
-        "minecraft:windswept_hills": (120, 120, 120, 255),
-        "minecraft:windswept_savanna": (160, 160, 70, 255),
-        "minecraft:wooded_badlands": (210, 130, 70, 255),
-    ]
-    private static let fallbackColor: (UInt8, UInt8, UInt8, UInt8) = (255, 0, 255, 255)
-
-    static func render(
+    func render(
         worldGenerator: WorldGenerator,
         topLeftX: Int,
         topLeftZ: Int,
@@ -741,18 +676,18 @@ struct BiomeMapRenderer {
         }
 
         let scaleI = Int32(scale)
-        let fromScaledX = floorDiv(Int32(topLeftX), scaleI)
-        let fromScaledZ = floorDiv(Int32(topLeftZ), scaleI)
-        let toScaledX = ceilDiv(Int32(topLeftX + width * scale), scaleI)
-        let toScaledZ = ceilDiv(Int32(topLeftZ + height * scale), scaleI)
+        let fromScaledX = Self.floorDiv(Int32(topLeftX), scaleI)
+        let fromScaledZ = Self.floorDiv(Int32(topLeftZ), scaleI)
+        let toScaledX = Self.ceilDiv(Int32(topLeftX + width * scale), scaleI)
+        let toScaledZ = Self.ceilDiv(Int32(topLeftZ + height * scale), scaleI)
 
         let alignedFromX = Int(fromScaledX * scaleI)
         let alignedFromZ = Int(fromScaledZ * scaleI)
         let alignedToX = Int(toScaledX * scaleI)
         let alignedToZ = Int(toScaledZ * scaleI)
 
-        let fromPos = makePosInt2D(x: alignedFromX, z: alignedFromZ)
-        let toPos: PosInt2D = makePosInt2D(x: alignedToX, z: alignedToZ)
+        let fromPos = Self.makePosInt2D(x: alignedFromX, z: alignedFromZ)
+        let toPos: PosInt2D = Self.makePosInt2D(x: alignedToX, z: alignedToZ)
         let biomes = try worldGenerator.generateBiomesInSquare(
             from: fromPos,
             to: toPos,
@@ -773,16 +708,15 @@ struct BiomeMapRenderer {
                 if let biomes {
                     let worldX = topLeftX + x * scale
                     let worldZ = topLeftZ + z * scale
-                    let sampleX = Int(floorDiv(Int32(worldX), scaleI) - fromScaledX)
-                    let sampleZ = Int(floorDiv(Int32(worldZ), scaleI) - fromScaledZ)
+                    let sampleX = Int(Self.floorDiv(Int32(worldX), scaleI) - fromScaledX)
+                    let sampleZ = Int(Self.floorDiv(Int32(worldZ), scaleI) - fromScaledZ)
                     let index = sampleZ * sampleWidth + sampleX
                     biomeKey = (index >= 0 && index < biomes.count) ? biomes[index] : nil
                 } else {
                     biomeKey = nil
                 }
 
-                let biomeId = biomeKey?.name ?? "unknown"
-                let color = biomeColors[biomeId] ?? fallbackColor
+                let color = palette.rgba8(forBiomeID: biomeKey?.name)
                 pixels.append(color.0)
                 pixels.append(color.1)
                 pixels.append(color.2)
@@ -793,7 +727,7 @@ struct BiomeMapRenderer {
         return BiomePixelMap(width: width, height: height, pixelsRGBA8: pixels)
     }
 
-    static func render(
+    func render(
         worldGenerator: WorldGenerator,
         topLeftX: Int,
         topLeftZ: Int,
@@ -819,7 +753,7 @@ struct BiomeMapRenderer {
                     topLeftX + (x / scale) * scale,
                     topLeftZ + (z / scale) * scale
                 )
-                let color = biomeColors[biomeId] ?? fallbackColor
+                let color = palette.rgba8(forBiomeID: biomeId)
                 pixels.append(color.0)
                 pixels.append(color.1)
                 pixels.append(color.2)

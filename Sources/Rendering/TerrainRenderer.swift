@@ -37,6 +37,7 @@ final class TerrainRenderer {
         let sizeY: Int
         let sizeZ: Int
         let solid: [UInt8]
+        let biomeColors: [UInt32]
 
         var yzStride: Int { sizeX * sizeZ }
 
@@ -55,6 +56,17 @@ final class TerrainRenderer {
             }
             return localIndex(x: lx, y: ly, z: lz)
         }
+
+        @inline(__always)
+        func biomeColorAtLocal(x: Int, y: Int, z: Int) -> UInt32 {
+            guard x >= 0, x < sizeX, y >= 0, y < sizeY, z >= 0, z < sizeZ else {
+                return 0
+            }
+            guard !biomeColors.isEmpty else {
+                return 0
+            }
+            return biomeColors[localIndex(x: x, y: y, z: z)]
+        }
     }
 
     private struct BuildResult {
@@ -71,7 +83,7 @@ final class TerrainRenderer {
         private let renderRadius: Int
         private let generationWorkerCount: Int
         private let retargetAroundCameraMovement: Bool
-        private let stoneColor: SIMD4<Float>
+        private let biomeColorPalette: BiomeColorPalette
         private let orderedOffsets: [ChunkCoord]
 
         private let lock = NSLock()
@@ -97,13 +109,13 @@ final class TerrainRenderer {
             renderRadius: Int,
             generationWorkerCount: Int,
             retargetAroundCameraMovement: Bool,
-            stoneColor: SIMD4<Float>
+            biomeColorPalette: BiomeColorPalette
         ) {
             self.worldGenerator = worldGenerator
             self.renderRadius = max(0, renderRadius)
             self.generationWorkerCount = max(1, generationWorkerCount)
             self.retargetAroundCameraMovement = retargetAroundCameraMovement
-            self.stoneColor = stoneColor
+            self.biomeColorPalette = biomeColorPalette
             self.orderedOffsets = Self.makeOrderedOffsets(radius: self.renderRadius)
         }
 
@@ -143,6 +155,32 @@ final class TerrainRenderer {
             let result = pendingResult
             pendingResult = nil
             return result
+        }
+
+        func currentBiomeName(at cameraBlock: SIMD3<Int>) -> String? {
+            let chunkCoord = ChunkCoord(
+                x: floorDiv(cameraBlock.x, 16),
+                z: floorDiv(cameraBlock.z, 16)
+            )
+            let localX = floorMod(cameraBlock.x, 16)
+            let localZ = floorMod(cameraBlock.z, 16)
+
+            lock.lock()
+            defer { lock.unlock() }
+            guard let chunk = chunks[chunkCoord] else {
+                return nil
+            }
+            let localY = cameraBlock.y - Int(chunk.minY)
+            guard localY >= 0, localY < Int(chunk.height) else {
+                return nil
+            }
+            return chunk.biome(
+                atLocal: PosInt3D(
+                    x: Int32(localX),
+                    y: Int32(localY),
+                    z: Int32(localZ)
+                )
+            )?.name
         }
 
         private func generationWorkerLoop() {
@@ -319,6 +357,18 @@ final class TerrainRenderer {
             abs(coord.x - center.x) <= renderRadius + extraMargin && abs(coord.z - center.z) <= renderRadius + extraMargin
         }
 
+        private func floorDiv(_ value: Int, _ divisor: Int) -> Int {
+            if value >= 0 {
+                return value / divisor
+            }
+            return -(((-value) + divisor - 1) / divisor)
+        }
+
+        private func floorMod(_ value: Int, _ divisor: Int) -> Int {
+            let result = value % divisor
+            return result >= 0 ? result : result + divisor
+        }
+
         private func rebuildVolume(center: ChunkCoord, chunks: [ChunkCoord: ProtoChunk]) -> Volume? {
             let chunkSpan = renderRadius * 2 + 1
             let sizeX = chunkSpan * 16
@@ -351,13 +401,18 @@ final class TerrainRenderer {
                     sizeX: sizeX,
                     sizeY: 0,
                     sizeZ: sizeZ,
-                    solid: []
+                    solid: [],
+                    biomeColors: []
                 )
             }
 
             let minY = Int(sampleChunk.minY) + firstSolidSection * ProtoChunk.sectionHeight
             let sizeY = (lastSolidSection - firstSolidSection + 1) * ProtoChunk.sectionHeight
             var solid = [UInt8](repeating: 0, count: sizeX * sizeY * sizeZ)
+            var biomeColors = [UInt32](
+                repeating: biomeColorPalette.packedRGBA8(forBiomeID: nil),
+                count: sizeX * sizeY * sizeZ
+            )
             let minChunkX = center.x - renderRadius
             let minChunkZ = center.z - renderRadius
 
@@ -380,6 +435,7 @@ final class TerrainRenderer {
                     guard let section = chunk.section(at: sectionIndex) else {
                         continue
                     }
+
                     let bitmap = section.bitmap
                     if bitmap.allSatisfy({ $0 == 0 }) {
                         continue
@@ -399,6 +455,14 @@ final class TerrainRenderer {
                             let gz = baseZ + z
                             let index = ((gy * sizeZ) + gz) * sizeX + gx
                             solid[index] = 1
+                            let biome = chunk.biome(
+                                atLocal: PosInt3D(
+                                    x: Int32(x),
+                                    y: Int32(sectionIndex * ProtoChunk.sectionHeight + y),
+                                    z: Int32(z)
+                                )
+                            )
+                            biomeColors[index] = biomeColorPalette.packedRGBA8(forBiomeID: biome?.name)
                             word &= word - 1
                         }
                     }
@@ -412,7 +476,8 @@ final class TerrainRenderer {
                 sizeX: sizeX,
                 sizeY: sizeY,
                 sizeZ: sizeZ,
-                solid: solid
+                solid: solid,
+                biomeColors: biomeColors
             )
         }
 
@@ -518,11 +583,17 @@ final class TerrainRenderer {
                 return true
             }
 
+            @inline(__always)
+            func biomeColorLocal(_ x: Int, _ y: Int, _ z: Int) -> UInt32 {
+                volume.biomeColorAtLocal(x: x, y: y, z: z)
+            }
+
             for d in 0..<3 {
                 let u = (d + 1) % 3
                 let v = (d + 2) % 3
                 let maskSize = dims[u] * dims[v]
                 var mask = [Int8](repeating: 0, count: maskSize)
+                var maskColors = [UInt32](repeating: 0, count: maskSize)
 
                 var q = [0, 0, 0]
                 q[d] = 1
@@ -541,10 +612,13 @@ final class TerrainRenderer {
 
                             if aSolid == bSolid {
                                 mask[n] = 0
+                                maskColors[n] = 0
                             } else if aSolid {
                                 mask[n] = 1
+                                maskColors[n] = biomeColorLocal(x[0], x[1], x[2])
                             } else {
                                 mask[n] = -1
+                                maskColors[n] = biomeColorLocal(x[0] + q[0], x[1] + q[1], x[2] + q[2])
                             }
                             n += 1
                         }
@@ -564,7 +638,10 @@ final class TerrainRenderer {
                             }
 
                             var width = 1
-                            while i + width < dims[u], mask[n + width] == c {
+                            let basePackedColor = maskColors[n]
+                            while i + width < dims[u],
+                                  mask[n + width] == c,
+                                  maskColors[n + width] == basePackedColor {
                                 width += 1
                             }
 
@@ -572,7 +649,8 @@ final class TerrainRenderer {
                             var done = false
                             while j + height < dims[v], !done {
                                 for k in 0..<width {
-                                    if mask[n + k + height * dims[u]] != c {
+                                    let maskIndex = n + k + height * dims[u]
+                                    if mask[maskIndex] != c || maskColors[maskIndex] != basePackedColor {
                                         done = true
                                         break
                                     }
@@ -611,11 +689,16 @@ final class TerrainRenderer {
                                 Float(volume.originY + p[1] + dv[1]),
                                 Float(volume.originZ + p[2] + dv[2])
                             )
+                            let faceColor = shadedBiomeColor(
+                                packedBaseColor: basePackedColor,
+                                axis: d,
+                                positiveFace: c > 0
+                            )
 
                             if c > 0 {
-                                appendQuad(&vertices, a: p0, b: p1, c: p2, d: p3)
+                                appendQuad(&vertices, a: p0, b: p1, c: p2, d: p3, color: faceColor)
                             } else {
-                                appendQuad(&vertices, a: p0, b: p3, c: p2, d: p1)
+                                appendQuad(&vertices, a: p0, b: p3, c: p2, d: p1, color: faceColor)
                             }
 
                             for dy in 0..<height {
@@ -639,14 +722,48 @@ final class TerrainRenderer {
             a: SIMD3<Float>,
             b: SIMD3<Float>,
             c: SIMD3<Float>,
-            d: SIMD3<Float>
+            d: SIMD3<Float>,
+            color: SIMD4<Float>
         ) {
-            vertices.append(.init(position: a, color: stoneColor))
-            vertices.append(.init(position: b, color: stoneColor))
-            vertices.append(.init(position: c, color: stoneColor))
-            vertices.append(.init(position: a, color: stoneColor))
-            vertices.append(.init(position: c, color: stoneColor))
-            vertices.append(.init(position: d, color: stoneColor))
+            vertices.append(.init(position: a, color: color))
+            vertices.append(.init(position: b, color: color))
+            vertices.append(.init(position: c, color: color))
+            vertices.append(.init(position: a, color: color))
+            vertices.append(.init(position: c, color: color))
+            vertices.append(.init(position: d, color: color))
+        }
+
+        private func shadedBiomeColor(packedBaseColor: UInt32, axis: Int, positiveFace: Bool) -> SIMD4<Float> {
+            let brightness: Float
+            switch (axis, positiveFace) {
+            case (1, true):
+                brightness = 1.00
+            case (1, false):
+                brightness = 0.58
+            case (0, _):
+                brightness = positiveFace ? 0.78 : 0.70
+            case (2, _):
+                brightness = positiveFace ? 0.88 : 0.82
+            default:
+                brightness = 0.75
+            }
+
+            let baseColor = unpackColor(packedBaseColor)
+            return SIMD4<Float>(
+                baseColor.x * brightness,
+                baseColor.y * brightness,
+                baseColor.z * brightness,
+                baseColor.w
+            )
+        }
+
+        private func unpackColor(_ packed: UInt32) -> SIMD4<Float> {
+            SIMD4<Float>(
+                Float(packed & 0xFF) / 255,
+                Float((packed >> 8) & 0xFF) / 255,
+                Float((packed >> 16) & 0xFF) / 255,
+                Float((packed >> 24) & 0xFF) / 255
+            )
         }
 
         private static func makeOrderedOffsets(radius: Int) -> [ChunkCoord] {
@@ -672,6 +789,7 @@ final class TerrainRenderer {
     }
 
     private let moveSpeed: Float
+    private let fastMoveMultiplier: Float
     private let mouseSensitivity: Float
     private let profilingEnabled = ProcessInfo.processInfo.environment["MINESCENE_PROFILE"] == "1"
     private let streamer: Streamer
@@ -680,6 +798,7 @@ final class TerrainRenderer {
     private let hudYColor = SIMD4<Float>(0.22, 0.72, 0.28, 1.0)
     private let hudZColor = SIMD4<Float>(0.12, 0.20, 0.46, 1.0)
     private let hudFpsColor = SIMD4<Float>(0.62, 0.28, 0.78, 1.0)
+    private let hudBiomeColor = SIMD4<Float>(0.95, 0.55, 0.14, 1.0)
 
     private var meshBuffer: VulkanOwnedBuffer?
     private var meshMemory: VulkanOwnedDeviceMemory?
@@ -691,6 +810,7 @@ final class TerrainRenderer {
     private var hudVertexCapacity = 0
     private var lastHudText = ""
     private var lastHudViewport = SIMD2<Int>(repeating: -1)
+    private var lastHudBiome = ""
 
     private var cameraPosition = SIMD3<Float>(x: 0.0, y: 160.0, z: 0.0)
     private var cameraYaw: Float = -.pi / 4.0
@@ -703,22 +823,26 @@ final class TerrainRenderer {
     private var keyD = false
     private var keySpace = false
     private var keyShift = false
+    private var keyR = false
 
     init(
         worldGenerator: WorldGenerator,
+        biomeColorPalette: BiomeColorPalette,
         renderRadius: Int = 12,
         moveSpeed: Float = 32.0,
+        fastMoveMultiplier: Float = 4.0,
         mouseSensitivity: Float = 0.0025,
         generationWorkerCount: Int = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
     ) {
         self.moveSpeed = moveSpeed
+        self.fastMoveMultiplier = fastMoveMultiplier
         self.mouseSensitivity = mouseSensitivity
         self.streamer = Streamer(
             worldGenerator: worldGenerator,
             renderRadius: renderRadius,
             generationWorkerCount: generationWorkerCount,
             retargetAroundCameraMovement: false,
-            stoneColor: SIMD4<Float>(0.34, 0.34, 0.36, 1.0)
+            biomeColorPalette: biomeColorPalette
         )
     }
 
@@ -755,6 +879,8 @@ final class TerrainRenderer {
             keySpace = pressed
         case SDLK_LSHIFT, SDLK_RSHIFT:
             keyShift = pressed
+        case SDLK_R:
+            keyR = pressed
         default:
             break
         }
@@ -791,7 +917,8 @@ final class TerrainRenderer {
 
         if simd_length_squared(movement) > 0 {
             movement = simd_normalize(movement)
-            cameraPosition += movement * moveSpeed * max(0, deltaTime)
+            let currentMoveSpeed = moveSpeed * (keyR ? fastMoveMultiplier : 1)
+            cameraPosition += movement * currentMoveSpeed * max(0, deltaTime)
         }
 
         let cameraBlock = SIMD3<Int>(
@@ -959,6 +1086,7 @@ final class TerrainRenderer {
     }
 
     private func updateHudIfNeeded(engine: VulkanEngine, viewportWidth: Int, viewportHeight: Int) throws {
+        let biomeText = currentBiomeHudText()
         let positionRuns = [
             HudTextRun(text: String(format: "X: %.1f ", Double(cameraPosition.x)), color: hudXColor),
             HudTextRun(text: String(format: "Y: %.1f ", Double(cameraPosition.y)), color: hudYColor),
@@ -967,17 +1095,25 @@ final class TerrainRenderer {
         let fpsRuns = [
             HudTextRun(text: String(format: "FPS: %.0f", Double(smoothedFps)), color: hudFpsColor)
         ]
-        let hudText = (positionRuns + fpsRuns).map(\.text).joined(separator: "\n")
+        let biomeRuns = [
+            HudTextRun(text: biomeText, color: hudBiomeColor)
+        ]
+        let hudText = (positionRuns + fpsRuns + biomeRuns).map(\.text).joined(separator: "\n")
         let viewport = SIMD2<Int>(viewportWidth, viewportHeight)
-        guard hudText != lastHudText || viewport != lastHudViewport else {
+        guard hudText != lastHudText || viewport != lastHudViewport || biomeText != lastHudBiome else {
             return
         }
 
-        let vertices = makeHudVertices(lines: [positionRuns, fpsRuns])
+        let vertices = makeHudVertices(
+            viewportWidth: viewportWidth,
+            leftLines: [positionRuns, fpsRuns],
+            rightLines: [biomeRuns]
+        )
         if vertices.isEmpty {
             hudVertexCount = 0
             lastHudText = hudText
             lastHudViewport = viewport
+            lastHudBiome = biomeText
             return
         }
 
@@ -1002,6 +1138,7 @@ final class TerrainRenderer {
         )
         lastHudText = hudText
         lastHudViewport = viewport
+        lastHudBiome = biomeText
     }
 
     private struct HudTextRun {
@@ -1009,43 +1146,131 @@ final class TerrainRenderer {
         let color: SIMD4<Float>
     }
 
-    private func makeHudVertices(lines: [[HudTextRun]]) -> [VulkanEngine.Vertex2D] {
-        let cellSize: Float = 5
-        let glyphAdvance: Float = 20
-        let lineAdvance: Float = 34
+    private struct HudStyle {
+        let cellSize: Float
+        let glyphAdvance: Float
+        let lineAdvance: Float
+    }
+
+    private enum HudAlignment {
+        case left
+        case right
+    }
+
+    private func makeHudVertices(
+        viewportWidth: Int,
+        leftLines: [[HudTextRun]],
+        rightLines: [[HudTextRun]]
+    ) -> [VulkanEngine.Vertex2D] {
+        let standardStyle = HudStyle(cellSize: 5, glyphAdvance: 20, lineAdvance: 34)
+        let compactStyle = HudStyle(cellSize: 3, glyphAdvance: 12, lineAdvance: 16)
         let shadowOffset = SIMD2<Float>(1, 1)
-        let origin = SIMD2<Float>(12, 12)
+        let leftOrigin = SIMD2<Float>(12, 12)
+        let rightMargin: Float = 12
 
         var vertices: [VulkanEngine.Vertex2D] = []
-        let characterCount = lines.flatMap { $0 }.reduce(0) { $0 + $1.text.count }
+        let characterCount = (leftLines + rightLines).flatMap { $0 }.reduce(0) { $0 + $1.text.count }
         vertices.reserveCapacity(characterCount * 180)
 
+        appendHudLines(
+            leftLines,
+            originX: leftOrigin.x,
+            originY: leftOrigin.y,
+            viewportWidth: Float(viewportWidth),
+            alignment: .left,
+            style: standardStyle,
+            shadowOffset: shadowOffset,
+            into: &vertices
+        )
+        appendHudLines(
+            rightLines,
+            originX: Float(viewportWidth) - rightMargin,
+            originY: leftOrigin.y,
+            viewportWidth: Float(viewportWidth),
+            alignment: .right,
+            style: compactStyle,
+            shadowOffset: shadowOffset,
+            into: &vertices
+        )
+
+        return vertices
+    }
+
+    private func appendHudLines(
+        _ lines: [[HudTextRun]],
+        originX: Float,
+        originY: Float,
+        viewportWidth: Float,
+        alignment: HudAlignment,
+        style: HudStyle,
+        shadowOffset: SIMD2<Float>,
+        into vertices: inout [VulkanEngine.Vertex2D]
+    ) {
         for (lineIndex, lineRuns) in lines.enumerated() {
-            var cursorX = origin.x
-            let lineY = origin.y + Float(lineIndex) * lineAdvance
+            let lineWidth = hudLineWidth(lineRuns, glyphAdvance: style.glyphAdvance)
+            let startX: Float
+            switch alignment {
+            case .left:
+                startX = originX
+            case .right:
+                startX = max(0, min(originX - lineWidth, viewportWidth - lineWidth))
+            }
+
+            var cursorX = startX
+            let lineY = originY + Float(lineIndex) * style.lineAdvance
             for run in lineRuns {
                 for character in run.text {
                     let glyph = Self.hudGlyphs[character] ?? Self.hudGlyphs[" "]!
                     appendGlyph(
                         glyph,
                         origin: SIMD2<Float>(cursorX + shadowOffset.x, lineY + shadowOffset.y),
-                        cellSize: cellSize,
+                        cellSize: style.cellSize,
                         color: hudShadowColor,
                         into: &vertices
                     )
                     appendGlyph(
                         glyph,
                         origin: SIMD2<Float>(cursorX, lineY),
-                        cellSize: cellSize,
+                        cellSize: style.cellSize,
                         color: run.color,
                         into: &vertices
                     )
-                    cursorX += glyphAdvance
+                    cursorX += style.glyphAdvance
                 }
             }
         }
+    }
 
-        return vertices
+    private func hudLineWidth(_ runs: [HudTextRun], glyphAdvance: Float) -> Float {
+        Float(runs.reduce(0) { $0 + $1.text.count }) * glyphAdvance
+    }
+
+    private func currentBiomeHudText() -> String {
+        let cameraBlock = SIMD3<Int>(
+            Int(floor(cameraPosition.x)),
+            Int(floor(cameraPosition.y)),
+            Int(floor(cameraPosition.z))
+        )
+        let biomeName = streamer.currentBiomeName(at: cameraBlock) ?? "unknown"
+        return "BIOME: \(formatBiomeName(biomeName))"
+    }
+
+    private func formatBiomeName(_ biomeName: String) -> String {
+        let trimmedNamespace: Substring
+        if let colonIndex = biomeName.lastIndex(of: ":") {
+            trimmedNamespace = biomeName[biomeName.index(after: colonIndex)...]
+        } else {
+            trimmedNamespace = Substring(biomeName)
+        }
+
+        return trimmedNamespace
+            .split(separator: "_")
+            .map { token in
+                guard let first = token.first else { return "" }
+                return String(first).uppercased() + token.dropFirst().lowercased()
+            }
+            .joined(separator: " ")
+            .uppercased()
     }
 
     private func appendGlyph(
@@ -1151,6 +1376,26 @@ final class TerrainRenderer {
         "7": ["111", "001", "001", "001", "001"],
         "8": ["111", "101", "111", "101", "111"],
         "9": ["111", "101", "111", "001", "111"],
+        "A": ["010", "101", "111", "101", "101"],
+        "B": ["110", "101", "110", "101", "110"],
+        "C": ["011", "100", "100", "100", "011"],
+        "D": ["110", "101", "101", "101", "110"],
+        "E": ["111", "100", "110", "100", "111"],
+        "G": ["011", "100", "101", "101", "011"],
+        "H": ["101", "101", "111", "101", "101"],
+        "I": ["111", "010", "010", "010", "111"],
+        "J": ["001", "001", "001", "101", "010"],
+        "K": ["101", "101", "110", "101", "101"],
+        "L": ["100", "100", "100", "100", "111"],
+        "M": ["101", "111", "111", "101", "101"],
+        "N": ["101", "111", "111", "111", "101"],
+        "O": ["010", "101", "101", "101", "010"],
+        "Q": ["010", "101", "101", "111", "011"],
+        "R": ["110", "101", "110", "101", "101"],
+        "T": ["111", "010", "010", "010", "010"],
+        "U": ["101", "101", "101", "101", "111"],
+        "V": ["101", "101", "101", "101", "010"],
+        "W": ["101", "101", "111", "111", "101"],
         "X": ["101", "101", "010", "101", "101"],
         "Y": ["101", "101", "010", "010", "010"],
         "Z": ["111", "001", "010", "100", "111"],

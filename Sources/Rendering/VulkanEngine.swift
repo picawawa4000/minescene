@@ -12,8 +12,12 @@ final class VulkanEngine {
         var swapchain: VulkanOwnedSwapchain?
         let swapchainImages: [VkImage]
         var swapchainImageViews: [VulkanOwnedImageView]?
+        var depthImage: VulkanOwnedImage?
+        var depthImageMemory: VulkanOwnedDeviceMemory?
+        var depthImageView: VulkanOwnedImageView?
         var swapchainFramebuffers: [VulkanOwnedFramebuffer]?
         let swapchainFormat: VkFormat
+        let depthFormat: VkFormat
         let swapchainExtent: VkExtent2D
 
         var renderPass: VulkanOwnedRenderPass?
@@ -27,8 +31,12 @@ final class VulkanEngine {
             swapchain: VulkanOwnedSwapchain,
             swapchainImages: [VkImage],
             swapchainImageViews: [VulkanOwnedImageView],
+            depthImage: VulkanOwnedImage,
+            depthImageMemory: VulkanOwnedDeviceMemory,
+            depthImageView: VulkanOwnedImageView,
             swapchainFramebuffers: [VulkanOwnedFramebuffer],
             swapchainFormat: VkFormat,
+            depthFormat: VkFormat,
             swapchainExtent: VkExtent2D,
             renderPass: VulkanOwnedRenderPass,
             mode2D: DrawingMode2D,
@@ -40,8 +48,12 @@ final class VulkanEngine {
             self.swapchain = swapchain
             self.swapchainImages = swapchainImages
             self.swapchainImageViews = swapchainImageViews
+            self.depthImage = depthImage
+            self.depthImageMemory = depthImageMemory
+            self.depthImageView = depthImageView
             self.swapchainFramebuffers = swapchainFramebuffers
             self.swapchainFormat = swapchainFormat
+            self.depthFormat = depthFormat
             self.swapchainExtent = swapchainExtent
             self.renderPass = renderPass
             self.mode2D = mode2D
@@ -49,11 +61,14 @@ final class VulkanEngine {
         }
 
         deinit {
-            // Explicit teardown order: pipelines -> framebuffers -> render pass -> views -> swapchain -> command pool.
+            // Explicit teardown order: pipelines -> framebuffers -> render pass -> depth -> views -> swapchain -> command pool.
             mode3D = nil
             mode2D = nil
             swapchainFramebuffers = nil
             renderPass = nil
+            depthImageView = nil
+            depthImageMemory = nil
+            depthImage = nil
             swapchainImageViews = nil
             swapchain = nil
             inFlightFence = nil
@@ -174,8 +189,12 @@ final class VulkanEngine {
     var swapchain: VulkanOwnedSwapchain { resources!.swapchain! }
     var swapchainImages: [VkImage] { resources!.swapchainImages }
     var swapchainImageViews: [VulkanOwnedImageView] { resources!.swapchainImageViews ?? [] }
+    var depthImage: VulkanOwnedImage { resources!.depthImage! }
+    var depthImageMemory: VulkanOwnedDeviceMemory { resources!.depthImageMemory! }
+    var depthImageView: VulkanOwnedImageView { resources!.depthImageView! }
     var swapchainFramebuffers: [VulkanOwnedFramebuffer] { resources!.swapchainFramebuffers ?? [] }
     var swapchainFormat: VkFormat { resources!.swapchainFormat }
+    var depthFormat: VkFormat { resources!.depthFormat }
     var swapchainExtent: VkExtent2D { resources!.swapchainExtent }
 
     var renderPass: VulkanOwnedRenderPass { resources!.renderPass! }
@@ -231,15 +250,24 @@ final class VulkanEngine {
             surface: self.surface,
             desiredExtent: desiredExtent
         )
+        let depthFormat = try VulkanEngine.chooseDepthFormat(physicalDevice: self.physicalDevice)
+        let depthResources = try VulkanEngine.createDepthResources(
+            device: self.device,
+            physicalDevice: self.physicalDevice,
+            format: depthFormat,
+            extent: swapchainBundle.extent
+        )
         let renderPass = try VulkanEngine.createRenderPass(
             device: self.device,
-            format: swapchainBundle.format
+            colorFormat: swapchainBundle.format,
+            depthFormat: depthFormat
         )
 
         let swapchainFramebuffers = try VulkanEngine.createFramebuffers(
             device: self.device,
             renderPass: renderPass,
             imageViews: swapchainBundle.imageViews,
+            depthImageView: depthResources.imageView,
             extent: swapchainBundle.extent
         )
 
@@ -278,6 +306,7 @@ final class VulkanEngine {
             pipelineLayout: mode2DPipelineLayout,
             vertexInput: VulkanEngine.vertexInput2D(),
             cullMode: VkCullModeFlags(VK_CULL_MODE_NONE.rawValue),
+            enableDepthTest: false,
             vertSpirv: vertSpirv,
             fragSpirv: fragSpirv
         )
@@ -350,6 +379,7 @@ final class VulkanEngine {
                 pipelineLayout: mode3DPipelineLayout,
                 vertexInput: VulkanEngine.vertexInput3D(),
                 cullMode: VkCullModeFlags(VK_CULL_MODE_BACK_BIT.rawValue),
+                enableDepthTest: true,
                 vertSpirv: vertSpirv3D,
                 fragSpirv: fragSpirv3D
             )
@@ -377,8 +407,12 @@ final class VulkanEngine {
             swapchain: swapchainBundle.swapchain,
             swapchainImages: swapchainBundle.images,
             swapchainImageViews: swapchainBundle.imageViews,
+            depthImage: depthResources.image,
+            depthImageMemory: depthResources.memory,
+            depthImageView: depthResources.imageView,
             swapchainFramebuffers: swapchainFramebuffers,
             swapchainFormat: swapchainBundle.format,
+            depthFormat: depthFormat,
             swapchainExtent: swapchainBundle.extent,
             renderPass: renderPass,
             mode2D: mode2D,
@@ -646,10 +680,87 @@ final class VulkanEngine {
         return (swapchain, images, imageViews, surfaceFormat.format, swapExtent)
     }
 
-    private static func createRenderPass(device: VulkanOwnedDevice, format: VkFormat) throws -> VulkanOwnedRenderPass {
+    private static func chooseDepthFormat(physicalDevice: VulkanPhysicalDevice) throws -> VkFormat {
+        let candidates: [VkFormat] = [
+            VK_FORMAT_D32_SFLOAT,
+            VK_FORMAT_D32_SFLOAT_S8_UINT,
+            VK_FORMAT_D24_UNORM_S8_UINT
+        ]
+        for format in candidates {
+            let properties = physicalDevice.getFormatProperties(format: format)
+            if (properties.optimalTilingFeatures & VkFormatFeatureFlags(VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT.rawValue)) != 0 {
+                return format
+            }
+        }
+        throw Errors.depthFormatUnsupported
+    }
+
+    private static func createDepthResources(
+        device: VulkanOwnedDevice,
+        physicalDevice: VulkanPhysicalDevice,
+        format: VkFormat,
+        extent: VkExtent2D
+    ) throws -> (image: VulkanOwnedImage, memory: VulkanOwnedDeviceMemory, imageView: VulkanOwnedImageView) {
+        var imageCreateInfo = VkImageCreateInfo.create(
+            flags: 0,
+            imageType: VK_IMAGE_TYPE_2D,
+            format: format,
+            extent: VkExtent3D(width: extent.width, height: extent.height, depth: 1),
+            mipLevels: 1,
+            arrayLayers: 1,
+            samples: VK_SAMPLE_COUNT_1_BIT,
+            tiling: VK_IMAGE_TILING_OPTIMAL,
+            usage: VkImageUsageFlags(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT.rawValue),
+            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            queueFamilyIndexCount: 0,
+            pQueueFamilyIndices: nil,
+            initialLayout: VK_IMAGE_LAYOUT_UNDEFINED
+        )
+        let image = try device.createImage(&imageCreateInfo)
+        let requirements = device.getImageMemoryRequirements(image)
+        let memoryTypeIndex = try findMemoryTypeIndex(
+            physicalDevice,
+            typeBits: requirements.memoryTypeBits,
+            properties: VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.rawValue)
+        )
+        var allocInfo = VkMemoryAllocateInfo.create(
+            allocationSize: requirements.size,
+            memoryTypeIndex: memoryTypeIndex
+        )
+        let memory = try device.allocateMemory(&allocInfo)
+        try device.bindImageMemory(image: image, memory: memory)
+
+        var imageViewCreateInfo = VkImageViewCreateInfo.create(
+            flags: 0,
+            image: image.image,
+            viewType: VK_IMAGE_VIEW_TYPE_2D,
+            format: format,
+            components: VkComponentMapping(
+                r: VK_COMPONENT_SWIZZLE_IDENTITY,
+                g: VK_COMPONENT_SWIZZLE_IDENTITY,
+                b: VK_COMPONENT_SWIZZLE_IDENTITY,
+                a: VK_COMPONENT_SWIZZLE_IDENTITY
+            ),
+            subresourceRange: VkImageSubresourceRange(
+                aspectMask: VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT.rawValue),
+                baseMipLevel: 0,
+                levelCount: 1,
+                baseArrayLayer: 0,
+                layerCount: 1
+            )
+        )
+        let imageView = try device.createImageView(&imageViewCreateInfo)
+        return (image, memory, imageView)
+    }
+
+    private static func createRenderPass(
+        device: VulkanOwnedDevice,
+        colorFormat: VkFormat,
+        depthFormat: VkFormat
+    ) throws -> VulkanOwnedRenderPass {
         var colorAttachment = VkAttachmentDescription(
             flags: 0,
-            format: format,
+            format: colorFormat,
             samples: VK_SAMPLE_COUNT_1_BIT,
             loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
             storeOp: VK_ATTACHMENT_STORE_OP_STORE,
@@ -658,35 +769,53 @@ final class VulkanEngine {
             initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
             finalLayout: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
         )
+        var depthAttachment = VkAttachmentDescription(
+            flags: 0,
+            format: depthFormat,
+            samples: VK_SAMPLE_COUNT_1_BIT,
+            loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
+            storeOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            stencilLoadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            stencilStoreOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+            finalLayout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        )
+        var attachments = [colorAttachment, depthAttachment]
         var colorAttachmentRef = VkAttachmentReference(
             attachment: 0,
             layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
         )
-        return try withUnsafePointer(to: &colorAttachment) { attachmentPtr in
+        var depthAttachmentRef = VkAttachmentReference(
+            attachment: 1,
+            layout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        )
+        return try attachments.withUnsafeMutableBufferPointer { attachmentsPtr in
             try withUnsafePointer(to: &colorAttachmentRef) { colorRefPtr in
-                var subpass = VkSubpassDescription(
-                    flags: 0,
-                    pipelineBindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    inputAttachmentCount: 0,
-                    pInputAttachments: nil,
-                    colorAttachmentCount: 1,
-                    pColorAttachments: colorRefPtr,
-                    pResolveAttachments: nil,
-                    pDepthStencilAttachment: nil,
-                    preserveAttachmentCount: 0,
-                    pPreserveAttachments: nil
-                )
-                return try withUnsafePointer(to: &subpass) { subpassPtr in
-                    var renderPassCreateInfo = VkRenderPassCreateInfo.create(
+                try withUnsafePointer(to: &depthAttachmentRef) { depthRefPtr in
+                    var subpass = VkSubpassDescription(
                         flags: 0,
-                        attachmentCount: 1,
-                        pAttachments: attachmentPtr,
-                        subpassCount: 1,
-                        pSubpasses: subpassPtr,
-                        dependencyCount: 0,
-                        pDependencies: nil
+                        pipelineBindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        inputAttachmentCount: 0,
+                        pInputAttachments: nil,
+                        colorAttachmentCount: 1,
+                        pColorAttachments: colorRefPtr,
+                        pResolveAttachments: nil,
+                        pDepthStencilAttachment: depthRefPtr,
+                        preserveAttachmentCount: 0,
+                        pPreserveAttachments: nil
                     )
-                    return try device.createRenderPass(&renderPassCreateInfo)
+                    return try withUnsafePointer(to: &subpass) { subpassPtr in
+                        var renderPassCreateInfo = VkRenderPassCreateInfo.create(
+                            flags: 0,
+                            attachmentCount: UInt32(attachmentsPtr.count),
+                            pAttachments: attachmentsPtr.baseAddress,
+                            subpassCount: 1,
+                            pSubpasses: subpassPtr,
+                            dependencyCount: 0,
+                            pDependencies: nil
+                        )
+                        return try device.createRenderPass(&renderPassCreateInfo)
+                    }
                 }
             }
         }
@@ -696,15 +825,16 @@ final class VulkanEngine {
         device: VulkanOwnedDevice,
         renderPass: VulkanOwnedRenderPass,
         imageViews: [VulkanOwnedImageView],
+        depthImageView: VulkanOwnedImageView,
         extent: VkExtent2D
     ) throws -> [VulkanOwnedFramebuffer] {
         try imageViews.map { imageView in
-            let imageViewRefs: [VkImageView?] = [imageView.imageView]
+            let imageViewRefs: [VkImageView?] = [imageView.imageView, depthImageView.imageView]
             return try imageViewRefs.withUnsafeBufferPointer { imageViewPtr in
                 var framebufferCreateInfo = VkFramebufferCreateInfo.create(
                     flags: 0,
                     renderPass: renderPass.renderPass,
-                    attachmentCount: 1,
+                    attachmentCount: UInt32(imageViewRefs.count),
                     pAttachments: imageViewPtr.baseAddress,
                     width: extent.width,
                     height: extent.height,
@@ -722,6 +852,7 @@ final class VulkanEngine {
         pipelineLayout: VulkanOwnedPipelineLayout,
         vertexInput: VertexInputDescription,
         cullMode: VkCullModeFlags = VkCullModeFlags(VK_CULL_MODE_NONE.rawValue),
+        enableDepthTest: Bool = false,
         vertSpirv: [UInt32],
         fragSpirv: [UInt32]
     ) throws -> VulkanOwnedPipeline {
@@ -819,6 +950,20 @@ final class VulkanEngine {
                     alphaToCoverageEnable: VK_FALSE,
                     alphaToOneEnable: VK_FALSE
                 )
+                var depthStencil = VkPipelineDepthStencilStateCreateInfo(
+                    sType: VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                    pNext: nil,
+                    flags: 0,
+                    depthTestEnable: enableDepthTest ? VK_TRUE : VK_FALSE,
+                    depthWriteEnable: enableDepthTest ? VK_TRUE : VK_FALSE,
+                    depthCompareOp: VK_COMPARE_OP_LESS,
+                    depthBoundsTestEnable: VK_FALSE,
+                    stencilTestEnable: VK_FALSE,
+                    front: VkStencilOpState(),
+                    back: VkStencilOpState(),
+                    minDepthBounds: 0,
+                    maxDepthBounds: 1
+                )
                 var colorBlendAttachment = VkPipelineColorBlendAttachmentState(
                     blendEnable: VK_FALSE,
                     srcColorBlendFactor: VK_BLEND_FACTOR_ONE,
@@ -855,33 +1000,35 @@ final class VulkanEngine {
                                     return try withUnsafePointer(to: &viewportState) { viewportStatePtr in
                                         try withUnsafePointer(to: &rasterization) { rasterizationPtr in
                                             try withUnsafePointer(to: &multisample) { multisamplePtr in
-                                                try withUnsafePointer(to: &colorBlendAttachment) { colorBlendAttachmentPtr in
-                                                    colorBlend.pAttachments = colorBlendAttachmentPtr
-                                                    return try withUnsafePointer(to: &colorBlend) { colorBlendPtr in
-                                                        var graphicsPipelineCreateInfo = VkGraphicsPipelineCreateInfo(
-                                                            sType: VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-                                                            pNext: nil,
-                                                            flags: 0,
-                                                            stageCount: UInt32(stagesPtr.count),
-                                                            pStages: stagesPtr.baseAddress,
-                                                            pVertexInputState: vertexInputStatePtr,
-                                                            pInputAssemblyState: inputAssemblyPtr,
-                                                            pTessellationState: nil,
-                                                            pViewportState: viewportStatePtr,
-                                                            pRasterizationState: rasterizationPtr,
-                                                            pMultisampleState: multisamplePtr,
-                                                            pDepthStencilState: nil,
-                                                            pColorBlendState: colorBlendPtr,
-                                                            pDynamicState: nil,
-                                                            layout: pipelineLayout.pipelineLayout,
-                                                            renderPass: renderPass.renderPass,
-                                                            subpass: 0,
-                                                            basePipelineHandle: nil,
-                                                            basePipelineIndex: 0
-                                                        )
-                                                        return try device.createGraphicsPipeline(
-                                                            createInfo: &graphicsPipelineCreateInfo
-                                                        )
+                                                try withUnsafePointer(to: &depthStencil) { depthStencilPtr in
+                                                    try withUnsafePointer(to: &colorBlendAttachment) { colorBlendAttachmentPtr in
+                                                        colorBlend.pAttachments = colorBlendAttachmentPtr
+                                                        return try withUnsafePointer(to: &colorBlend) { colorBlendPtr in
+                                                            var graphicsPipelineCreateInfo = VkGraphicsPipelineCreateInfo(
+                                                                sType: VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                                                pNext: nil,
+                                                                flags: 0,
+                                                                stageCount: UInt32(stagesPtr.count),
+                                                                pStages: stagesPtr.baseAddress,
+                                                                pVertexInputState: vertexInputStatePtr,
+                                                                pInputAssemblyState: inputAssemblyPtr,
+                                                                pTessellationState: nil,
+                                                                pViewportState: viewportStatePtr,
+                                                                pRasterizationState: rasterizationPtr,
+                                                                pMultisampleState: multisamplePtr,
+                                                                pDepthStencilState: depthStencilPtr,
+                                                                pColorBlendState: colorBlendPtr,
+                                                                pDynamicState: nil,
+                                                                layout: pipelineLayout.pipelineLayout,
+                                                                renderPass: renderPass.renderPass,
+                                                                subpass: 0,
+                                                                basePipelineHandle: nil,
+                                                                basePipelineIndex: 0
+                                                            )
+                                                            return try device.createGraphicsPipeline(
+                                                                createInfo: &graphicsPipelineCreateInfo
+                                                            )
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1371,20 +1518,21 @@ final class VulkanEngine {
         try VulkanEngine.vulkanResultCheck(vkResetCommandBuffer(commandBuffer.commandBuffer, 0))
         try commandBuffer.begin()
 
-        var clearValue = VkClearValue(
-            color: VkClearColorValue(float32: (clearColor.x, clearColor.y, clearColor.z, clearColor.w))
-        )
+        var clearValues = [
+            VkClearValue(color: VkClearColorValue(float32: (clearColor.x, clearColor.y, clearColor.z, clearColor.w))),
+            VkClearValue(depthStencil: VkClearDepthStencilValue(depth: 1, stencil: 0))
+        ]
         var renderPassBeginInfo = VkRenderPassBeginInfo(
             sType: VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             pNext: nil,
             renderPass: renderPass.renderPass,
             framebuffer: swapchainFramebuffers[framebufferIndex].framebuffer,
             renderArea: VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: swapchainExtent),
-            clearValueCount: 1,
+            clearValueCount: UInt32(clearValues.count),
             pClearValues: nil
         )
-        withUnsafePointer(to: &clearValue) { clearPtr in
-            renderPassBeginInfo.pClearValues = clearPtr
+        clearValues.withUnsafeBufferPointer { clearPtr in
+            renderPassBeginInfo.pClearValues = clearPtr.baseAddress
             commandBuffer.beginRenderPass(renderPassBeginInfo: &renderPassBeginInfo, contents: VK_SUBPASS_CONTENTS_INLINE)
         }
 
@@ -1606,20 +1754,21 @@ final class VulkanEngine {
         try device.resetFences([inFlightFence.fence])
         try VulkanEngine.vulkanResultCheck(vkResetCommandBuffer(commandBuffer.commandBuffer, 0))
         try commandBuffer.begin()
-        var clearValue = VkClearValue(
-            color: VkClearColorValue(float32: (clearColor.x, clearColor.y, clearColor.z, clearColor.w))
-        )
+        var clearValues = [
+            VkClearValue(color: VkClearColorValue(float32: (clearColor.x, clearColor.y, clearColor.z, clearColor.w))),
+            VkClearValue(depthStencil: VkClearDepthStencilValue(depth: 1, stencil: 0))
+        ]
         var renderPassBeginInfo = VkRenderPassBeginInfo(
             sType: VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             pNext: nil,
             renderPass: renderPass.renderPass,
             framebuffer: swapchainFramebuffers[framebufferIndex].framebuffer,
             renderArea: VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: swapchainExtent),
-            clearValueCount: 1,
+            clearValueCount: UInt32(clearValues.count),
             pClearValues: nil
         )
-        withUnsafePointer(to: &clearValue) { clearPtr in
-            renderPassBeginInfo.pClearValues = clearPtr
+        clearValues.withUnsafeBufferPointer { clearPtr in
+            renderPassBeginInfo.pClearValues = clearPtr.baseAddress
             commandBuffer.beginRenderPass(renderPassBeginInfo: &renderPassBeginInfo, contents: VK_SUBPASS_CONTENTS_INLINE)
         }
         recordDrawBatches(
@@ -1722,6 +1871,7 @@ final class VulkanEngine {
         case noSuitableQueueFamily
         case invalidSpirvData
         case swapchainUnsupported
+        case depthFormatUnsupported
         case noSuitableMemoryType
         case emptyVertexData
         case vertexDataExceedsCapacity

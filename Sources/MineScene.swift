@@ -28,6 +28,7 @@ final class MineSceneApp {
     private var terrainRenderer: TerrainRenderer?
     private var imageAvailable: VulkanOwnedSemaphore?
     private var renderFinishedByImage: [VulkanOwnedSemaphore] = []
+    private let biomeColorPalette = BiomeColorPalette.defaultPalette()
 
     init() throws {
         self.sdl = try SDLRuntime()
@@ -75,12 +76,12 @@ final class MineSceneApp {
         let surface = try createVulkanSurface(from: window, instance: instance)
         self.surface = surface
 
-        let seed: UInt64 = 123456789
+        let seed: Int64 = -214726972146453730
         let dataPackPath = "vanilla/1.21.11"
         let dataPackURL = URL(fileURLWithPath: dataPackPath, isDirectory: true)
         let dataPack = try DataPack(fromRootPath: dataPackURL)
         let worldGenerator = try WorldGenerator(
-            withWorldSeed: seed,
+            withWorldSeed: UInt64(bitPattern: seed),
             usingDataPacks: [dataPack],
             usingSettings: RegistryKey(referencing: "minecraft:overworld")
         )
@@ -101,7 +102,10 @@ final class MineSceneApp {
         self.renderFinishedByImage = try engine.swapchainImages.map { _ in
             try engine.device.createSemaphore()
         }
-        self.terrainRenderer = TerrainRenderer(worldGenerator: worldGenerator)
+        self.terrainRenderer = TerrainRenderer(
+            worldGenerator: worldGenerator,
+            biomeColorPalette: biomeColorPalette
+        )
     }
 
     static func main() throws {

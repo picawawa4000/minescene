@@ -10,7 +10,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/picawawa4000/swift-vulkan-bindings.git", branch: "main"),
-        .package(url: "https://github.com/picawawa4000/dpreader-swift.git", branch: "master"),
+        .package(url: "https://github.com/picawawa4000/dpreader-swift.git", revision: "a8b7049bdc78632514c123eb8d7503075496fbd8"),
         .package(url: "https://github.com/KevinVitale/SwiftSDL.git", from: "0.2.0-alpha.28")
     ], 
     targets: [

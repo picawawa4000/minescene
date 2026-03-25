@@ -76,7 +76,7 @@ final class MineSceneApp {
         let surface = try createVulkanSurface(from: window, instance: instance)
         self.surface = surface
 
-        let seed: Int64 = -214726972146453730
+        let seed: Int64 = 8608349533057813284
         let dataPackPath = "vanilla/1.21.11"
         let dataPackURL = URL(fileURLWithPath: dataPackPath, isDirectory: true)
         let dataPack = try DataPack(fromRootPath: dataPackURL)

@@ -6,10 +6,8 @@ import VulkanBindings
 import simd
 
 final class TerrainRenderer {
-    private struct RebuildProfile {
-        var generatedChunks = 0
+    private struct MeshProfile {
         var generationSeconds: Double = 0
-        var volumeSeconds: Double = 0
         var meshSeconds: Double = 0
         var uploadSeconds: Double = 0
     }
@@ -19,90 +17,64 @@ final class TerrainRenderer {
         let z: Int
     }
 
-    private struct ChunkSnapshot {
+    private struct ChunkMeshSnapshot {
+        let coord: ChunkCoord
         let revision: Int
-        let center: ChunkCoord
-        let cameraBlock: SIMD3<Int>
-        let chunks: [ChunkCoord: ProtoChunk]
-        let generatedChunks: Int
+        let chunk: ProtoChunk
+        let neighbors: [ChunkCoord: ProtoChunk]
         let generationSeconds: Double
+        let totalTargetChunks: Int
+        let availableChunks: Int
+    }
+
+    private struct ChunkMeshResult {
+        let coord: ChunkCoord
+        let revision: Int
+        let vertices: [VulkanEngine.Vertex3D]
+        let profile: MeshProfile
+        let availableChunks: Int
         let totalTargetChunks: Int
     }
 
-    private struct Volume {
-        let originX: Int
-        let originY: Int
-        let originZ: Int
-        let sizeX: Int
-        let sizeY: Int
-        let sizeZ: Int
-        let solid: [UInt8]
-        let biomeColors: [UInt32]
-
-        var yzStride: Int { sizeX * sizeZ }
-
-        @inline(__always)
-        func localIndex(x: Int, y: Int, z: Int) -> Int {
-            ((y * sizeZ) + z) * sizeX + x
-        }
-
-        @inline(__always)
-        func index(worldX: Int, worldY: Int, worldZ: Int) -> Int? {
-            let lx = worldX - originX
-            let ly = worldY - originY
-            let lz = worldZ - originZ
-            guard lx >= 0, lx < sizeX, ly >= 0, ly < sizeY, lz >= 0, lz < sizeZ else {
-                return nil
-            }
-            return localIndex(x: lx, y: ly, z: lz)
-        }
-
-        @inline(__always)
-        func biomeColorAtLocal(x: Int, y: Int, z: Int) -> UInt32 {
-            guard x >= 0, x < sizeX, y >= 0, y < sizeY, z >= 0, z < sizeZ else {
-                return 0
-            }
-            guard !biomeColors.isEmpty else {
-                return 0
-            }
-            return biomeColors[localIndex(x: x, y: y, z: z)]
-        }
+    private struct ChunkRenderMesh {
+        let buffer: VulkanOwnedBuffer
+        let memory: VulkanOwnedDeviceMemory
+        let vertexCount: UInt32
     }
 
-    private struct BuildResult {
-        let revision: Int
-        let vertices: [VulkanEngine.Vertex3D]
-        let profile: RebuildProfile
-        let volumeDescription: String
-        let availableChunks: Int
+    private struct StreamDebugStatus {
+        let generatedChunks: Int
+        let inFlightGenerationChunks: Int
+        let dirtyMeshChunks: Int
+        let inFlightMeshChunks: Int
         let totalTargetChunks: Int
     }
 
     private final class Streamer: @unchecked Sendable {
         private let worldGenerator: WorldGenerator
-        private let renderRadius: Int
         private let generationWorkerCount: Int
         private let retargetAroundCameraMovement: Bool
         private let biomeColorPalette: BiomeColorPalette
-        private let orderedOffsets: [ChunkCoord]
 
         private let lock = NSLock()
         private let generationQueue = DispatchQueue(label: "TerrainRenderer.Generation", qos: .userInitiated, attributes: .concurrent)
-        private let rebuildQueue = DispatchQueue(label: "TerrainRenderer.Mesh", qos: .userInitiated)
+        private let meshQueue = DispatchQueue(label: "TerrainRenderer.Mesh", qos: .userInitiated, attributes: .concurrent)
 
+        private var renderRadius: Int
+        private var orderedOffsets: [ChunkCoord]
         private var targetCenter: ChunkCoord?
         private var targetCameraBlock = SIMD3<Int>(Int.min, Int.min, Int.min)
         private var chunks: [ChunkCoord: ProtoChunk] = [:]
         private var inFlightChunks: Set<ChunkCoord> = []
         private var activeGenerationWorkers = 0
 
-        private var rebuildRequested = false
-        private var rebuildRunning = false
-        private var pendingResult: BuildResult?
-        private var revision = 0
-
-        private var generatedChunksSinceLastBuild = 0
-        private var generationSecondsSinceLastBuild: Double = 0
+        private var dirtyMeshChunks: Set<ChunkCoord> = []
+        private var inFlightMeshChunks: Set<ChunkCoord> = []
+        private var activeMeshWorkers = 0
+        private var chunkMeshRevision: [ChunkCoord: Int] = [:]
+        private var pendingMeshResults: [ChunkCoord: ChunkMeshResult] = [:]
+        private var pendingRemovedChunks: Set<ChunkCoord> = []
+        private var generationSecondsByChunk: [ChunkCoord: Double] = [:]
 
         init(
             worldGenerator: WorldGenerator,
@@ -119,8 +91,49 @@ final class TerrainRenderer {
             self.orderedOffsets = Self.makeOrderedOffsets(radius: self.renderRadius)
         }
 
+        func adjustRenderRadius(by delta: Int) {
+            var generationWorkersToStart = 0
+            var meshWorkersToStart = 0
+
+            lock.lock()
+            let nextRadius = max(0, renderRadius + delta)
+            guard nextRadius != renderRadius else {
+                lock.unlock()
+                return
+            }
+
+            renderRadius = nextRadius
+            orderedOffsets = Self.makeOrderedOffsets(radius: renderRadius)
+
+            if let center = targetCenter {
+                let removed = pruneChunksLocked(around: center)
+                for removedCoord in removed {
+                    markChunkRemovedLocked(removedCoord)
+                }
+                for coord in chunks.keys {
+                    markChunkDirtyLocked(coord)
+                }
+            }
+
+            generationWorkersToStart = startGenerationWorkersLocked()
+            meshWorkersToStart = startMeshWorkersLocked()
+            lock.unlock()
+
+            for _ in 0..<generationWorkersToStart {
+                generationQueue.async { [self] in
+                    generationWorkerLoop()
+                }
+            }
+            for _ in 0..<meshWorkersToStart {
+                meshQueue.async { [self] in
+                    meshWorkerLoop()
+                }
+            }
+        }
+
         func updateTarget(center: ChunkCoord, cameraBlock: SIMD3<Int>) {
-            var workersToStart = 0
+            var generationWorkersToStart = 0
+            var meshWorkersToStart = 0
             lock.lock()
             let effectiveCenter: ChunkCoord
             if retargetAroundCameraMovement || targetCenter == nil {
@@ -133,28 +146,49 @@ final class TerrainRenderer {
             targetCenter = effectiveCenter
             targetCameraBlock = cameraBlock
             if centerChanged {
-                pruneChunksLocked(around: effectiveCenter)
+                let removed = pruneChunksLocked(around: effectiveCenter)
+                for removedCoord in removed {
+                    markChunkRemovedLocked(removedCoord)
+                }
             }
             if centerChanged || blockChanged {
-                revision += 1
+                if centerChanged {
+                    for coord in chunks.keys {
+                        markChunkDirtyLocked(coord)
+                    }
+                }
                 requestRebuildLocked()
             }
-            workersToStart = startGenerationWorkersLocked()
+            generationWorkersToStart = startGenerationWorkersLocked()
+            meshWorkersToStart = startMeshWorkersLocked()
             lock.unlock()
 
-            for _ in 0..<workersToStart {
+            for _ in 0..<generationWorkersToStart {
                 generationQueue.async { [self] in
                     generationWorkerLoop()
                 }
             }
+            for _ in 0..<meshWorkersToStart {
+                meshQueue.async { [self] in
+                    meshWorkerLoop()
+                }
+            }
         }
 
-        func takeCompletedResult() -> BuildResult? {
+        func takeCompletedResults() -> (results: [ChunkMeshResult], removals: [ChunkCoord]) {
             lock.lock()
             defer { lock.unlock() }
-            let result = pendingResult
-            pendingResult = nil
-            return result
+            let results = pendingMeshResults.values.sorted { lhs, rhs in
+                if lhs.coord.z != rhs.coord.z { return lhs.coord.z < rhs.coord.z }
+                return lhs.coord.x < rhs.coord.x
+            }
+            let removals = pendingRemovedChunks.sorted { lhs, rhs in
+                if lhs.z != rhs.z { return lhs.z < rhs.z }
+                return lhs.x < rhs.x
+            }
+            pendingMeshResults.removeAll(keepingCapacity: true)
+            pendingRemovedChunks.removeAll(keepingCapacity: true)
+            return (results, removals)
         }
 
         func currentBiomeName(at cameraBlock: SIMD3<Int>) -> String? {
@@ -183,6 +217,40 @@ final class TerrainRenderer {
             )?.name
         }
 
+        func debugStatus() -> StreamDebugStatus {
+            lock.lock()
+            defer { lock.unlock() }
+
+            guard let center = targetCenter else {
+                return StreamDebugStatus(
+                    generatedChunks: 0,
+                    inFlightGenerationChunks: 0,
+                    dirtyMeshChunks: dirtyMeshChunks.count,
+                    inFlightMeshChunks: inFlightMeshChunks.count,
+                    totalTargetChunks: orderedOffsets.count
+                )
+            }
+
+            let generatedChunks = chunks.keys.reduce(into: 0) { count, coord in
+                if shouldKeepChunk(coord, around: center) {
+                    count += 1
+                }
+            }
+            let inFlightGenerationChunks = inFlightChunks.reduce(into: 0) { count, coord in
+                if shouldKeepChunk(coord, around: center) {
+                    count += 1
+                }
+            }
+
+            return StreamDebugStatus(
+                generatedChunks: generatedChunks,
+                inFlightGenerationChunks: inFlightGenerationChunks,
+                dirtyMeshChunks: dirtyMeshChunks.count,
+                inFlightMeshChunks: inFlightMeshChunks.count,
+                totalTargetChunks: orderedOffsets.count
+            )
+        }
+
         private func generationWorkerLoop() {
             while true {
                 let chunkCoord: ChunkCoord
@@ -201,119 +269,41 @@ final class TerrainRenderer {
                 let generationSucceeded = (try? worldGenerator.generateInto(protoChunk, at: PosInt2D(x: Int32(chunkCoord.x), z: Int32(chunkCoord.z)))) != nil
                 let generationSeconds = CFAbsoluteTimeGetCurrent() - generationStart
 
-                var workersToStart = 0
+                var generationWorkersToStart = 0
+                var meshWorkersToStart = 0
                 lock.lock()
                 inFlightChunks.remove(chunkCoord)
                 if generationSucceeded, let center = targetCenter, shouldKeepChunk(chunkCoord, around: center) {
                     chunks[chunkCoord] = protoChunk
-                    generatedChunksSinceLastBuild += 1
-                    generationSecondsSinceLastBuild += generationSeconds
-                    revision += 1
-                    requestRebuildLocked()
+                    generationSecondsByChunk[chunkCoord] = generationSeconds
+                    markChunkDirtyLocked(chunkCoord)
+                    for neighbor in adjacentChunkCoords(to: chunkCoord) where chunks[neighbor] != nil {
+                        markChunkDirtyLocked(neighbor)
+                    }
                 }
-                pruneChunksLockedIfNeeded()
-                workersToStart = startGenerationWorkersLocked()
+                let removed = pruneChunksLockedIfNeeded()
+                for removedCoord in removed {
+                    markChunkRemovedLocked(removedCoord)
+                }
+                generationWorkersToStart = startGenerationWorkersLocked()
+                meshWorkersToStart = startMeshWorkersLocked()
                 lock.unlock()
 
-                for _ in 0..<workersToStart {
+                for _ in 0..<generationWorkersToStart {
                     generationQueue.async { [self] in
                         generationWorkerLoop()
+                    }
+                }
+                for _ in 0..<meshWorkersToStart {
+                    meshQueue.async { [self] in
+                        meshWorkerLoop()
                     }
                 }
             }
         }
 
         private func requestRebuildLocked() {
-            rebuildRequested = true
-            guard !rebuildRunning else {
-                return
-            }
-            rebuildRunning = true
-            rebuildQueue.async { [self] in
-                rebuildLoop()
-            }
-        }
-
-        private func rebuildLoop() {
-            while true {
-                let snapshot: ChunkSnapshot?
-                lock.lock()
-                if !rebuildRequested {
-                    rebuildRunning = false
-                    lock.unlock()
-                    return
-                }
-                rebuildRequested = false
-                snapshot = makeSnapshotLocked()
-                lock.unlock()
-
-                guard let snapshot else {
-                    continue
-                }
-                let result = build(snapshot: snapshot)
-
-                lock.lock()
-                if pendingResult == nil || result.revision >= pendingResult!.revision {
-                    pendingResult = result
-                }
-                lock.unlock()
-            }
-        }
-
-        private func makeSnapshotLocked() -> ChunkSnapshot? {
-            guard let center = targetCenter else {
-                return nil
-            }
-
-            pruneChunksLocked(around: center)
-            let relevantChunks = chunks.filter { shouldKeepChunk($0.key, around: center) }
-            let snapshot = ChunkSnapshot(
-                revision: revision,
-                center: center,
-                cameraBlock: targetCameraBlock,
-                chunks: relevantChunks,
-                generatedChunks: generatedChunksSinceLastBuild,
-                generationSeconds: generationSecondsSinceLastBuild,
-                totalTargetChunks: orderedOffsets.count
-            )
-            generatedChunksSinceLastBuild = 0
-            generationSecondsSinceLastBuild = 0
-            return snapshot
-        }
-
-        private func build(snapshot: ChunkSnapshot) -> BuildResult {
-            var profile = RebuildProfile(
-                generatedChunks: snapshot.generatedChunks,
-                generationSeconds: snapshot.generationSeconds,
-                volumeSeconds: 0,
-                meshSeconds: 0,
-                uploadSeconds: 0
-            )
-
-            let volumeStart = CFAbsoluteTimeGetCurrent()
-            let volume = rebuildVolume(center: snapshot.center, chunks: snapshot.chunks)
-            let hiddenComponent = updateHiddenConnectedComponent(volume: volume, cameraBlock: snapshot.cameraBlock)
-            profile.volumeSeconds = CFAbsoluteTimeGetCurrent() - volumeStart
-
-            let meshStart = CFAbsoluteTimeGetCurrent()
-            let vertices = buildGreedyMesh(volume: volume, hiddenConnectedComponent: hiddenComponent)
-            profile.meshSeconds = CFAbsoluteTimeGetCurrent() - meshStart
-
-            let volumeDescription: String
-            if let volume {
-                volumeDescription = "\(volume.sizeX)x\(volume.sizeY)x\(volume.sizeZ)"
-            } else {
-                volumeDescription = "none"
-            }
-
-            return BuildResult(
-                revision: snapshot.revision,
-                vertices: vertices,
-                profile: profile,
-                volumeDescription: volumeDescription,
-                availableChunks: snapshot.chunks.count,
-                totalTargetChunks: snapshot.totalTargetChunks
-            )
+            _ = startMeshWorkersLocked()
         }
 
         private func nextMissingChunkLocked() -> ChunkCoord? {
@@ -341,20 +331,163 @@ final class TerrainRenderer {
             return started
         }
 
-        private func pruneChunksLockedIfNeeded() {
+        private func nextDirtyChunkLocked() -> ChunkCoord? {
             guard let center = targetCenter else {
-                chunks.removeAll(keepingCapacity: true)
-                return
+                return nil
             }
-            pruneChunksLocked(around: center)
+            let orderedLoaded = chunks.keys.sorted { lhs, rhs in
+                let lhsDistance = max(abs(lhs.x - center.x), abs(lhs.z - center.z))
+                let rhsDistance = max(abs(rhs.x - center.x), abs(rhs.z - center.z))
+                if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
+                if lhs.z != rhs.z { return lhs.z < rhs.z }
+                return lhs.x < rhs.x
+            }
+            for coord in orderedLoaded where dirtyMeshChunks.contains(coord) && !inFlightMeshChunks.contains(coord) {
+                return coord
+            }
+            return nil
         }
 
-        private func pruneChunksLocked(around center: ChunkCoord) {
-            chunks = chunks.filter { shouldKeepChunk($0.key, around: center, extraMargin: 1) }
+        private func startMeshWorkersLocked() -> Int {
+            guard targetCenter != nil else {
+                return 0
+            }
+            let meshWorkerLimit = max(1, generationWorkerCount)
+            var started = 0
+            while activeMeshWorkers < meshWorkerLimit, nextDirtyChunkLocked() != nil {
+                activeMeshWorkers += 1
+                started += 1
+            }
+            return started
+        }
+
+        private func meshWorkerLoop() {
+            while true {
+                let snapshot: ChunkMeshSnapshot
+                lock.lock()
+                guard let coord = nextDirtyChunkLocked(),
+                      let chunk = chunks[coord] else {
+                    activeMeshWorkers = max(0, activeMeshWorkers - 1)
+                    lock.unlock()
+                    return
+                }
+                dirtyMeshChunks.remove(coord)
+                inFlightMeshChunks.insert(coord)
+                let revision = chunkMeshRevision[coord] ?? 0
+                let availableChunks = chunks.count
+                var neighbors: [ChunkCoord: ProtoChunk] = [coord: chunk]
+                for neighbor in adjacentChunkCoords(to: coord) {
+                    if let neighborChunk = chunks[neighbor] {
+                        neighbors[neighbor] = neighborChunk
+                    }
+                }
+                let generationSeconds = generationSecondsByChunk[coord] ?? 0
+                lock.unlock()
+
+                snapshot = ChunkMeshSnapshot(
+                    coord: coord,
+                    revision: revision,
+                    chunk: chunk,
+                    neighbors: neighbors,
+                    generationSeconds: generationSeconds,
+                    totalTargetChunks: orderedOffsets.count,
+                    availableChunks: availableChunks
+                )
+
+                let result = buildChunkMesh(snapshot: snapshot)
+
+                var meshWorkersToStart = 0
+                lock.lock()
+                inFlightMeshChunks.remove(coord)
+                if chunks[coord] != nil, (chunkMeshRevision[coord] ?? 0) == result.revision {
+                    pendingMeshResults[coord] = result
+                    generationSecondsByChunk[coord] = 0
+                }
+                meshWorkersToStart = startMeshWorkersLocked()
+                lock.unlock()
+
+                for _ in 0..<meshWorkersToStart {
+                    meshQueue.async { [self] in
+                        meshWorkerLoop()
+                    }
+                }
+            }
+        }
+
+        private func buildChunkMesh(snapshot: ChunkMeshSnapshot) -> ChunkMeshResult {
+            var profile = MeshProfile(
+                generationSeconds: snapshot.generationSeconds,
+                meshSeconds: 0,
+                uploadSeconds: 0
+            )
+
+            let meshStart = CFAbsoluteTimeGetCurrent()
+            let vertices = buildGreedyMesh(coord: snapshot.coord, chunk: snapshot.chunk, neighbors: snapshot.neighbors)
+            profile.meshSeconds = CFAbsoluteTimeGetCurrent() - meshStart
+
+            return ChunkMeshResult(
+                coord: snapshot.coord,
+                revision: snapshot.revision,
+                vertices: vertices,
+                profile: profile,
+                availableChunks: snapshot.availableChunks,
+                totalTargetChunks: snapshot.totalTargetChunks
+            )
+        }
+
+        private func pruneChunksLockedIfNeeded() -> [ChunkCoord] {
+            guard let center = targetCenter else {
+                let removed = Array(chunks.keys)
+                chunks.removeAll(keepingCapacity: true)
+                return removed
+            }
+            return pruneChunksLocked(around: center)
+        }
+
+        @discardableResult
+        private func pruneChunksLocked(around center: ChunkCoord) -> [ChunkCoord] {
+            var removed: [ChunkCoord] = []
+            chunks = chunks.filter { coord, _ in
+                let keep = shouldKeepChunk(coord, around: center, extraMargin: 1)
+                if !keep {
+                    removed.append(coord)
+                }
+                return keep
+            }
+            return removed
         }
 
         private func shouldKeepChunk(_ coord: ChunkCoord, around center: ChunkCoord, extraMargin: Int = 0) -> Bool {
             abs(coord.x - center.x) <= renderRadius + extraMargin && abs(coord.z - center.z) <= renderRadius + extraMargin
+        }
+
+        private func markChunkDirtyLocked(_ coord: ChunkCoord) {
+            guard chunks[coord] != nil else {
+                return
+            }
+            chunkMeshRevision[coord, default: 0] += 1
+            dirtyMeshChunks.insert(coord)
+        }
+
+        private func markChunkRemovedLocked(_ coord: ChunkCoord) {
+            dirtyMeshChunks.remove(coord)
+            inFlightMeshChunks.remove(coord)
+            chunkMeshRevision[coord, default: 0] += 1
+            generationSecondsByChunk.removeValue(forKey: coord)
+            pendingMeshResults.removeValue(forKey: coord)
+            pendingRemovedChunks.insert(coord)
+            for neighbor in adjacentChunkCoords(to: coord) where chunks[neighbor] != nil {
+                markChunkDirtyLocked(neighbor)
+            }
+        }
+
+        private func adjacentChunkCoords(to coord: ChunkCoord) -> [ChunkCoord] {
+            [
+                ChunkCoord(x: coord.x - 1, z: coord.z),
+                ChunkCoord(x: coord.x + 1, z: coord.z),
+                ChunkCoord(x: coord.x, z: coord.z - 1),
+                ChunkCoord(x: coord.x, z: coord.z + 1)
+            ]
         }
 
         private func floorDiv(_ value: Int, _ divisor: Int) -> Int {
@@ -369,223 +502,88 @@ final class TerrainRenderer {
             return result >= 0 ? result : result + divisor
         }
 
-        private func rebuildVolume(center: ChunkCoord, chunks: [ChunkCoord: ProtoChunk]) -> Volume? {
-            let chunkSpan = renderRadius * 2 + 1
-            let sizeX = chunkSpan * 16
-            let sizeZ = chunkSpan * 16
-
-            guard let sampleChunk = chunks[ChunkCoord(x: center.x, z: center.z)] ?? chunks.values.first else {
-                return nil
-            }
-
+        private func buildGreedyMesh(
+            coord: ChunkCoord,
+            chunk: ProtoChunk,
+            neighbors: [ChunkCoord: ProtoChunk]
+        ) -> [VulkanEngine.Vertex3D] {
             var firstSolidSection = Int.max
             var lastSolidSection = Int.min
-
-            for chunk in chunks.values {
-                for sectionIndex in 0..<chunk.sectionCount {
-                    guard let section = chunk.section(at: sectionIndex) else {
-                        continue
-                    }
-                    if section.bitmap.contains(where: { $0 != 0 }) {
-                        firstSolidSection = min(firstSolidSection, sectionIndex)
-                        lastSolidSection = max(lastSolidSection, sectionIndex)
-                    }
+            for sectionIndex in 0..<chunk.sectionCount {
+                guard let section = chunk.section(at: sectionIndex),
+                      section.bitmap.contains(where: { $0 != 0 }) else {
+                    continue
                 }
+                firstSolidSection = min(firstSolidSection, sectionIndex)
+                lastSolidSection = max(lastSolidSection, sectionIndex)
             }
 
             guard firstSolidSection != Int.max, lastSolidSection != Int.min else {
-                return Volume(
-                    originX: (center.x - renderRadius) * 16,
-                    originY: Int(sampleChunk.minY),
-                    originZ: (center.z - renderRadius) * 16,
-                    sizeX: sizeX,
-                    sizeY: 0,
-                    sizeZ: sizeZ,
-                    solid: [],
-                    biomeColors: []
+                return []
+            }
+
+            let originX = coord.x * 16
+            let originY = Int(chunk.minY) + firstSolidSection * ProtoChunk.sectionHeight
+            let originZ = coord.z * 16
+            let dims = [16, (lastSolidSection - firstSolidSection + 1) * ProtoChunk.sectionHeight, 16]
+
+            var vertices: [VulkanEngine.Vertex3D] = []
+            vertices.reserveCapacity(12_000)
+
+            @inline(__always)
+            func isOwnedLocal(_ x: Int, _ y: Int, _ z: Int) -> Bool {
+                x >= 0 && x < dims[0] && y >= 0 && y < dims[1] && z >= 0 && z < dims[2]
+            }
+
+            @inline(__always)
+            func packedBiomeColorForOwnedBlock(_ x: Int, _ y: Int, _ z: Int) -> UInt32 {
+                let absoluteLocalY = firstSolidSection * ProtoChunk.sectionHeight + y
+                let biome = chunk.biome(
+                    atLocal: PosInt3D(
+                        x: Int32(x),
+                        y: Int32(absoluteLocalY),
+                        z: Int32(z)
+                    )
+                )
+                return biomeColorPalette.packedRGBA8(forBiomeID: biome?.name)
+            }
+
+            @inline(__always)
+            func isSolidWorld(_ worldX: Int, _ worldY: Int, _ worldZ: Int) -> Bool {
+                let queryCoord = ChunkCoord(
+                    x: floorDiv(worldX, 16),
+                    z: floorDiv(worldZ, 16)
+                )
+                guard let queryChunk = neighbors[queryCoord] else {
+                    return false
+                }
+                let localX = floorMod(worldX, 16)
+                let localZ = floorMod(worldZ, 16)
+                let localY = worldY - Int(queryChunk.minY)
+                guard localY >= 0, localY < Int(queryChunk.height) else {
+                    return false
+                }
+                return queryChunk.isTerrain(
+                    atLocal: PosInt3D(
+                        x: Int32(localX),
+                        y: Int32(localY),
+                        z: Int32(localZ)
+                    )
                 )
             }
 
-            let minY = Int(sampleChunk.minY) + firstSolidSection * ProtoChunk.sectionHeight
-            let sizeY = (lastSolidSection - firstSolidSection + 1) * ProtoChunk.sectionHeight
-            var solid = [UInt8](repeating: 0, count: sizeX * sizeY * sizeZ)
-            var biomeColors = [UInt32](
-                repeating: biomeColorPalette.packedRGBA8(forBiomeID: nil),
-                count: sizeX * sizeY * sizeZ
-            )
-            let minChunkX = center.x - renderRadius
-            let minChunkZ = center.z - renderRadius
-
-            for (coord, chunk) in chunks {
-                let localChunkX = coord.x - minChunkX
-                let localChunkZ = coord.z - minChunkZ
-                guard localChunkX >= 0, localChunkX < chunkSpan, localChunkZ >= 0, localChunkZ < chunkSpan else {
-                    continue
-                }
-
-                let baseX = localChunkX * 16
-                let baseZ = localChunkZ * 16
-                let startSection = max(0, firstSolidSection)
-                let endSection = min(chunk.sectionCount - 1, lastSolidSection)
-                if startSection > endSection {
-                    continue
-                }
-
-                for sectionIndex in startSection...endSection {
-                    guard let section = chunk.section(at: sectionIndex) else {
-                        continue
-                    }
-
-                    let bitmap = section.bitmap
-                    if bitmap.allSatisfy({ $0 == 0 }) {
-                        continue
-                    }
-
-                    let baseY = (sectionIndex - firstSolidSection) * ProtoChunk.sectionHeight
-                    for (wordIndex, wordValue) in bitmap.enumerated() where wordValue != 0 {
-                        var word = wordValue
-                        while word != 0 {
-                            let bitIndex = word.trailingZeroBitCount
-                            let blockIndex = wordIndex * 64 + bitIndex
-                            let x = blockIndex & 15
-                            let z = (blockIndex >> 4) & 15
-                            let y = (blockIndex >> 8) & 15
-                            let gx = baseX + x
-                            let gy = baseY + y
-                            let gz = baseZ + z
-                            let index = ((gy * sizeZ) + gz) * sizeX + gx
-                            solid[index] = 1
-                            let biome = chunk.biome(
-                                atLocal: PosInt3D(
-                                    x: Int32(x),
-                                    y: Int32(sectionIndex * ProtoChunk.sectionHeight + y),
-                                    z: Int32(z)
-                                )
-                            )
-                            biomeColors[index] = biomeColorPalette.packedRGBA8(forBiomeID: biome?.name)
-                            word &= word - 1
-                        }
-                    }
-                }
-            }
-
-            return Volume(
-                originX: minChunkX * 16,
-                originY: minY,
-                originZ: minChunkZ * 16,
-                sizeX: sizeX,
-                sizeY: sizeY,
-                sizeZ: sizeZ,
-                solid: solid,
-                biomeColors: biomeColors
-            )
-        }
-
-        private func updateHiddenConnectedComponent(volume: Volume?, cameraBlock: SIMD3<Int>) -> [UInt8]? {
-            guard let volume,
-                  let startIndex = volume.index(worldX: cameraBlock.x, worldY: cameraBlock.y, worldZ: cameraBlock.z),
-                  startIndex < volume.solid.count,
-                  volume.solid[startIndex] != 0 else {
-                return nil
-            }
-
-            var visited = [UInt8](repeating: 0, count: volume.solid.count)
-            var queue: [Int] = [startIndex]
-            visited[startIndex] = 1
-
-            var head = 0
-            let sizeX = volume.sizeX
-            let sizeY = volume.sizeY
-            let sizeZ = volume.sizeZ
-            let yzStride = volume.yzStride
-
-            while head < queue.count {
-                let idx = queue[head]
-                head += 1
-
-                let x = idx % sizeX
-                let yz = idx / sizeX
-                let z = yz % sizeZ
-                let y = yz / sizeZ
-
-                if x > 0 {
-                    let n = idx - 1
-                    if visited[n] == 0 && volume.solid[n] != 0 {
-                        visited[n] = 1
-                        queue.append(n)
-                    }
-                }
-                if x + 1 < sizeX {
-                    let n = idx + 1
-                    if visited[n] == 0 && volume.solid[n] != 0 {
-                        visited[n] = 1
-                        queue.append(n)
-                    }
-                }
-                if z > 0 {
-                    let n = idx - sizeX
-                    if visited[n] == 0 && volume.solid[n] != 0 {
-                        visited[n] = 1
-                        queue.append(n)
-                    }
-                }
-                if z + 1 < sizeZ {
-                    let n = idx + sizeX
-                    if visited[n] == 0 && volume.solid[n] != 0 {
-                        visited[n] = 1
-                        queue.append(n)
-                    }
-                }
-                if y > 0 {
-                    let n = idx - yzStride
-                    if visited[n] == 0 && volume.solid[n] != 0 {
-                        visited[n] = 1
-                        queue.append(n)
-                    }
-                }
-                if y + 1 < sizeY {
-                    let n = idx + yzStride
-                    if visited[n] == 0 && volume.solid[n] != 0 {
-                        visited[n] = 1
-                        queue.append(n)
-                    }
-                }
-            }
-
-            return visited
-        }
-
-        private func buildGreedyMesh(volume: Volume?, hiddenConnectedComponent: [UInt8]?) -> [VulkanEngine.Vertex3D] {
-            guard let volume else {
-                return []
-            }
-
-            let dims = [volume.sizeX, volume.sizeY, volume.sizeZ]
-            if dims.contains(where: { $0 <= 0 }) {
-                return []
-            }
-
-            var vertices: [VulkanEngine.Vertex3D] = []
-            vertices.reserveCapacity(600_000)
-
             @inline(__always)
-            func isSolidLocal(_ x: Int, _ y: Int, _ z: Int) -> Bool {
-                if x < 0 || x >= dims[0] || y < 0 || y >= dims[1] || z < 0 || z >= dims[2] {
-                    return false
-                }
-                let idx = volume.localIndex(x: x, y: y, z: z)
-                if volume.solid[idx] == 0 {
-                    return false
-                }
-                if let hiddenConnectedComponent, hiddenConnectedComponent[idx] != 0 {
-                    return false
-                }
-                return true
+            func localToWorld(_ x: Int, _ y: Int, _ z: Int) -> SIMD3<Int> {
+                SIMD3<Int>(originX + x, originY + y, originZ + z)
             }
 
             @inline(__always)
-            func biomeColorLocal(_ x: Int, _ y: Int, _ z: Int) -> UInt32 {
-                volume.biomeColorAtLocal(x: x, y: y, z: z)
+            func solidAtLocalOrNeighbor(_ x: Int, _ y: Int, _ z: Int) -> Bool {
+                if y < 0 || y >= dims[1] {
+                    return false
+                }
+                let world = localToWorld(x, y, z)
+                return isSolidWorld(world.x, world.y, world.z)
             }
 
             for d in 0..<3 {
@@ -607,18 +605,25 @@ final class TerrainRenderer {
                         for i in 0..<dims[u] {
                             x[u] = i
 
-                            let aSolid = x[d] >= 0 ? isSolidLocal(x[0], x[1], x[2]) : false
-                            let bSolid = x[d] < dims[d] - 1 ? isSolidLocal(x[0] + q[0], x[1] + q[1], x[2] + q[2]) : false
+                            let aLocal = [x[0], x[1], x[2]]
+                            let bLocal = [x[0] + q[0], x[1] + q[1], x[2] + q[2]]
+                            let aOwned = isOwnedLocal(aLocal[0], aLocal[1], aLocal[2])
+                            let bOwned = isOwnedLocal(bLocal[0], bLocal[1], bLocal[2])
+                            let aSolid = solidAtLocalOrNeighbor(aLocal[0], aLocal[1], aLocal[2])
+                            let bSolid = solidAtLocalOrNeighbor(bLocal[0], bLocal[1], bLocal[2])
 
-                            if aSolid == bSolid {
+                            if aSolid == bSolid || (!aOwned && !bOwned) {
                                 mask[n] = 0
                                 maskColors[n] = 0
-                            } else if aSolid {
+                            } else if aSolid && aOwned {
                                 mask[n] = 1
-                                maskColors[n] = biomeColorLocal(x[0], x[1], x[2])
-                            } else {
+                                maskColors[n] = packedBiomeColorForOwnedBlock(aLocal[0], aLocal[1], aLocal[2])
+                            } else if bSolid && bOwned {
                                 mask[n] = -1
-                                maskColors[n] = biomeColorLocal(x[0] + q[0], x[1] + q[1], x[2] + q[2])
+                                maskColors[n] = packedBiomeColorForOwnedBlock(bLocal[0], bLocal[1], bLocal[2])
+                            } else {
+                                mask[n] = 0
+                                maskColors[n] = 0
                             }
                             n += 1
                         }
@@ -670,24 +675,24 @@ final class TerrainRenderer {
                             p[v] = j
 
                             let p0 = SIMD3<Float>(
-                                Float(volume.originX + p[0]),
-                                Float(volume.originY + p[1]),
-                                Float(volume.originZ + p[2])
+                                Float(originX + p[0]),
+                                Float(originY + p[1]),
+                                Float(originZ + p[2])
                             )
                             let p1 = SIMD3<Float>(
-                                Float(volume.originX + p[0] + du[0]),
-                                Float(volume.originY + p[1] + du[1]),
-                                Float(volume.originZ + p[2] + du[2])
+                                Float(originX + p[0] + du[0]),
+                                Float(originY + p[1] + du[1]),
+                                Float(originZ + p[2] + du[2])
                             )
                             let p2 = SIMD3<Float>(
-                                Float(volume.originX + p[0] + du[0] + dv[0]),
-                                Float(volume.originY + p[1] + du[1] + dv[1]),
-                                Float(volume.originZ + p[2] + du[2] + dv[2])
+                                Float(originX + p[0] + du[0] + dv[0]),
+                                Float(originY + p[1] + du[1] + dv[1]),
+                                Float(originZ + p[2] + du[2] + dv[2])
                             )
                             let p3 = SIMD3<Float>(
-                                Float(volume.originX + p[0] + dv[0]),
-                                Float(volume.originY + p[1] + dv[1]),
-                                Float(volume.originZ + p[2] + dv[2])
+                                Float(originX + p[0] + dv[0]),
+                                Float(originY + p[1] + dv[1]),
+                                Float(originZ + p[2] + dv[2])
                             )
                             let faceColor = shadedBiomeColor(
                                 packedBaseColor: basePackedColor,
@@ -799,11 +804,9 @@ final class TerrainRenderer {
     private let hudZColor = SIMD4<Float>(0.12, 0.20, 0.46, 1.0)
     private let hudFpsColor = SIMD4<Float>(0.62, 0.28, 0.78, 1.0)
     private let hudBiomeColor = SIMD4<Float>(0.95, 0.55, 0.14, 1.0)
+    private let hudDebugColor = SIMD4<Float>(0.62, 0.52, 0.12, 1.0)
 
-    private var meshBuffer: VulkanOwnedBuffer?
-    private var meshMemory: VulkanOwnedDeviceMemory?
-    private var meshVertexCount: UInt32 = 0
-    private var lastAppliedRevision = 0
+    private var chunkMeshes: [ChunkCoord: ChunkRenderMesh] = [:]
     private var hudBuffer: VulkanOwnedBuffer?
     private var hudMemory: VulkanOwnedDeviceMemory?
     private var hudVertexCount: UInt32 = 0
@@ -841,7 +844,7 @@ final class TerrainRenderer {
             worldGenerator: worldGenerator,
             renderRadius: renderRadius,
             generationWorkerCount: generationWorkerCount,
-            retargetAroundCameraMovement: false,
+            retargetAroundCameraMovement: true,
             biomeColorPalette: biomeColorPalette
         )
     }
@@ -881,6 +884,14 @@ final class TerrainRenderer {
             keyShift = pressed
         case SDLK_R:
             keyR = pressed
+        case SDLK_LEFTBRACKET:
+            if pressed {
+                streamer.adjustRenderRadius(by: -1)
+            }
+        case SDLK_RIGHTBRACKET:
+            if pressed {
+                streamer.adjustRenderRadius(by: 1)
+            }
         default:
             break
         }
@@ -976,11 +987,14 @@ final class TerrainRenderer {
         }
         let renderFinished = renderFinishedByImage[Int(imageIndex)]
 
-        let batches: [VulkanEngine.DrawBatch3D]
-        if let meshBuffer, meshVertexCount > 0 {
-            batches = [.init(buffer: meshBuffer, vertexCount: meshVertexCount)]
-        } else {
-            batches = []
+        let batches: [VulkanEngine.DrawBatch3D] = chunkMeshes.keys.sorted { lhs, rhs in
+            if lhs.z != rhs.z { return lhs.z < rhs.z }
+            return lhs.x < rhs.x
+        }.compactMap { coord in
+            guard let mesh = chunkMeshes[coord], mesh.vertexCount > 0 else {
+                return nil
+            }
+            return .init(buffer: mesh.buffer, vertexCount: mesh.vertexCount)
         }
         let hudBatches: [VulkanEngine.DrawBatch2D]
         if let hudBuffer, hudVertexCount > 0 {
@@ -1020,37 +1034,43 @@ final class TerrainRenderer {
     }
 
     private func applyCompletedBuildIfAvailable(engine: VulkanEngine) throws {
-        guard let result = streamer.takeCompletedResult(), result.revision > lastAppliedRevision else {
+        let completed = streamer.takeCompletedResults()
+        guard !completed.results.isEmpty || !completed.removals.isEmpty else {
             return
         }
 
-        meshBuffer = nil
-        meshMemory = nil
-        meshVertexCount = 0
-
-        let uploadStart = CFAbsoluteTimeGetCurrent()
-        if !result.vertices.isEmpty {
-            let (buffer, memory) = try engine.createVertexBuffer3D(result.vertices)
-            meshBuffer = buffer
-            meshMemory = memory
-            meshVertexCount = UInt32(result.vertices.count)
+        for coord in completed.removals {
+            chunkMeshes.removeValue(forKey: coord)
         }
 
-        var profile = result.profile
-        profile.uploadSeconds = CFAbsoluteTimeGetCurrent() - uploadStart
-        lastAppliedRevision = result.revision
-        logRebuild(
-            profile: profile,
-            volumeDescription: result.volumeDescription,
-            vertexCount: result.vertices.count,
-            availableChunks: result.availableChunks,
-            totalTargetChunks: result.totalTargetChunks
-        )
+        for result in completed.results {
+            chunkMeshes.removeValue(forKey: result.coord)
+
+            let uploadStart = CFAbsoluteTimeGetCurrent()
+            if !result.vertices.isEmpty {
+                let (buffer, memory) = try engine.createVertexBuffer3D(result.vertices)
+                chunkMeshes[result.coord] = ChunkRenderMesh(
+                    buffer: buffer,
+                    memory: memory,
+                    vertexCount: UInt32(result.vertices.count)
+                )
+            }
+
+            var profile = result.profile
+            profile.uploadSeconds = CFAbsoluteTimeGetCurrent() - uploadStart
+            logChunkMesh(
+                coord: result.coord,
+                profile: profile,
+                vertexCount: result.vertices.count,
+                availableChunks: result.availableChunks,
+                totalTargetChunks: result.totalTargetChunks
+            )
+        }
     }
 
-    private func logRebuild(
-        profile: RebuildProfile,
-        volumeDescription: String,
+    private func logChunkMesh(
+        coord: ChunkCoord,
+        profile: MeshProfile,
         vertexCount: Int,
         availableChunks: Int,
         totalTargetChunks: Int
@@ -1058,19 +1078,18 @@ final class TerrainRenderer {
         guard profilingEnabled else {
             return
         }
-        let totalMs = (profile.generationSeconds + profile.volumeSeconds + profile.meshSeconds + profile.uploadSeconds) * 1000
+        let totalMs = (profile.generationSeconds + profile.meshSeconds + profile.uploadSeconds) * 1000
         print(
             String(
-                format: "Terrain rebuild: generated=%d available=%d/%d gen=%.1fms volume=%.1fms mesh=%.1fms upload=%.1fms total=%.1fms volume=%@ vertices=%d",
-                profile.generatedChunks,
+                format: "Chunk mesh: chunk=(%d,%d) available=%d/%d gen=%.1fms mesh=%.1fms upload=%.1fms total=%.1fms vertices=%d",
+                coord.x,
+                coord.z,
                 availableChunks,
                 totalTargetChunks,
                 profile.generationSeconds * 1000,
-                profile.volumeSeconds * 1000,
                 profile.meshSeconds * 1000,
                 profile.uploadSeconds * 1000,
                 totalMs,
-                volumeDescription,
                 vertexCount
             )
         )
@@ -1087,6 +1106,7 @@ final class TerrainRenderer {
 
     private func updateHudIfNeeded(engine: VulkanEngine, viewportWidth: Int, viewportHeight: Int) throws {
         let biomeText = currentBiomeHudText()
+        let debugLines = currentDebugHudLines()
         let positionRuns = [
             HudTextRun(text: String(format: "X: %.1f ", Double(cameraPosition.x)), color: hudXColor),
             HudTextRun(text: String(format: "Y: %.1f ", Double(cameraPosition.y)), color: hudYColor),
@@ -1098,7 +1118,10 @@ final class TerrainRenderer {
         let biomeRuns = [
             HudTextRun(text: biomeText, color: hudBiomeColor)
         ]
-        let hudText = (positionRuns + fpsRuns + biomeRuns).map(\.text).joined(separator: "\n")
+        let debugRuns = debugLines.map { [HudTextRun(text: $0, color: hudDebugColor)] }
+        let hudText = ([positionRuns, fpsRuns, biomeRuns] + debugRuns)
+            .flatMap { $0.map(\.text) }
+            .joined(separator: "\n")
         let viewport = SIMD2<Int>(viewportWidth, viewportHeight)
         guard hudText != lastHudText || viewport != lastHudViewport || biomeText != lastHudBiome else {
             return
@@ -1107,7 +1130,7 @@ final class TerrainRenderer {
         let vertices = makeHudVertices(
             viewportWidth: viewportWidth,
             leftLines: [positionRuns, fpsRuns],
-            rightLines: [biomeRuns]
+            rightLines: [biomeRuns] + debugRuns
         )
         if vertices.isEmpty {
             hudVertexCount = 0
@@ -1253,6 +1276,15 @@ final class TerrainRenderer {
         )
         let biomeName = streamer.currentBiomeName(at: cameraBlock) ?? "unknown"
         return "BIOME: \(formatBiomeName(biomeName))"
+    }
+
+    private func currentDebugHudLines() -> [String] {
+        let status = streamer.debugStatus()
+        return [
+            "CHUNKS: \(status.generatedChunks)/\(status.totalTargetChunks)",
+            "GEN: \(status.inFlightGenerationChunks) MESH: \(status.inFlightMeshChunks)",
+            "DIRTY: \(status.dirtyMeshChunks) DRAWN: \(chunkMeshes.count)"
+        ]
     }
 
     private func formatBiomeName(_ biomeName: String) -> String {
@@ -1402,6 +1434,7 @@ final class TerrainRenderer {
         "F": ["111", "100", "110", "100", "100"],
         "P": ["110", "101", "110", "100", "100"],
         "S": ["111", "100", "111", "001", "111"],
+        "/": ["001", "001", "010", "100", "100"],
         ":": ["000", "010", "000", "010", "000"],
         ".": ["000", "000", "000", "000", "010"],
         "-": ["000", "000", "111", "000", "000"],

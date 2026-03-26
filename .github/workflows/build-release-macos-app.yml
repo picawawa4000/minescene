@@ -22,9 +22,10 @@ jobs:
 
       - name: Rewrite GitHub SSH URLs to HTTPS for SwiftPM
         run: |
-          git config --global url."https://github.com/".insteadOf git@github.com:
-          git config --global url."https://github.com/".insteadOf ssh://git@github.com/
-          git config --global url."https://github.com/".insteadOf git+ssh://git@github.com/
+          git config --global --add url."https://github.com/".insteadOf git@github.com:
+          git config --global --add url."https://github.com/".insteadOf ssh://git@github.com/
+          git config --global --add url."https://github.com/".insteadOf git+ssh://git@github.com/
+          git config --global --get-all url."https://github.com/".insteadOf
 
       - name: Install macOS runtime dependencies
         run: brew install glslang molten-vk vulkan-loader

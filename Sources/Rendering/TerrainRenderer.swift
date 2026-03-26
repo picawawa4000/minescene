@@ -246,6 +246,12 @@ final class TerrainRenderer {
         }
     }
 
+    private struct CommandLogEntry {
+        let message: String
+        let isError: Bool
+        var age: Float = 0
+    }
+
     private final class Streamer: @unchecked Sendable {
         private let worldGenerator: WorldGenerator
         private let generationWorkerCount: Int
@@ -1042,6 +1048,9 @@ final class TerrainRenderer {
     private let commandPromptTextColor = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
     private let commandPromptCursorColor = SIMD4<Float>(1.0, 1.0, 1.0, 0.55)
     private let commandPromptCursorBlinkPeriod: Float = 0.5
+    private let commandLogLifetime: Float = 5.0
+    private let commandLogBackgroundColor = SIMD4<Float>(0.0, 0.0, 0.0, 0.72)
+    private let commandLogErrorColor = SIMD4<Float>(0.92, 0.28, 0.24, 1.0)
 
     private var chunkMeshes: [ChunkCoord: ChunkRenderMesh] = [:]
     private var hudBuffer: VulkanOwnedBuffer?
@@ -1068,6 +1077,7 @@ final class TerrainRenderer {
     private var commandPromptActive = false
     private var commandPromptText = ""
     private var commandPromptCursorElapsed: Float = 0
+    private var commandLogEntries: [CommandLogEntry] = []
 
     var isCommandPromptActive: Bool {
         commandPromptActive
@@ -1248,14 +1258,36 @@ final class TerrainRenderer {
                     Float(targetPosition.y),
                     Float(targetPosition.z)
                 )
+                logCommandMessage(
+                    "Teleported to (\(formatCommandNumber(targetPosition.x)), \(formatCommandNumber(targetPosition.y)), \(formatCommandNumber(targetPosition.z)))"
+                )
             default:
-                print("Unknown command '\(commandLabel)'")
+                logCommandMessage("Unknown command '\(commandLabel)'", isError: true)
             }
         } catch let error as CommandParseError {
-            print("Failed to parse '\(commandLabel)': \(error.description)")
+            logCommandMessage("Failed to parse '\(commandLabel)': \(error.description)", isError: true)
         } catch {
-            print("Failed to execute '\(commandLabel)': \(error)")
+            logCommandMessage("Failed to execute '\(commandLabel)': \(error)", isError: true)
         }
+    }
+
+    private func logCommandMessage(_ message: String, isError: Bool = false) {
+        print(message)
+        commandLogEntries.append(CommandLogEntry(message: message, isError: isError))
+        if commandLogEntries.count > 5 {
+            commandLogEntries.removeFirst(commandLogEntries.count - 5)
+        }
+    }
+
+    private func formatCommandNumber(_ value: Double) -> String {
+        var text = String(format: "%.3f", value)
+        while text.contains(".") && text.last == "0" {
+            text.removeLast()
+        }
+        if text.last == "." {
+            text.removeLast()
+        }
+        return text
     }
 
     private func resetMovementKeys() {
@@ -1279,6 +1311,12 @@ final class TerrainRenderer {
             }
             if commandPromptActive {
                 commandPromptCursorElapsed += deltaTime
+            }
+            if !commandLogEntries.isEmpty {
+                for index in commandLogEntries.indices {
+                    commandLogEntries[index].age += deltaTime
+                }
+                commandLogEntries.removeAll { $0.age >= commandLogLifetime }
             }
         }
 
@@ -1491,6 +1529,10 @@ final class TerrainRenderer {
         let debugLines = currentDebugHudLines()
         let promptDisplayText = currentCommandPromptDisplayText()
         let promptCursorVisible = isCommandPromptCursorVisible()
+        let hasActiveCommandLog = !commandLogEntries.isEmpty
+        let commandLogSignature = commandLogEntries.map { entry in
+            "\(entry.isError ? "error" : "info"):\(entry.message)"
+        }.joined(separator: "|")
         let positionRuns = [
             HudTextRun(text: String(format: "X: %.1f ", Double(cameraPosition.x)), color: hudXColor),
             HudTextRun(text: String(format: "Y: %.1f ", Double(cameraPosition.y)), color: hudYColor),
@@ -1505,9 +1547,9 @@ final class TerrainRenderer {
         let debugRuns = debugLines.map { [HudTextRun(text: $0, color: hudDebugColor)] }
         let hudText = ([positionRuns, fpsRuns, biomeRuns] + debugRuns)
             .flatMap { $0.map(\.text) }
-            .joined(separator: "\n") + "\nprompt:\(promptDisplayText ?? ""):\(promptCursorVisible ? 1 : 0)"
+            .joined(separator: "\n") + "\nprompt:\(promptDisplayText ?? ""):\(promptCursorVisible ? 1 : 0)\nlog:\(commandLogSignature)"
         let viewport = SIMD2<Int>(viewportWidth, viewportHeight)
-        guard hudText != lastHudText || viewport != lastHudViewport || biomeText != lastHudBiome else {
+        guard hasActiveCommandLog || hudText != lastHudText || viewport != lastHudViewport || biomeText != lastHudBiome else {
             return
         }
 
@@ -1609,6 +1651,13 @@ final class TerrainRenderer {
             appendCommandPrompt(
                 text: promptText,
                 cursorVisible: promptCursorVisible,
+                viewportWidth: Float(viewportWidth),
+                viewportHeight: Float(viewportHeight),
+                into: &vertices
+            )
+        }
+        if !commandLogEntries.isEmpty {
+            appendCommandLog(
                 viewportWidth: Float(viewportWidth),
                 viewportHeight: Float(viewportHeight),
                 into: &vertices
@@ -1719,6 +1768,59 @@ final class TerrainRenderer {
             .uppercased()
     }
 
+    private func appendCommandLog(
+        viewportWidth: Float,
+        viewportHeight: Float,
+        into vertices: inout [VulkanEngine.Vertex2D]
+    ) {
+        let cellSize: Float = 2
+        let glyphAdvance: Float = 14
+        let promptBarHeight: Float = 38
+        let logBarHeight: Float = 28
+        let logSpacing: Float = 4
+        let visibleEntries = commandLogEntries.suffix(5).reversed()
+
+        for (offset, entry) in visibleEntries.enumerated() {
+            let fade = max(0, 1 - (entry.age / commandLogLifetime))
+            guard fade > 0 else {
+                continue
+            }
+
+            let lineBottom = viewportHeight - promptBarHeight - Float(offset) * (logBarHeight + logSpacing)
+            let lineTop = lineBottom - logBarHeight
+            let backgroundColor = SIMD4<Float>(
+                commandLogBackgroundColor.x,
+                commandLogBackgroundColor.y,
+                commandLogBackgroundColor.z,
+                commandLogBackgroundColor.w * fade
+            )
+            let baseTextColor = entry.isError ? commandLogErrorColor : commandPromptTextColor
+            let textColor = SIMD4<Float>(
+                baseTextColor.x,
+                baseTextColor.y,
+                baseTextColor.z,
+                fade
+            )
+
+            appendHudQuad(
+                minX: 0,
+                minY: lineTop,
+                maxX: viewportWidth,
+                maxY: lineBottom,
+                color: backgroundColor,
+                into: &vertices
+            )
+            appendPromptFontText(
+                entry.message,
+                origin: SIMD2<Float>(12, lineTop + 6),
+                cellSize: cellSize,
+                glyphAdvance: glyphAdvance,
+                color: textColor,
+                into: &vertices
+            )
+        }
+    }
+
     private func appendCommandPrompt(
         text: String,
         cursorVisible: Bool,
@@ -1751,17 +1853,15 @@ final class TerrainRenderer {
         )
         cursorX += glyphAdvance
 
-        for character in text {
-            let glyph = Self.promptGlyphs[character] ?? Self.promptGlyphs[" "]!
-            appendGlyph(
-                glyph,
-                origin: SIMD2<Float>(cursorX, textOrigin.y),
-                cellSize: cellSize,
-                color: commandPromptTextColor,
-                into: &vertices
-            )
-            cursorX += glyphAdvance
-        }
+        appendPromptFontText(
+            text,
+            origin: SIMD2<Float>(cursorX, textOrigin.y),
+            cellSize: cellSize,
+            glyphAdvance: glyphAdvance,
+            color: commandPromptTextColor,
+            into: &vertices
+        )
+        cursorX += Float(text.count) * glyphAdvance
 
         if cursorVisible, let cursorGlyph = Self.promptGlyphs["_"] {
             appendGlyph(
@@ -1771,6 +1871,28 @@ final class TerrainRenderer {
                 color: commandPromptCursorColor,
                 into: &vertices
             )
+        }
+    }
+
+    private func appendPromptFontText(
+        _ text: String,
+        origin: SIMD2<Float>,
+        cellSize: Float,
+        glyphAdvance: Float,
+        color: SIMD4<Float>,
+        into vertices: inout [VulkanEngine.Vertex2D]
+    ) {
+        var cursorX = origin.x
+        for character in text {
+            let glyph = Self.promptGlyphs[character] ?? Self.promptGlyphs[" "]!
+            appendGlyph(
+                glyph,
+                origin: SIMD2<Float>(cursorX, origin.y),
+                cellSize: cellSize,
+                color: color,
+                into: &vertices
+            )
+            cursorX += glyphAdvance
         }
     }
 
@@ -1877,6 +1999,33 @@ final class TerrainRenderer {
         "7": ["1111111", "0000011", "0000110", "0001100", "0011000", "0011000", "0011000", "0011000", "0000000"],
         "8": ["0111110", "1100011", "1100011", "0111110", "1100011", "1100011", "1100011", "0111110", "0000000"],
         "9": ["0111110", "1100011", "1100011", "1100011", "0111111", "0000011", "0000110", "0111100", "0000000"],
+
+        "A": ["0011100", "0110110", "1100011", "1100011", "1111111", "1100011", "1100011", "1100011", "0000000"],
+        "B": ["1111110", "1100011", "1100011", "1111110", "1100011", "1100011", "1100011", "1111110", "0000000"],
+        "C": ["0111110", "1100011", "1100000", "1100000", "1100000", "1100000", "1100011", "0111110", "0000000"],
+        "D": ["1111100", "1100110", "1100011", "1100011", "1100011", "1100011", "1100110", "1111100", "0000000"],
+        "E": ["1111111", "1100000", "1100000", "1111110", "1100000", "1100000", "1100000", "1111111", "0000000"],
+        "F": ["1111111", "1100000", "1100000", "1111110", "1100000", "1100000", "1100000", "1100000", "0000000"],
+        "G": ["0111110", "1100011", "1100000", "1100000", "1101111", "1100011", "1100011", "0111110", "0000000"],
+        "H": ["1100011", "1100011", "1100011", "1111111", "1100011", "1100011", "1100011", "1100011", "0000000"],
+        "I": ["0111110", "0011000", "0011000", "0011000", "0011000", "0011000", "0011000", "0111110", "0000000"],
+        "J": ["0001111", "0000110", "0000110", "0000110", "0000110", "1100110", "1100110", "0111100", "0000000"],
+        "K": ["1100011", "1100110", "1101100", "1111000", "1111000", "1101100", "1100110", "1100011", "0000000"],
+        "L": ["1100000", "1100000", "1100000", "1100000", "1100000", "1100000", "1100000", "1111111", "0000000"],
+        "M": ["1100011", "1110111", "1111111", "1101011", "1100011", "1100011", "1100011", "1100011", "0000000"],
+        "N": ["1100011", "1110011", "1111011", "1101111", "1100111", "1100011", "1100011", "1100011", "0000000"],
+        "O": ["0111110", "1100011", "1100011", "1100011", "1100011", "1100011", "1100011", "0111110", "0000000"],
+        "P": ["1111110", "1100011", "1100011", "1111110", "1100000", "1100000", "1100000", "1100000", "0000000"],
+        "Q": ["0111110", "1100011", "1100011", "1100011", "1100011", "1101011", "1100110", "0111101", "0000000"],
+        "R": ["1111110", "1100011", "1100011", "1111110", "1101100", "1100110", "1100011", "1100011", "0000000"],
+        "S": ["0111110", "1100011", "1100000", "0111110", "0000011", "0000011", "1100011", "0111110", "0000000"],
+        "T": ["1111111", "0011000", "0011000", "0011000", "0011000", "0011000", "0011000", "0011000", "0000000"],
+        "U": ["1100011", "1100011", "1100011", "1100011", "1100011", "1100011", "1100011", "0111110", "0000000"],
+        "V": ["1100011", "1100011", "1100011", "1100011", "1100011", "1100011", "0110110", "0011100", "0000000"],
+        "W": ["1100011", "1100011", "1100011", "1100011", "1101011", "1111111", "1110111", "1100011", "0000000"],
+        "X": ["1100011", "1100011", "0110110", "0011100", "0011100", "0110110", "1100011", "1100011", "0000000"],
+        "Y": ["1100011", "1100011", "0110110", "0011100", "0011000", "0011000", "0011000", "0011000", "0000000"],
+        "Z": ["1111111", "0000011", "0000110", "0001100", "0011000", "0110000", "1100000", "1111111", "0000000"],
 
         "a": ["0000000", "0000000", "0111110", "0000011", "0111111", "1100011", "1100011", "0111111", "0000000"],
         "b": ["1100000", "1100000", "1100000", "1111110", "1100011", "1100011", "1100011", "1111110", "0000000"],

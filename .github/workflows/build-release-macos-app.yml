@@ -20,6 +20,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Rewrite GitHub SSH URLs to HTTPS for SwiftPM
+        run: |
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          git config --global url."https://github.com/".insteadOf ssh://git@github.com/
+          git config --global url."https://github.com/".insteadOf git+ssh://git@github.com/
+
       - name: Install macOS runtime dependencies
         run: brew install glslang molten-vk vulkan-loader
 

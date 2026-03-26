@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 TESTVISIBLE_MACRO_FILE="$ROOT_DIR/.build/checkouts/TestVisible/Sources/TestVisiblePlugin/TestVisibleMacro.swift"
 
 if [[ -f "$TESTVISIBLE_MACRO_FILE" ]] && ! grep -Fq "import Foundation" "$TESTVISIBLE_MACRO_FILE"; then
+  chmod u+w "$TESTVISIBLE_MACRO_FILE"
   python3 - "$TESTVISIBLE_MACRO_FILE" <<'PY'
 from pathlib import Path
 import sys

@@ -30,6 +30,12 @@ jobs:
       - name: Install macOS runtime dependencies
         run: brew install glslang molten-vk vulkan-loader
 
+      - name: Resolve and patch Swift dependencies
+        run: |
+          chmod +x ./.github/scripts/patch-swiftpm-dependencies.sh
+          swift package resolve
+          ./.github/scripts/patch-swiftpm-dependencies.sh
+
       - name: Build bundled app
         run: ./.github/scripts/build-release-app.sh
 
@@ -111,6 +117,14 @@ jobs:
             -DSDL_TEST_LIBRARY=OFF
           cmake --build "$RUNNER_TEMP/SDL3-build"
           cmake --install "$RUNNER_TEMP/SDL3-build"
+
+      - name: Resolve and patch Swift dependencies
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/sdl3/lib/pkgconfig:${{ runner.temp }}/sdl3/lib64/pkgconfig:${{ runner.temp }}/sdl3/lib/x86_64-linux-gnu/pkgconfig
+        run: |
+          chmod +x ./.github/scripts/patch-swiftpm-dependencies.sh
+          swift package resolve
+          ./.github/scripts/patch-swiftpm-dependencies.sh
 
       - name: Build Linux release artifact
         env:

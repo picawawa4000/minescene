@@ -5,7 +5,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 APP_NAME="${APP_NAME:-MineScene}"
 EXECUTABLE_NAME="${EXECUTABLE_NAME:-minescene}"
-MINECRAFT_VERSION="${MINECRAFT_VERSION:-1.21.11}"
 RELEASE_VERSION="${RELEASE_VERSION:-dev}"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 APP_PATH="$DIST_DIR/$APP_NAME.app"
@@ -46,19 +45,6 @@ compile_shaders() {
   "$shader_compiler" -V -D -S frag -e mainPS -o "$spirv_dir/colour3D.frag.spv" "$shader_dir/colour3D.slang"
 }
 
-ensure_datapack() {
-  local datapack_dir="$ROOT_DIR/vanilla/$MINECRAFT_VERSION"
-  if [[ -d "$datapack_dir" ]] && [[ -n "$(find "$datapack_dir" -mindepth 1 -maxdepth 1 2>/dev/null)" ]]; then
-    return
-  fi
-
-  python3 "$ROOT_DIR/vanilla/extract_vanilla_datapack.py" \
-    --version "$MINECRAFT_VERSION" \
-    --dest "$datapack_dir" \
-    --download-kind client \
-    --force
-}
-
 require_file() {
   local path="$1"
   if [[ ! -e "$path" ]]; then
@@ -85,7 +71,6 @@ find_brew_prefix() {
 }
 
 compile_shaders
-ensure_datapack
 
 swift build --configuration release
 BIN_DIR="$(swift build --configuration release --show-bin-path)"
@@ -99,12 +84,11 @@ APP_EXECUTABLE="$APP_MACOS/$EXECUTABLE_NAME"
 
 rm -rf "$APP_PATH"
 mkdir -p "$APP_MACOS" "$APP_FRAMEWORKS" "$APP_RESOURCES" "$APP_VULKAN_DIR"
-mkdir -p "$APP_RESOURCES/Shaders" "$APP_RESOURCES/vanilla"
+mkdir -p "$APP_RESOURCES/Shaders"
 
 cp "$BIN_DIR/$EXECUTABLE_NAME" "$APP_EXECUTABLE"
 cp -R "$BIN_DIR/SDL3.framework" "$APP_FRAMEWORKS/"
 cp -R "$ROOT_DIR/Shaders/SPIRV" "$APP_RESOURCES/Shaders/"
-cp -R "$ROOT_DIR/vanilla/$MINECRAFT_VERSION" "$APP_RESOURCES/vanilla/"
 
 VULKAN_LOADER_PREFIX="$(find_brew_prefix vulkan-loader "${VULKAN_LOADER_PREFIX:-}")"
 MOLTENVK_PREFIX="$(find_brew_prefix molten-vk "${MOLTENVK_PREFIX:-}")"

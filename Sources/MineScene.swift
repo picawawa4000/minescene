@@ -136,6 +136,8 @@ final class MineSceneApp {
         self.keybindSettings = settings.keybinds
         self.settingsByName = settings.byName
         self.sdl = try SDLRuntime()
+        let datapackPathURLs = try Self.loadOrPromptForDatapackPathURLs()
+        self.dataPacks = try datapackPathURLs.map { try DataPack(fromRootPath: $0) }
 
         let windowPtr = "MineScene".withCString { title in
             SDL_CreateWindow(title, 1200, 840, SDL_WindowFlags.vulkan.rawValue | SDL_WindowFlags.resizable.rawValue)
@@ -181,10 +183,7 @@ final class MineSceneApp {
         self.surface = surface
 
         let seed: Int64 = 8608000014473684604
-        let dataPackURL = try Self.resourceURL(relativePath: "vanilla/1.21.11", isDirectory: true)
-        let dataPack = try DataPack(fromRootPath: dataPackURL)
         Self.loadSettingsFromDisk(settingsByName: settings.byName)
-        self.dataPacks = [dataPack]
         self.currentWorldSeed = seed
         let worldGenerator = try makeWorldGenerator(seed: seed)
         self.worldGenerator = worldGenerator
@@ -207,9 +206,16 @@ final class MineSceneApp {
         self.terrainRenderer = makeTerrainRenderer(worldGenerator: worldGenerator)
     }
 
-    static func main() throws {
-        let app = try MineSceneApp()
-        try app.run()
+    static func main() {
+        do {
+            let app = try MineSceneApp()
+            try app.run()
+        } catch DatapackSelectionScreen.SelectionError.cancelled {
+            return
+        } catch {
+            fputs("Error raised at top level: \(error)\n", stderr)
+            exit(1)
+        }
     }
 
     private static func resourceURL(relativePath: String, isDirectory: Bool = false) throws -> URL {
@@ -251,7 +257,7 @@ final class MineSceneApp {
         while running {
             while SDL_PollEvent(&event) {
                 switch event.eventType {
-                case .quit:
+                case .quit, .windowCloseRequested, .windowDestroyed:
                     running = false
                 case .keyDown:
                     if !event.key.repeat,
@@ -761,6 +767,45 @@ final class MineSceneApp {
 
     private static func settingsFileURL() -> URL {
         appDataDirectoryURL().appendingPathComponent("settings.json", isDirectory: false)
+    }
+
+    private static func datapackPathsFileURL() -> URL {
+        appDataDirectoryURL().appendingPathComponent("datapack_paths.txt", isDirectory: false)
+    }
+
+    private static func loadOrPromptForDatapackPathURLs() throws -> [URL] {
+        let fileURL = datapackPathsFileURL()
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            return try loadDatapackPathURLs(from: fileURL)
+        }
+
+        let selectedURLs = try DatapackSelectionScreen().run()
+        try saveDatapackPathURLs(selectedURLs, to: fileURL)
+        return selectedURLs
+    }
+
+    private static func loadDatapackPathURLs(from fileURL: URL) throws -> [URL] {
+        let contents = try String(contentsOf: fileURL, encoding: .utf8)
+        return contents
+            .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .map(String.init)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map {
+                URL(
+                    fileURLWithPath: NSString(string: $0).expandingTildeInPath,
+                    isDirectory: true
+                ).standardizedFileURL
+            }
+    }
+
+    private static func saveDatapackPathURLs(_ urls: [URL], to fileURL: URL) throws {
+        let directoryURL = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let contents = urls
+            .map { $0.standardizedFileURL.path }
+            .joined(separator: "\n")
+        try contents.write(to: fileURL, atomically: true, encoding: .utf8)
     }
 
     private static func loadSettingsFromDisk(settingsByName: [String: any SettingProtocol]) {

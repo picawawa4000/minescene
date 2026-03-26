@@ -76,7 +76,7 @@ final class MineSceneApp {
         let surface = try createVulkanSurface(from: window, instance: instance)
         self.surface = surface
 
-        let seed: Int64 = 8608349533057813284
+        let seed: Int64 = 8608000014473684604
         let dataPackPath = "vanilla/1.21.11"
         let dataPackURL = URL(fileURLWithPath: dataPackPath, isDirectory: true)
         let dataPack = try DataPack(fromRootPath: dataPackURL)
@@ -124,13 +124,15 @@ final class MineSceneApp {
                 case .quit:
                     running = false
                 case .keyDown:
-                    if !event.key.repeat, event.key.key == SDLK_ESCAPE {
+                    if !event.key.repeat,
+                       event.key.key == SDLK_ESCAPE,
+                       terrainRenderer?.isCommandPromptActive != true {
                         running = false
                     } else {
-                        terrainRenderer?.handleEvent(event)
+                        terrainRenderer?.handleEvent(event, window: window?.pointer)
                     }
                 default:
-                    terrainRenderer?.handleEvent(event)
+                    terrainRenderer?.handleEvent(event, window: window?.pointer)
                 }
             }
 

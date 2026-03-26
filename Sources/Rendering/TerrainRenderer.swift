@@ -17,11 +17,72 @@ final class TerrainRenderer {
         let z: Int
     }
 
+    private struct CompactBiomeEntry {
+        let name: String
+        let packedColor: UInt32
+    }
+
+    private struct CompactSection {
+        let bitmap: [UInt64]
+        let biomePalette: [CompactBiomeEntry]
+        let biomeIndices: [UInt8]
+
+        @inline(__always)
+        func biomeEntry(atBlockIndex blockIndex: Int) -> CompactBiomeEntry {
+            biomePalette[Int(biomeIndices[blockIndex])]
+        }
+
+        @inline(__always)
+        func isSolid(atBlockIndex blockIndex: Int) -> Bool {
+            let wordIndex = blockIndex >> 6
+            let bitIndex = blockIndex & 63
+            return (bitmap[wordIndex] & (UInt64(1) << UInt64(bitIndex))) != 0
+        }
+    }
+
+    private struct CompactChunk {
+        let minY: Int
+        let height: Int
+        let sections: [CompactSection]
+
+        var sectionCount: Int { sections.count }
+
+        @inline(__always)
+        func section(at index: Int) -> CompactSection? {
+            guard index >= 0, index < sections.count else {
+                return nil
+            }
+            return sections[index]
+        }
+
+        @inline(__always)
+        func biomeEntry(atLocalX x: Int, y: Int, z: Int) -> CompactBiomeEntry? {
+            guard x >= 0, x < 16, y >= 0, y < height, z >= 0, z < 16 else {
+                return nil
+            }
+            let sectionIndex = y >> 4
+            let localY = y & 15
+            let blockIndex = (localY << 8) | (z << 4) | x
+            return sections[sectionIndex].biomeEntry(atBlockIndex: blockIndex)
+        }
+
+        @inline(__always)
+        func isSolid(atLocalX x: Int, y: Int, z: Int) -> Bool {
+            guard x >= 0, x < 16, y >= 0, y < height, z >= 0, z < 16 else {
+                return false
+            }
+            let sectionIndex = y >> 4
+            let localY = y & 15
+            let blockIndex = (localY << 8) | (z << 4) | x
+            return sections[sectionIndex].isSolid(atBlockIndex: blockIndex)
+        }
+    }
+
     private struct ChunkMeshSnapshot {
         let coord: ChunkCoord
         let revision: Int
-        let chunk: ProtoChunk
-        let neighbors: [ChunkCoord: ProtoChunk]
+        let chunk: CompactChunk
+        let neighbors: [ChunkCoord: CompactChunk]
         let generationSeconds: Double
         let totalTargetChunks: Int
         let availableChunks: Int
@@ -64,7 +125,7 @@ final class TerrainRenderer {
         private var orderedOffsets: [ChunkCoord]
         private var targetCenter: ChunkCoord?
         private var targetCameraBlock = SIMD3<Int>(Int.min, Int.min, Int.min)
-        private var chunks: [ChunkCoord: ProtoChunk] = [:]
+        private var chunks: [ChunkCoord: CompactChunk] = [:]
         private var inFlightChunks: Set<ChunkCoord> = []
         private var activeGenerationWorkers = 0
 
@@ -142,7 +203,6 @@ final class TerrainRenderer {
                 effectiveCenter = targetCenter!
             }
             let centerChanged = targetCenter != effectiveCenter
-            let blockChanged = targetCameraBlock != cameraBlock
             targetCenter = effectiveCenter
             targetCameraBlock = cameraBlock
             if centerChanged {
@@ -151,13 +211,10 @@ final class TerrainRenderer {
                     markChunkRemovedLocked(removedCoord)
                 }
             }
-            if centerChanged || blockChanged {
-                if centerChanged {
-                    for coord in chunks.keys {
-                        markChunkDirtyLocked(coord)
-                    }
+            if centerChanged {
+                for coord in chunks.keys {
+                    markChunkDirtyLocked(coord)
                 }
-                requestRebuildLocked()
             }
             generationWorkersToStart = startGenerationWorkersLocked()
             meshWorkersToStart = startMeshWorkersLocked()
@@ -204,17 +261,11 @@ final class TerrainRenderer {
             guard let chunk = chunks[chunkCoord] else {
                 return nil
             }
-            let localY = cameraBlock.y - Int(chunk.minY)
-            guard localY >= 0, localY < Int(chunk.height) else {
+            let localY = cameraBlock.y - chunk.minY
+            guard localY >= 0, localY < chunk.height else {
                 return nil
             }
-            return chunk.biome(
-                atLocal: PosInt3D(
-                    x: Int32(localX),
-                    y: Int32(localY),
-                    z: Int32(localZ)
-                )
-            )?.name
+            return chunk.biomeEntry(atLocalX: localX, y: localY, z: localZ)?.name
         }
 
         func debugStatus() -> StreamDebugStatus {
@@ -268,13 +319,14 @@ final class TerrainRenderer {
                 let protoChunk = ProtoChunk()
                 let generationSucceeded = (try? worldGenerator.generateInto(protoChunk, at: PosInt2D(x: Int32(chunkCoord.x), z: Int32(chunkCoord.z)))) != nil
                 let generationSeconds = CFAbsoluteTimeGetCurrent() - generationStart
+                let compactChunk = generationSucceeded ? makeCompactChunk(from: protoChunk) : nil
 
                 var generationWorkersToStart = 0
                 var meshWorkersToStart = 0
                 lock.lock()
                 inFlightChunks.remove(chunkCoord)
-                if generationSucceeded, let center = targetCenter, shouldKeepChunk(chunkCoord, around: center) {
-                    chunks[chunkCoord] = protoChunk
+                if let compactChunk, let center = targetCenter, shouldKeepChunk(chunkCoord, around: center) {
+                    chunks[chunkCoord] = compactChunk
                     generationSecondsByChunk[chunkCoord] = generationSeconds
                     markChunkDirtyLocked(chunkCoord)
                     for neighbor in adjacentChunkCoords(to: chunkCoord) where chunks[neighbor] != nil {
@@ -300,10 +352,6 @@ final class TerrainRenderer {
                     }
                 }
             }
-        }
-
-        private func requestRebuildLocked() {
-            _ = startMeshWorkersLocked()
         }
 
         private func nextMissingChunkLocked() -> ChunkCoord? {
@@ -375,7 +423,7 @@ final class TerrainRenderer {
                 inFlightMeshChunks.insert(coord)
                 let revision = chunkMeshRevision[coord] ?? 0
                 let availableChunks = chunks.count
-                var neighbors: [ChunkCoord: ProtoChunk] = [coord: chunk]
+                var neighbors: [ChunkCoord: CompactChunk] = [coord: chunk]
                 for neighbor in adjacentChunkCoords(to: coord) {
                     if let neighborChunk = chunks[neighbor] {
                         neighbors[neighbor] = neighborChunk
@@ -432,6 +480,67 @@ final class TerrainRenderer {
                 profile: profile,
                 availableChunks: snapshot.availableChunks,
                 totalTargetChunks: snapshot.totalTargetChunks
+            )
+        }
+
+        private func makeCompactChunk(from protoChunk: ProtoChunk) -> CompactChunk {
+            var sections: [CompactSection] = []
+            sections.reserveCapacity(protoChunk.sectionCount)
+
+            for sectionIndex in 0..<protoChunk.sectionCount {
+                guard let section = protoChunk.section(at: sectionIndex) else {
+                    continue
+                }
+
+                let bitmap = section.bitmap
+                var biomePalette: [CompactBiomeEntry] = []
+                biomePalette.reserveCapacity(8)
+                var paletteIndexByName: [String: Int] = [:]
+                var biomeIndices = [UInt8](repeating: 0, count: 16 * 16 * 16)
+
+                for blockIndex in 0..<biomeIndices.count {
+                    let x = blockIndex & 15
+                    let z = (blockIndex >> 4) & 15
+                    let y = (blockIndex >> 8) & 15
+                    let localY = sectionIndex * ProtoChunk.sectionHeight + y
+                    let biomeName = protoChunk.biome(
+                        atLocal: PosInt3D(
+                            x: Int32(x),
+                            y: Int32(localY),
+                            z: Int32(z)
+                        )
+                    )?.name ?? "unknown"
+
+                    let paletteIndex: Int
+                    if let existing = paletteIndexByName[biomeName] {
+                        paletteIndex = existing
+                    } else {
+                        paletteIndex = biomePalette.count
+                        precondition(paletteIndex < 256, "section biome palette exceeded UInt8 capacity")
+                        paletteIndexByName[biomeName] = paletteIndex
+                        biomePalette.append(
+                            CompactBiomeEntry(
+                                name: biomeName,
+                                packedColor: biomeColorPalette.packedRGBA8(forBiomeID: biomeName)
+                            )
+                        )
+                    }
+                    biomeIndices[blockIndex] = UInt8(paletteIndex)
+                }
+
+                sections.append(
+                    CompactSection(
+                        bitmap: bitmap,
+                        biomePalette: biomePalette,
+                        biomeIndices: biomeIndices
+                    )
+                )
+            }
+
+            return CompactChunk(
+                minY: Int(protoChunk.minY),
+                height: Int(protoChunk.height),
+                sections: sections
             )
         }
 
@@ -504,8 +613,8 @@ final class TerrainRenderer {
 
         private func buildGreedyMesh(
             coord: ChunkCoord,
-            chunk: ProtoChunk,
-            neighbors: [ChunkCoord: ProtoChunk]
+            chunk: CompactChunk,
+            neighbors: [ChunkCoord: CompactChunk]
         ) -> [VulkanEngine.Vertex3D] {
             var firstSolidSection = Int.max
             var lastSolidSection = Int.min
@@ -523,7 +632,7 @@ final class TerrainRenderer {
             }
 
             let originX = coord.x * 16
-            let originY = Int(chunk.minY) + firstSolidSection * ProtoChunk.sectionHeight
+            let originY = chunk.minY + firstSolidSection * ProtoChunk.sectionHeight
             let originZ = coord.z * 16
             let dims = [16, (lastSolidSection - firstSolidSection + 1) * ProtoChunk.sectionHeight, 16]
 
@@ -538,14 +647,8 @@ final class TerrainRenderer {
             @inline(__always)
             func packedBiomeColorForOwnedBlock(_ x: Int, _ y: Int, _ z: Int) -> UInt32 {
                 let absoluteLocalY = firstSolidSection * ProtoChunk.sectionHeight + y
-                let biome = chunk.biome(
-                    atLocal: PosInt3D(
-                        x: Int32(x),
-                        y: Int32(absoluteLocalY),
-                        z: Int32(z)
-                    )
-                )
-                return biomeColorPalette.packedRGBA8(forBiomeID: biome?.name)
+                return chunk.biomeEntry(atLocalX: x, y: absoluteLocalY, z: z)?.packedColor
+                    ?? biomeColorPalette.packedRGBA8(forBiomeID: nil)
             }
 
             @inline(__always)
@@ -559,17 +662,11 @@ final class TerrainRenderer {
                 }
                 let localX = floorMod(worldX, 16)
                 let localZ = floorMod(worldZ, 16)
-                let localY = worldY - Int(queryChunk.minY)
-                guard localY >= 0, localY < Int(queryChunk.height) else {
+                let localY = worldY - queryChunk.minY
+                guard localY >= 0, localY < queryChunk.height else {
                     return false
                 }
-                return queryChunk.isTerrain(
-                    atLocal: PosInt3D(
-                        x: Int32(localX),
-                        y: Int32(localY),
-                        z: Int32(localZ)
-                    )
-                )
+                return queryChunk.isSolid(atLocalX: localX, y: localY, z: localZ)
             }
 
             @inline(__always)
@@ -795,6 +892,7 @@ final class TerrainRenderer {
 
     private let moveSpeed: Float
     private let fastMoveMultiplier: Float
+    private let zoomMultiplier: Float
     private let mouseSensitivity: Float
     private let profilingEnabled = ProcessInfo.processInfo.environment["MINESCENE_PROFILE"] == "1"
     private let streamer: Streamer
@@ -805,6 +903,10 @@ final class TerrainRenderer {
     private let hudFpsColor = SIMD4<Float>(0.62, 0.28, 0.78, 1.0)
     private let hudBiomeColor = SIMD4<Float>(0.95, 0.55, 0.14, 1.0)
     private let hudDebugColor = SIMD4<Float>(0.62, 0.52, 0.12, 1.0)
+    private let commandPromptBackgroundColor = SIMD4<Float>(0.0, 0.0, 0.0, 0.72)
+    private let commandPromptTextColor = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
+    private let commandPromptCursorColor = SIMD4<Float>(1.0, 1.0, 1.0, 0.55)
+    private let commandPromptCursorBlinkPeriod: Float = 0.5
 
     private var chunkMeshes: [ChunkCoord: ChunkRenderMesh] = [:]
     private var hudBuffer: VulkanOwnedBuffer?
@@ -827,6 +929,14 @@ final class TerrainRenderer {
     private var keySpace = false
     private var keyShift = false
     private var keyR = false
+    private var keyX = false
+    private var commandPromptActive = false
+    private var commandPromptText = ""
+    private var commandPromptCursorElapsed: Float = 0
+
+    var isCommandPromptActive: Bool {
+        commandPromptActive
+    }
 
     init(
         worldGenerator: WorldGenerator,
@@ -834,11 +944,13 @@ final class TerrainRenderer {
         renderRadius: Int = 12,
         moveSpeed: Float = 32.0,
         fastMoveMultiplier: Float = 4.0,
+        zoomMultiplier: Float = 4.0,
         mouseSensitivity: Float = 0.0025,
         generationWorkerCount: Int = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
     ) {
         self.moveSpeed = moveSpeed
         self.fastMoveMultiplier = fastMoveMultiplier
+        self.zoomMultiplier = max(1, zoomMultiplier)
         self.mouseSensitivity = mouseSensitivity
         self.streamer = Streamer(
             worldGenerator: worldGenerator,
@@ -849,10 +961,19 @@ final class TerrainRenderer {
         )
     }
 
-    func handleEvent(_ event: SDL_Event) {
+    func handleEvent(_ event: SDL_Event, window: OpaquePointer?) {
+        if commandPromptActive {
+            handleCommandPromptEvent(event, window: window)
+            return
+        }
+
         switch event.eventType {
         case .keyDown:
             if event.key.repeat {
+                return
+            }
+            if event.key.scancode == SDL_SCANCODE_SLASH {
+                openCommandPrompt(window: window)
                 return
             }
             setKeyState(key: event.key.key, pressed: true)
@@ -863,6 +984,30 @@ final class TerrainRenderer {
             cameraYaw += delta.x * mouseSensitivity
             cameraPitch -= delta.y * mouseSensitivity
             cameraPitch = max(-(.pi / 2.0 - 0.01), min(.pi / 2.0 - 0.01, cameraPitch))
+        default:
+            break
+        }
+    }
+
+    private func handleCommandPromptEvent(_ event: SDL_Event, window: OpaquePointer?) {
+        switch event.eventType {
+        case .keyDown:
+            switch event.key.key {
+            case SDLK_RETURN, SDLK_RETURN2:
+                closeCommandPrompt(window: window, execute: true)
+            case SDLK_BACKSPACE:
+                if !commandPromptText.isEmpty {
+                    commandPromptText.removeLast()
+                }
+            case SDLK_ESCAPE:
+                closeCommandPrompt(window: window, execute: false)
+            default:
+                break
+            }
+        case .textInput:
+            if let textPointer = event.text.text {
+                appendCommandPromptText(String(cString: textPointer))
+            }
         default:
             break
         }
@@ -884,6 +1029,8 @@ final class TerrainRenderer {
             keyShift = pressed
         case SDLK_R:
             keyR = pressed
+        case SDLK_X:
+            keyX = pressed
         case SDLK_LEFTBRACKET:
             if pressed {
                 streamer.adjustRenderRadius(by: -1)
@@ -897,6 +1044,52 @@ final class TerrainRenderer {
         }
     }
 
+    private func openCommandPrompt(window: OpaquePointer?) {
+        commandPromptActive = true
+        commandPromptText = ""
+        commandPromptCursorElapsed = 0
+        resetMovementKeys()
+        if let window {
+            _ = SDL_StartTextInput(window)
+        }
+    }
+
+    private func closeCommandPrompt(window: OpaquePointer?, execute: Bool) {
+        if execute {
+            print(commandPromptText)
+        }
+        commandPromptActive = false
+        commandPromptText = ""
+        commandPromptCursorElapsed = 0
+        if let window {
+            _ = SDL_StopTextInput(window)
+        }
+    }
+
+    private func appendCommandPromptText(_ text: String) {
+        let sanitized = String(
+            text
+                .lowercased()
+                .unicodeScalars
+                .filter { !CharacterSet.controlCharacters.contains($0) && $0.value != 0x7F }
+        )
+        guard !sanitized.isEmpty else {
+            return
+        }
+        commandPromptText += sanitized
+    }
+
+    private func resetMovementKeys() {
+        keyW = false
+        keyA = false
+        keyS = false
+        keyD = false
+        keySpace = false
+        keyShift = false
+        keyR = false
+        keyX = false
+    }
+
     func update(deltaTime: Float) {
         if deltaTime > 0 {
             let instantaneousFps = min(240, 1 / deltaTime)
@@ -904,6 +1097,9 @@ final class TerrainRenderer {
                 smoothedFps = instantaneousFps
             } else {
                 smoothedFps += (instantaneousFps - smoothedFps) * 0.12
+            }
+            if commandPromptActive {
+                commandPromptCursorElapsed += deltaTime
             }
         }
 
@@ -961,6 +1157,13 @@ final class TerrainRenderer {
         let width = max(1, Float(windowW))
         let height = max(1, Float(windowH))
         let aspect = width / height
+        let baseFovYRadians: Float = 65.0 * .pi / 180.0
+        let effectiveFovYRadians: Float
+        if keyX {
+            effectiveFovYRadians = 2 * atan(tan(baseFovYRadians * 0.5) / zoomMultiplier)
+        } else {
+            effectiveFovYRadians = baseFovYRadians
+        }
 
         let view = lookAtRH(
             eye: cameraPosition,
@@ -968,7 +1171,7 @@ final class TerrainRenderer {
             up: SIMD3<Float>(0, 1, 0)
         )
         let projection = perspectiveRH(
-            fovYRadians: 65.0 * .pi / 180.0,
+            fovYRadians: effectiveFovYRadians,
             aspect: aspect,
             nearZ: 0.05,
             farZ: 2048.0
@@ -1107,6 +1310,8 @@ final class TerrainRenderer {
     private func updateHudIfNeeded(engine: VulkanEngine, viewportWidth: Int, viewportHeight: Int) throws {
         let biomeText = currentBiomeHudText()
         let debugLines = currentDebugHudLines()
+        let promptDisplayText = currentCommandPromptDisplayText()
+        let promptCursorVisible = isCommandPromptCursorVisible()
         let positionRuns = [
             HudTextRun(text: String(format: "X: %.1f ", Double(cameraPosition.x)), color: hudXColor),
             HudTextRun(text: String(format: "Y: %.1f ", Double(cameraPosition.y)), color: hudYColor),
@@ -1121,7 +1326,7 @@ final class TerrainRenderer {
         let debugRuns = debugLines.map { [HudTextRun(text: $0, color: hudDebugColor)] }
         let hudText = ([positionRuns, fpsRuns, biomeRuns] + debugRuns)
             .flatMap { $0.map(\.text) }
-            .joined(separator: "\n")
+            .joined(separator: "\n") + "\nprompt:\(promptDisplayText ?? ""):\(promptCursorVisible ? 1 : 0)"
         let viewport = SIMD2<Int>(viewportWidth, viewportHeight)
         guard hudText != lastHudText || viewport != lastHudViewport || biomeText != lastHudBiome else {
             return
@@ -1129,8 +1334,11 @@ final class TerrainRenderer {
 
         let vertices = makeHudVertices(
             viewportWidth: viewportWidth,
+            viewportHeight: viewportHeight,
             leftLines: [positionRuns, fpsRuns],
-            rightLines: [biomeRuns] + debugRuns
+            rightLines: [biomeRuns] + debugRuns,
+            promptText: promptDisplayText,
+            promptCursorVisible: promptCursorVisible
         )
         if vertices.isEmpty {
             hudVertexCount = 0
@@ -1182,8 +1390,11 @@ final class TerrainRenderer {
 
     private func makeHudVertices(
         viewportWidth: Int,
+        viewportHeight: Int,
         leftLines: [[HudTextRun]],
-        rightLines: [[HudTextRun]]
+        rightLines: [[HudTextRun]],
+        promptText: String?,
+        promptCursorVisible: Bool
     ) -> [VulkanEngine.Vertex2D] {
         let standardStyle = HudStyle(cellSize: 5, glyphAdvance: 20, lineAdvance: 34)
         let compactStyle = HudStyle(cellSize: 3, glyphAdvance: 12, lineAdvance: 16)
@@ -1192,8 +1403,8 @@ final class TerrainRenderer {
         let rightMargin: Float = 12
 
         var vertices: [VulkanEngine.Vertex2D] = []
-        let characterCount = (leftLines + rightLines).flatMap { $0 }.reduce(0) { $0 + $1.text.count }
-        vertices.reserveCapacity(characterCount * 180)
+        let characterCount = (leftLines + rightLines).flatMap { $0 }.reduce(0) { $0 + $1.text.count } + (promptText?.count ?? 0)
+        vertices.reserveCapacity(characterCount * 180 + (promptText == nil ? 0 : 512))
 
         appendHudLines(
             leftLines,
@@ -1215,6 +1426,15 @@ final class TerrainRenderer {
             shadowOffset: shadowOffset,
             into: &vertices
         )
+        if let promptText {
+            appendCommandPrompt(
+                text: promptText,
+                cursorVisible: promptCursorVisible,
+                viewportWidth: Float(viewportWidth),
+                viewportHeight: Float(viewportHeight),
+                into: &vertices
+            )
+        }
 
         return vertices
     }
@@ -1287,6 +1507,21 @@ final class TerrainRenderer {
         ]
     }
 
+    private func currentCommandPromptDisplayText() -> String? {
+        guard commandPromptActive else {
+            return nil
+        }
+        return commandPromptText
+    }
+
+    private func isCommandPromptCursorVisible() -> Bool {
+        guard commandPromptActive else {
+            return false
+        }
+        let phase = commandPromptCursorElapsed.truncatingRemainder(dividingBy: commandPromptCursorBlinkPeriod * 2)
+        return phase < commandPromptCursorBlinkPeriod
+    }
+
     private func formatBiomeName(_ biomeName: String) -> String {
         let trimmedNamespace: Substring
         if let colonIndex = biomeName.lastIndex(of: ":") {
@@ -1303,6 +1538,61 @@ final class TerrainRenderer {
             }
             .joined(separator: " ")
             .uppercased()
+    }
+
+    private func appendCommandPrompt(
+        text: String,
+        cursorVisible: Bool,
+        viewportWidth: Float,
+        viewportHeight: Float,
+        into vertices: inout [VulkanEngine.Vertex2D]
+    ) {
+        let cellSize: Float = 2
+        let glyphAdvance: Float = 14
+        let barHeight: Float = 34
+        let textOrigin = SIMD2<Float>(12, viewportHeight - barHeight + 5)
+
+        appendHudQuad(
+            minX: 0,
+            minY: viewportHeight - barHeight,
+            maxX: viewportWidth,
+            maxY: viewportHeight,
+            color: commandPromptBackgroundColor,
+            into: &vertices
+        )
+
+        var cursorX = textOrigin.x
+        let slashGlyph = Self.promptGlyphs["/"] ?? Self.promptGlyphs[" "]!
+        appendGlyph(
+            slashGlyph,
+            origin: SIMD2<Float>(cursorX, textOrigin.y),
+            cellSize: cellSize,
+            color: commandPromptTextColor,
+            into: &vertices
+        )
+        cursorX += glyphAdvance
+
+        for character in text {
+            let glyph = Self.promptGlyphs[character] ?? Self.promptGlyphs[" "]!
+            appendGlyph(
+                glyph,
+                origin: SIMD2<Float>(cursorX, textOrigin.y),
+                cellSize: cellSize,
+                color: commandPromptTextColor,
+                into: &vertices
+            )
+            cursorX += glyphAdvance
+        }
+
+        if cursorVisible, let cursorGlyph = Self.promptGlyphs["_"] {
+            appendGlyph(
+                cursorGlyph,
+                origin: SIMD2<Float>(cursorX, textOrigin.y),
+                cellSize: cellSize,
+                color: commandPromptCursorColor,
+                into: &vertices
+            )
+        }
     }
 
     private func appendGlyph(
@@ -1397,6 +1687,78 @@ final class TerrainRenderer {
         )
     }
 
+    private static let promptGlyphs: [Character: [String]] = [
+        "0": ["0111110", "1100011", "1100111", "1101111", "1111011", "1110011", "1100011", "0111110", "0000000"],
+        "1": ["0011000", "0111000", "0011000", "0011000", "0011000", "0011000", "0011000", "1111111", "0000000"],
+        "2": ["0111110", "1100011", "0000011", "0000110", "0001100", "0110000", "1100000", "1111111", "0000000"],
+        "3": ["0111110", "1100011", "0000011", "0011110", "0000011", "0000011", "1100011", "0111110", "0000000"],
+        "4": ["0001110", "0011110", "0110110", "1100110", "1111111", "0000110", "0000110", "0001111", "0000000"],
+        "5": ["1111111", "1100000", "1100000", "1111110", "0000011", "0000011", "1100011", "0111110", "0000000"],
+        "6": ["0011110", "0110000", "1100000", "1111110", "1100011", "1100011", "1100011", "0111110", "0000000"],
+        "7": ["1111111", "0000011", "0000110", "0001100", "0011000", "0011000", "0011000", "0011000", "0000000"],
+        "8": ["0111110", "1100011", "1100011", "0111110", "1100011", "1100011", "1100011", "0111110", "0000000"],
+        "9": ["0111110", "1100011", "1100011", "1100011", "0111111", "0000011", "0000110", "0111100", "0000000"],
+
+        "a": ["0000000", "0000000", "0111110", "0000011", "0111111", "1100011", "1100011", "0111111", "0000000"],
+        "b": ["1100000", "1100000", "1100000", "1111110", "1100011", "1100011", "1100011", "1111110", "0000000"],
+        "c": ["0000000", "0000000", "0111110", "1100011", "1100000", "1100000", "1100011", "0111110", "0000000"],
+        "d": ["0000011", "0000011", "0000011", "0111111", "1100011", "1100011", "1100011", "0111111", "0000000"],
+        "e": ["0000000", "0000000", "0111110", "1100011", "1111111", "1100000", "1100011", "0111110", "0000000"],
+        "f": ["0001110", "0011011", "0011000", "1111110", "0011000", "0011000", "0011000", "0011000", "0000000"],
+        "g": ["0000000", "0000000", "0111111", "1100011", "1100011", "0111111", "0000011", "1100011", "0111110"],
+        "h": ["1100000", "1100000", "1100000", "1111110", "1100011", "1100011", "1100011", "1100011", "0000000"],
+        "i": ["0011000", "0000000", "0111000", "0011000", "0011000", "0011000", "0011000", "0111110", "0000000"],
+        "j": ["0001100", "0000000", "0011100", "0001100", "0001100", "0001100", "0001100", "1101100", "0111000"],
+        "k": ["1100000", "1100000", "1100011", "1100110", "1111100", "1100110", "1100011", "1100011", "0000000"],
+        "l": ["0111000", "0011000", "0011000", "0011000", "0011000", "0011000", "0011000", "0111110", "0000000"],
+        "m": ["0000000", "0000000", "1110110", "1111111", "1101011", "1101011", "1100011", "1100011", "0000000"],
+        "n": ["0000000", "0000000", "1111110", "1100011", "1100011", "1100011", "1100011", "1100011", "0000000"],
+        "o": ["0000000", "0000000", "0111110", "1100011", "1100011", "1100011", "1100011", "0111110", "0000000"],
+        "p": ["0000000", "0000000", "1111110", "1100011", "1100011", "1111110", "1100000", "1100000", "1100000"],
+        "q": ["0000000", "0000000", "0111111", "1100011", "1100011", "0111111", "0000011", "0000011", "0000011"],
+        "r": ["0000000", "0000000", "1101110", "1110011", "1100000", "1100000", "1100000", "1100000", "0000000"],
+        "s": ["0000000", "0000000", "0111111", "1100000", "0111110", "0000011", "1100011", "0111110", "0000000"],
+        "t": ["0011000", "0011000", "1111110", "0011000", "0011000", "0011000", "0011011", "0001110", "0000000"],
+        "u": ["0000000", "0000000", "1100011", "1100011", "1100011", "1100011", "1100111", "0111011", "0000000"],
+        "v": ["0000000", "0000000", "1100011", "1100011", "1100011", "1100011", "0110110", "0011100", "0000000"],
+        "w": ["0000000", "0000000", "1100011", "1100011", "1101011", "1101011", "1111111", "0110110", "0000000"],
+        "x": ["0000000", "0000000", "1100011", "0110110", "0011100", "0011100", "0110110", "1100011", "0000000"],
+        "y": ["0000000", "0000000", "1100011", "1100011", "1100011", "0111111", "0000011", "1100011", "0111110"],
+        "z": ["0000000", "0000000", "1111111", "0000110", "0001100", "0011000", "0110000", "1111111", "0000000"],
+
+        " ": ["0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000"],
+        "/": ["0000011", "0000110", "0001100", "0011000", "0110000", "1100000", "0000000", "0000000", "0000000"],
+        "\\": ["1100000", "0110000", "0011000", "0001100", "0000110", "0000011", "0000000", "0000000", "0000000"],
+        "_": ["0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "1111111"],
+        "-": ["0000000", "0000000", "0000000", "0111110", "0111110", "0000000", "0000000", "0000000", "0000000"],
+        ".": ["0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "0011000", "0011000"],
+        ",": ["0000000", "0000000", "0000000", "0000000", "0000000", "0000000", "0011000", "0011000", "0110000"],
+        ":": ["0000000", "0011000", "0011000", "0000000", "0000000", "0011000", "0011000", "0000000", "0000000"],
+        ";": ["0000000", "0011000", "0011000", "0000000", "0000000", "0011000", "0011000", "0110000", "0000000"],
+        "=": ["0000000", "0000000", "1111111", "0000000", "1111111", "0000000", "0000000", "0000000", "0000000"],
+        "+": ["0000000", "0011000", "0011000", "1111111", "0011000", "0011000", "0000000", "0000000", "0000000"],
+        "*": ["0000000", "1100011", "0110110", "0011100", "0110110", "1100011", "0000000", "0000000", "0000000"],
+        "#": ["0000000", "0110110", "1111111", "0110110", "0110110", "1111111", "0110110", "0000000", "0000000"],
+        "@": ["0011110", "0110011", "1101111", "1101011", "1101111", "1100000", "0111110", "0000000", "0000000"],
+        "~": ["0000000", "0000000", "0110010", "1001101", "0000000", "0000000", "0000000", "0000000", "0000000"],
+        "^": ["0011000", "0110110", "1100011", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000"],
+        "!": ["0011000", "0011000", "0011000", "0011000", "0011000", "0000000", "0011000", "0011000", "0000000"],
+        "?": ["0111110", "1100011", "0000011", "0001110", "0011000", "0000000", "0011000", "0011000", "0000000"],
+        "'": ["0011000", "0011000", "0001100", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000"],
+        "\"": ["0110110", "0110110", "0010010", "0000000", "0000000", "0000000", "0000000", "0000000", "0000000"],
+        "[": ["0011110", "0011000", "0011000", "0011000", "0011000", "0011000", "0011000", "0011110", "0000000"],
+        "]": ["0111100", "0001100", "0001100", "0001100", "0001100", "0001100", "0001100", "0111100", "0000000"],
+        "{": ["0001110", "0011000", "0011000", "1110000", "0011000", "0011000", "0011000", "0001110", "0000000"],
+        "}": ["1110000", "0001100", "0001100", "0000111", "0001100", "0001100", "0001100", "1110000", "0000000"],
+        "(": ["0001110", "0011000", "0110000", "0110000", "0110000", "0110000", "0011000", "0001110", "0000000"],
+        ")": ["0111000", "0001100", "0000110", "0000110", "0000110", "0000110", "0001100", "0111000", "0000000"],
+        "<": ["0000110", "0001100", "0011000", "0110000", "0011000", "0001100", "0000110", "0000000", "0000000"],
+        ">": ["0110000", "0011000", "0001100", "0000110", "0001100", "0011000", "0110000", "0000000", "0000000"],
+        "|": ["0011000", "0011000", "0011000", "0011000", "0011000", "0011000", "0011000", "0011000", "0000000"],
+        "%": ["1100011", "1100110", "0001100", "0011000", "0110000", "1100110", "1000011", "0000000", "0000000"],
+        "&": ["0011100", "0110110", "0111100", "0011000", "0111011", "1100110", "1100110", "0111011", "0000000"]
+    ]
+
     private static let hudGlyphs: [Character: [String]] = [
         "0": ["111", "101", "101", "101", "111"],
         "1": ["010", "110", "010", "010", "111"],
@@ -1413,6 +1775,7 @@ final class TerrainRenderer {
         "C": ["011", "100", "100", "100", "011"],
         "D": ["110", "101", "101", "101", "110"],
         "E": ["111", "100", "110", "100", "111"],
+        "F": ["111", "100", "110", "100", "100"],
         "G": ["011", "100", "101", "101", "011"],
         "H": ["101", "101", "111", "101", "101"],
         "I": ["111", "010", "010", "010", "111"],
@@ -1422,8 +1785,10 @@ final class TerrainRenderer {
         "M": ["101", "111", "111", "101", "101"],
         "N": ["101", "111", "111", "111", "101"],
         "O": ["010", "101", "101", "101", "010"],
+        "P": ["110", "101", "110", "100", "100"],
         "Q": ["010", "101", "101", "111", "011"],
         "R": ["110", "101", "110", "101", "101"],
+        "S": ["111", "100", "111", "001", "111"],
         "T": ["111", "010", "010", "010", "010"],
         "U": ["101", "101", "101", "101", "111"],
         "V": ["101", "101", "101", "101", "010"],
@@ -1431,13 +1796,48 @@ final class TerrainRenderer {
         "X": ["101", "101", "010", "101", "101"],
         "Y": ["101", "101", "010", "010", "010"],
         "Z": ["111", "001", "010", "100", "111"],
-        "F": ["111", "100", "110", "100", "100"],
-        "P": ["110", "101", "110", "100", "100"],
-        "S": ["111", "100", "111", "001", "111"],
+        "a": ["000", "011", "101", "111", "101"],
+        "b": ["100", "110", "101", "110", "101"],
+        "c": ["000", "011", "100", "100", "011"],
+        "d": ["001", "011", "101", "101", "011"],
+        "e": ["000", "011", "111", "100", "011"],
+        "f": ["001", "010", "111", "010", "010"],
+        "g": ["000", "011", "101", "011", "001"],
+        "h": ["100", "110", "101", "101", "101"],
+        "i": ["010", "000", "110", "010", "111"],
+        "j": ["001", "000", "001", "101", "010"],
+        "k": ["100", "101", "110", "101", "101"],
+        "l": ["110", "010", "010", "010", "111"],
+        "m": ["000", "111", "111", "101", "101"],
+        "n": ["000", "110", "101", "101", "101"],
+        "o": ["000", "010", "101", "101", "010"],
+        "p": ["000", "110", "101", "110", "100"],
+        "q": ["000", "011", "101", "011", "001"],
+        "r": ["000", "101", "110", "100", "100"],
+        "s": ["000", "011", "110", "011", "110"],
+        "t": ["010", "111", "010", "010", "001"],
+        "u": ["000", "101", "101", "101", "011"],
+        "v": ["000", "101", "101", "101", "010"],
+        "w": ["000", "101", "111", "111", "101"],
+        "x": ["000", "101", "010", "010", "101"],
+        "y": ["000", "101", "101", "011", "001"],
+        "z": ["000", "111", "001", "010", "111"],
         "/": ["001", "001", "010", "100", "100"],
         ":": ["000", "010", "000", "010", "000"],
         ".": ["000", "000", "000", "000", "010"],
+        ",": ["000", "000", "000", "010", "100"],
         "-": ["000", "000", "111", "000", "000"],
+        "_": ["000", "000", "000", "000", "111"],
+        "=": ["000", "111", "000", "111", "000"],
+        "[": ["110", "100", "100", "100", "110"],
+        "]": ["011", "001", "001", "001", "011"],
+        "@": ["111", "101", "111", "100", "011"],
+        "~": ["000", "101", "010", "000", "000"],
+        "^": ["010", "101", "000", "000", "000"],
+        "!": ["010", "010", "010", "000", "010"],
+        "?": ["111", "001", "010", "000", "010"],
+        "'": ["010", "010", "000", "000", "000"],
+        "\"": ["101", "101", "000", "000", "000"],
         " ": ["000", "000", "000", "000", "000"]
     ]
 }

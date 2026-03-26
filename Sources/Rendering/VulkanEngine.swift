@@ -307,6 +307,7 @@ final class VulkanEngine {
             vertexInput: VulkanEngine.vertexInput2D(),
             cullMode: VkCullModeFlags(VK_CULL_MODE_NONE.rawValue),
             enableDepthTest: false,
+            enableBlending: true,
             vertSpirv: vertSpirv,
             fragSpirv: fragSpirv
         )
@@ -380,6 +381,7 @@ final class VulkanEngine {
                 vertexInput: VulkanEngine.vertexInput3D(),
                 cullMode: VkCullModeFlags(VK_CULL_MODE_BACK_BIT.rawValue),
                 enableDepthTest: true,
+                enableBlending: false,
                 vertSpirv: vertSpirv3D,
                 fragSpirv: fragSpirv3D
             )
@@ -853,6 +855,7 @@ final class VulkanEngine {
         vertexInput: VertexInputDescription,
         cullMode: VkCullModeFlags = VkCullModeFlags(VK_CULL_MODE_NONE.rawValue),
         enableDepthTest: Bool = false,
+        enableBlending: Bool = false,
         vertSpirv: [UInt32],
         fragSpirv: [UInt32]
     ) throws -> VulkanOwnedPipeline {
@@ -965,12 +968,12 @@ final class VulkanEngine {
                     maxDepthBounds: 1
                 )
                 var colorBlendAttachment = VkPipelineColorBlendAttachmentState(
-                    blendEnable: VK_FALSE,
-                    srcColorBlendFactor: VK_BLEND_FACTOR_ONE,
-                    dstColorBlendFactor: VK_BLEND_FACTOR_ZERO,
+                    blendEnable: enableBlending ? VK_TRUE : VK_FALSE,
+                    srcColorBlendFactor: enableBlending ? VK_BLEND_FACTOR_SRC_ALPHA : VK_BLEND_FACTOR_ONE,
+                    dstColorBlendFactor: enableBlending ? VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA : VK_BLEND_FACTOR_ZERO,
                     colorBlendOp: VK_BLEND_OP_ADD,
                     srcAlphaBlendFactor: VK_BLEND_FACTOR_ONE,
-                    dstAlphaBlendFactor: VK_BLEND_FACTOR_ZERO,
+                    dstAlphaBlendFactor: enableBlending ? VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA : VK_BLEND_FACTOR_ZERO,
                     alphaBlendOp: VK_BLEND_OP_ADD,
                     colorWriteMask: VkColorComponentFlags(
                         VK_COLOR_COMPONENT_R_BIT.rawValue |

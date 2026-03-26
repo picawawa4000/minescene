@@ -244,7 +244,8 @@ extension TerrainRenderer {
         let visibleEntries = commandLogEntries.suffix(5).reversed()
 
         for (offset, entry) in visibleEntries.enumerated() {
-            let fade = max(0, 1 - (entry.age / commandLogLifetime))
+            let fadeProgress = max(0, entry.age - commandLogHoldDuration) / commandLogFadeDuration
+            let fade = max(0, 1 - fadeProgress)
             guard fade > 0 else {
                 continue
             }

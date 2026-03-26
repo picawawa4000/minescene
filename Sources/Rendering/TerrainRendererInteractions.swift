@@ -2,6 +2,10 @@ import SwiftSDL
 import simd
 
 extension TerrainRenderer {
+    var currentCameraPosition: SIMD3<Float> {
+        cameraPosition
+    }
+
     func handleEvent(_ event: SDL_Event, window: OpaquePointer?) {
         if commandPromptActive {
             handleCommandPromptEvent(event, window: window)
@@ -87,7 +91,7 @@ extension TerrainRenderer {
                 for index in commandLogEntries.indices {
                     commandLogEntries[index].age += deltaTime
                 }
-                commandLogEntries.removeAll { $0.age >= commandLogLifetime }
+                commandLogEntries.removeAll { $0.age >= commandLogHoldDuration + commandLogFadeDuration }
             }
         }
 

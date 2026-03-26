@@ -180,6 +180,14 @@ final class BiomeQuadTreeCache {
         self.maxBatchSpanTiles = 2
     }
 
+    func clear() {
+        lockQueue.sync(flags: .barrier) {
+            trees.removeAll(keepingCapacity: false)
+            pending.removeAll(keepingCapacity: false)
+            version &+= 1
+        }
+    }
+
     func currentVersion(sampleY: Int = 256) -> UInt64 {
         _ = sampleY
         return lockQueue.sync { version }
@@ -257,6 +265,10 @@ final class BiomeQuadTreeCache {
         vertices.reserveCapacity(width * height * 6)
         let vertexBuildStartNs = DispatchTime.now().uptimeNanoseconds
 
+        let cellSize = Float(scale)
+        let originX = Float(topLeftX)
+        let originZ = Float(topLeftZ)
+
         for y in 0..<height {
             for x in 0..<width {
                 let baseIndex = (y * width + x) * 4
@@ -266,10 +278,10 @@ final class BiomeQuadTreeCache {
                 let a = Float(pixels[baseIndex + 3]) / 255.0
                 let color = SIMD4<Float>(x: r, y: g, z: b, w: a)
 
-                let px0 = Float(x)
-                let py0 = Float(y)
-                let px1 = px0 + 1.0
-                let py1 = py0 + 1.0
+                let px0 = originX + Float(x) * cellSize
+                let py0 = originZ + Float(y) * cellSize
+                let px1 = px0 + cellSize
+                let py1 = py0 + cellSize
 
                 vertices.append(.init(position: SIMD2<Float>(x: px0, y: py1), color: color))
                 vertices.append(.init(position: SIMD2<Float>(x: px1, y: py1), color: color))

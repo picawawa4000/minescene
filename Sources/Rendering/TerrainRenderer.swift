@@ -302,6 +302,24 @@ final class TerrainRenderer {
             )
         }
 
+        func requestMeshRebuild() {
+            var meshWorkersToStart = 0
+
+            lock.lock()
+            for coord in chunks.keys {
+                markChunkDirtyLocked(coord)
+            }
+            pendingMeshResults.removeAll(keepingCapacity: true)
+            meshWorkersToStart = startMeshWorkersLocked()
+            lock.unlock()
+
+            for _ in 0..<meshWorkersToStart {
+                meshQueue.async { [self] in
+                    meshWorkerLoop()
+                }
+            }
+        }
+
         private func generationWorkerLoop() {
             while true {
                 let chunkCoord: ChunkCoord
@@ -907,10 +925,12 @@ final class TerrainRenderer {
     let commandPromptTextColor = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
     let commandPromptCursorColor = SIMD4<Float>(1.0, 1.0, 1.0, 0.55)
     let commandPromptCursorBlinkPeriod: Float = 0.5
-    let commandLogLifetime: Float = 5.0
+    let commandLogHoldDuration: Float = 5.0
+    let commandLogFadeDuration: Float = 5.0
     let commandLogBackgroundColor = SIMD4<Float>(0.0, 0.0, 0.0, 0.72)
     let commandLogErrorColor = SIMD4<Float>(0.92, 0.28, 0.24, 1.0)
 
+    var externalCommandExecutor: ((String, String, TerrainRenderer) throws -> Bool)?
     var chunkMeshes: [ChunkCoord: ChunkRenderMesh] = [:]
     var hudBuffer: VulkanOwnedBuffer?
     var hudMemory: VulkanOwnedDeviceMemory?
@@ -935,7 +955,10 @@ final class TerrainRenderer {
     var keyX = false
     var commandPromptActive = false
     var commandPromptText = ""
+    var commandPromptDraftText = ""
     var commandPromptCursorElapsed: Float = 0
+    var commandPromptHistory: [String] = []
+    var commandPromptHistoryIndex: Int?
     var commandLogEntries: [TerrainRendererCommandLogEntry] = []
 
     init(
@@ -1117,6 +1140,14 @@ final class TerrainRenderer {
                 vertexCount
             )
         )
+    }
+
+    func discardChunkMeshes() {
+        chunkMeshes.removeAll()
+    }
+
+    func requestChunkMeshRebuild() {
+        streamer.requestMeshRebuild()
     }
 }
 

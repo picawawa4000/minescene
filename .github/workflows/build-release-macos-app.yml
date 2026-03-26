@@ -45,3 +45,89 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ github.event.release.tag_name }}" "dist/MineScene-macos-${{ env.RELEASE_VERSION }}.zip" --clobber
+
+  build-linux:
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ github.event.release.tag_name || github.ref_name }}
+      SDL3_VERSION: "3.4.0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Rewrite GitHub SSH URLs to HTTPS for SwiftPM
+        run: |
+          git config --global --add url."https://github.com/".insteadOf git@github.com:
+          git config --global --add url."https://github.com/".insteadOf ssh://git@github.com/
+          git config --global --add url."https://github.com/".insteadOf git+ssh://git@github.com/
+          git config --global --get-all url."https://github.com/".insteadOf
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            glslang-tools \
+            libasound2-dev \
+            libdbus-1-dev \
+            libdecor-0-dev \
+            libdrm-dev \
+            libegl1-mesa-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev \
+            libibus-1.0-dev \
+            libpipewire-0.3-dev \
+            libudev-dev \
+            liburing-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxss-dev \
+            libxtst-dev \
+            ninja-build \
+            patchelf \
+            pkg-config
+
+      - name: Build SDL3
+        run: |
+          curl -L "https://github.com/libsdl-org/SDL/releases/download/release-${SDL3_VERSION}/SDL3-${SDL3_VERSION}.tar.gz" -o "$RUNNER_TEMP/SDL3.tar.gz"
+          tar -xzf "$RUNNER_TEMP/SDL3.tar.gz" -C "$RUNNER_TEMP"
+          cmake -S "$RUNNER_TEMP/SDL3-${SDL3_VERSION}" -B "$RUNNER_TEMP/SDL3-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/sdl3" \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=OFF \
+            -DSDL_TEST_LIBRARY=OFF
+          cmake --build "$RUNNER_TEMP/SDL3-build"
+          cmake --install "$RUNNER_TEMP/SDL3-build"
+
+      - name: Build Linux release artifact
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/sdl3/lib/pkgconfig:${{ runner.temp }}/sdl3/lib64/pkgconfig:${{ runner.temp }}/sdl3/lib/x86_64-linux-gnu/pkgconfig
+          LD_LIBRARY_PATH: ${{ runner.temp }}/sdl3/lib:${{ runner.temp }}/sdl3/lib64:${{ runner.temp }}/sdl3/lib/x86_64-linux-gnu
+          SDL3_PREFIX: ${{ runner.temp }}/sdl3
+        run: bash ./.github/scripts/build-release-linux.sh
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MineScene-linux-${{ env.RELEASE_VERSION }}
+          path: dist/MineScene-linux-x86_64-${{ env.RELEASE_VERSION }}.tar.gz
+          if-no-files-found: error
+
+      - name: Attach asset to GitHub release
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "dist/MineScene-linux-x86_64-${{ env.RELEASE_VERSION }}.tar.gz" --clobber

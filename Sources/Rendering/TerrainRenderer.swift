@@ -111,6 +111,141 @@ final class TerrainRenderer {
         let totalTargetChunks: Int
     }
 
+    private enum CommandParseError: Error, CustomStringConvertible {
+        case missingArgument(String)
+        case invalidInt(String)
+        case invalidDouble(String)
+        case invalidPosition(axis: String, value: String)
+        case trailingArguments(String)
+
+        var description: String {
+            switch self {
+            case .missingArgument(let expected):
+                return "expected \(expected), but reached the end of the command"
+            case .invalidInt(let value):
+                return "expected integer argument, got '\(value)'"
+            case .invalidDouble(let value):
+                return "expected double argument, got '\(value)'"
+            case .invalidPosition(let axis, let value):
+                return "expected \(axis) coordinate, got '\(value)'"
+            case .trailingArguments(let value):
+                return "unexpected trailing arguments '\(value)'"
+            }
+        }
+    }
+
+    private struct CommandArgumentParser {
+        private let tokens: [Substring]
+        private var index = 0
+
+        init(_ arguments: String) {
+            self.tokens = arguments.split(whereSeparator: \.isWhitespace)
+        }
+
+        mutating func getNextInt() throws -> Int {
+            let token = try nextToken(expected: "an integer")
+            guard Self.isValidIntToken(token), let value = Int(token) else {
+                throw CommandParseError.invalidInt(token)
+            }
+            return value
+        }
+
+        mutating func getNextDouble() throws -> Double {
+            let token = try nextToken(expected: "a double")
+            guard let value = Self.parseStrictDouble(token) else {
+                throw CommandParseError.invalidDouble(token)
+            }
+            return value
+        }
+
+        mutating func getNextString() throws -> String {
+            try nextToken(expected: "a string")
+        }
+
+        mutating func getNextPos(currentPosition: SIMD3<Double>) throws -> SIMD3<Double> {
+            SIMD3<Double>(
+                try parsePositionComponent(axis: "x", current: currentPosition.x),
+                try parsePositionComponent(axis: "y", current: currentPosition.y),
+                try parsePositionComponent(axis: "z", current: currentPosition.z)
+            )
+        }
+
+        mutating func end() throws {
+            guard index < tokens.count else {
+                return
+            }
+            let trailing = tokens[index...].joined(separator: " ")
+            throw CommandParseError.trailingArguments(trailing)
+        }
+
+        private mutating func parsePositionComponent(axis: String, current: Double) throws -> Double {
+            let token = try nextToken(expected: "\(axis) coordinate")
+            if token == "~" {
+                return current
+            }
+            if token.first == "~" {
+                let offsetToken = String(token.dropFirst())
+                guard let offset = Self.parseStrictDouble(offsetToken) else {
+                    throw CommandParseError.invalidPosition(axis: axis, value: token)
+                }
+                return current + offset
+            }
+            guard let absolute = Self.parseStrictDouble(token) else {
+                throw CommandParseError.invalidPosition(axis: axis, value: token)
+            }
+            return absolute
+        }
+
+        private mutating func nextToken(expected: String) throws -> String {
+            guard index < tokens.count else {
+                throw CommandParseError.missingArgument(expected)
+            }
+            let token = String(tokens[index])
+            index += 1
+            return token
+        }
+
+        private static func isValidIntToken(_ token: String) -> Bool {
+            guard !token.isEmpty else {
+                return false
+            }
+            let digits = token.first == "+" || token.first == "-"
+                ? token.dropFirst()
+                : token[...]
+            guard !digits.isEmpty else {
+                return false
+            }
+            return digits.allSatisfy(isASCIIDigit)
+        }
+
+        private static func parseStrictDouble(_ token: String) -> Double? {
+            guard !token.isEmpty else {
+                return nil
+            }
+
+            let unsigned = token.first == "+" || token.first == "-"
+                ? String(token.dropFirst())
+                : token
+            guard !unsigned.isEmpty else {
+                return nil
+            }
+
+            let parts = unsigned.split(separator: ".", omittingEmptySubsequences: false)
+            guard parts.count == 1 || parts.count == 2 else {
+                return nil
+            }
+            guard parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(isASCIIDigit) }) else {
+                return nil
+            }
+
+            return Double(token)
+        }
+
+        private static func isASCIIDigit(_ character: Character) -> Bool {
+            character >= "0" && character <= "9"
+        }
+    }
+
     private final class Streamer: @unchecked Sendable {
         private let worldGenerator: WorldGenerator
         private let generationWorkerCount: Int
@@ -1056,7 +1191,7 @@ final class TerrainRenderer {
 
     private func closeCommandPrompt(window: OpaquePointer?, execute: Bool) {
         if execute {
-            print(commandPromptText)
+            executeCommand(commandPromptText)
         }
         commandPromptActive = false
         commandPromptText = ""
@@ -1077,6 +1212,50 @@ final class TerrainRenderer {
             return
         }
         commandPromptText += sanitized
+    }
+
+    private func executeCommand(_ commandText: String) {
+        let trimmedCommand = commandText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedCommand.isEmpty else {
+            return
+        }
+
+        let commandName: String
+        let arguments: String
+        if let firstWhitespace = trimmedCommand.firstIndex(where: \.isWhitespace) {
+            commandName = String(trimmedCommand[..<firstWhitespace])
+            arguments = String(trimmedCommand[firstWhitespace...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            commandName = trimmedCommand
+            arguments = ""
+        }
+
+        let commandLabel = "/\(commandName)"
+
+        do {
+            switch commandName {
+            case "tp":
+                var parser = CommandArgumentParser(arguments)
+                let currentPosition = SIMD3<Double>(
+                    Double(cameraPosition.x),
+                    Double(cameraPosition.y),
+                    Double(cameraPosition.z)
+                )
+                let targetPosition = try parser.getNextPos(currentPosition: currentPosition)
+                try parser.end()
+                cameraPosition = SIMD3<Float>(
+                    Float(targetPosition.x),
+                    Float(targetPosition.y),
+                    Float(targetPosition.z)
+                )
+            default:
+                print("Unknown command '\(commandLabel)'")
+            }
+        } catch let error as CommandParseError {
+            print("Failed to parse '\(commandLabel)': \(error.description)")
+        } catch {
+            print("Failed to execute '\(commandLabel)': \(error)")
+        }
     }
 
     private func resetMovementKeys() {
@@ -1549,8 +1728,8 @@ final class TerrainRenderer {
     ) {
         let cellSize: Float = 2
         let glyphAdvance: Float = 14
-        let barHeight: Float = 34
-        let textOrigin = SIMD2<Float>(12, viewportHeight - barHeight + 5)
+        let barHeight: Float = 38
+        let textOrigin = SIMD2<Float>(12, viewportHeight - barHeight + 10)
 
         appendHudQuad(
             minX: 0,

@@ -105,8 +105,18 @@ VULKAN_LOADER_PREFIX="$(find_brew_prefix vulkan-loader "${VULKAN_LOADER_PREFIX:-
 MOLTENVK_PREFIX="$(find_brew_prefix molten-vk "${MOLTENVK_PREFIX:-}")"
 HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-$(brew --prefix)}"
 
-VULKAN_LOADER_SOURCE="$VULKAN_LOADER_PREFIX/lib/libvulkan.1.dylib"
-MOLTENVK_SOURCE="$MOLTENVK_PREFIX/lib/libMoltenVK.dylib"
+VULKAN_LOADER_SOURCE="$(
+  find_first_existing \
+    "$VULKAN_LOADER_PREFIX/lib/libvulkan.1.dylib" \
+    "$HOMEBREW_PREFIX/lib/libvulkan.1.dylib" \
+    "$(find "$HOMEBREW_PREFIX/Cellar" \( -path '*/lib/libvulkan.1.dylib' -o -path '*/lib/libvulkan*.dylib' \) 2>/dev/null | head -n 1)"
+)"
+MOLTENVK_SOURCE="$(
+  find_first_existing \
+    "$MOLTENVK_PREFIX/lib/libMoltenVK.dylib" \
+    "$HOMEBREW_PREFIX/lib/libMoltenVK.dylib" \
+    "$(find "$HOMEBREW_PREFIX/Cellar" -path '*/lib/libMoltenVK.dylib' 2>/dev/null | head -n 1)"
+)"
 MOLTENVK_ICD_SOURCE="$(
   find_first_existing \
     "$MOLTENVK_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json" \
@@ -123,6 +133,17 @@ require_file "$MOLTENVK_ICD_SOURCE"
 cp -fL "$VULKAN_LOADER_SOURCE" "$APP_FRAMEWORKS/libvulkan.1.dylib"
 cp -fL "$MOLTENVK_SOURCE" "$APP_FRAMEWORKS/libMoltenVK.dylib"
 cp "$MOLTENVK_ICD_SOURCE" "$APP_VULKAN_DIR/MoltenVK_icd.json"
+
+install_name_tool -id "@rpath/libvulkan.1.dylib" "$APP_FRAMEWORKS/libvulkan.1.dylib"
+install_name_tool -id "@rpath/libMoltenVK.dylib" "$APP_FRAMEWORKS/libMoltenVK.dylib"
+
+if otool -L "$APP_EXECUTABLE" | grep -Fq "$VULKAN_LOADER_SOURCE"; then
+  install_name_tool -change "$VULKAN_LOADER_SOURCE" "@rpath/libvulkan.1.dylib" "$APP_EXECUTABLE"
+fi
+
+if otool -L "$APP_EXECUTABLE" | grep -Fq "$MOLTENVK_SOURCE"; then
+  install_name_tool -change "$MOLTENVK_SOURCE" "@rpath/libMoltenVK.dylib" "$APP_EXECUTABLE"
+fi
 
 python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); data = json.loads(path.read_text()); data["ICD"]["library_path"] = "../../../Frameworks/libMoltenVK.dylib"; path.write_text(json.dumps(data, indent=4) + "\n")' \
   "$APP_VULKAN_DIR/MoltenVK_icd.json"

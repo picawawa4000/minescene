@@ -70,6 +70,17 @@ find_brew_prefix() {
   "$brew_bin" --prefix "$formula"
 }
 
+find_first_existing() {
+  local candidate
+  for candidate in "$@"; do
+    if [[ -e "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 compile_shaders
 
 swift build --configuration release
@@ -92,10 +103,18 @@ cp -R "$ROOT_DIR/Shaders/SPIRV" "$APP_RESOURCES/Shaders/"
 
 VULKAN_LOADER_PREFIX="$(find_brew_prefix vulkan-loader "${VULKAN_LOADER_PREFIX:-}")"
 MOLTENVK_PREFIX="$(find_brew_prefix molten-vk "${MOLTENVK_PREFIX:-}")"
+HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-$(brew --prefix)}"
 
 VULKAN_LOADER_SOURCE="$VULKAN_LOADER_PREFIX/lib/libvulkan.1.dylib"
 MOLTENVK_SOURCE="$MOLTENVK_PREFIX/lib/libMoltenVK.dylib"
-MOLTENVK_ICD_SOURCE="$MOLTENVK_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json"
+MOLTENVK_ICD_SOURCE="$(
+  find_first_existing \
+    "$MOLTENVK_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json" \
+    "$MOLTENVK_PREFIX/etc/vulkan/icd.d/MoltenVK_icd.json" \
+    "$HOMEBREW_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json" \
+    "$HOMEBREW_PREFIX/etc/vulkan/icd.d/MoltenVK_icd.json" \
+    "$(find "$HOMEBREW_PREFIX/Cellar" -path '*/vulkan/icd.d/MoltenVK_icd.json' 2>/dev/null | head -n 1)"
+)"
 
 require_file "$VULKAN_LOADER_SOURCE"
 require_file "$MOLTENVK_SOURCE"

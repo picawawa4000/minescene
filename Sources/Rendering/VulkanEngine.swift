@@ -1,7 +1,9 @@
 import Foundation
-import simd
 import VulkanBindings
 import Vulkan
+#if canImport(simd)
+import simd
+#endif
 
 final class VulkanEngine {
     private final class Resources {

@@ -1,6 +1,8 @@
 import Foundation
 import DPReader
+#if canImport(simd)
 import simd
+#endif
 
 struct BiomePixelMap {
     let width: Int

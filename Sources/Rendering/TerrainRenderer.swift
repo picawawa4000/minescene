@@ -3,7 +3,9 @@ import DPReader
 import SwiftSDL
 import Vulkan
 import VulkanBindings
+#if canImport(simd)
 import simd
+#endif
 
 final class TerrainRenderer {
     struct MeshProfile {

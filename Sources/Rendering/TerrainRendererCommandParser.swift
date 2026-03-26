@@ -1,6 +1,8 @@
 import Foundation
 import SwiftSDL
+#if canImport(simd)
 import simd
+#endif
 
 enum TerrainRendererCommandParseError: Error, CustomStringConvertible {
     case missingArgument(String)

@@ -1,5 +1,8 @@
+import Foundation
 import SwiftSDL
+#if canImport(simd)
 import simd
+#endif
 
 extension TerrainRenderer {
     var currentCameraPosition: SIMD3<Float> {

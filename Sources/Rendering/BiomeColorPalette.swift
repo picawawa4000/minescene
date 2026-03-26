@@ -1,4 +1,6 @@
+#if canImport(simd)
 import simd
+#endif
 
 struct BiomeColorPalette {
     private let colorsRGBA8: [String: (UInt8, UInt8, UInt8, UInt8)]

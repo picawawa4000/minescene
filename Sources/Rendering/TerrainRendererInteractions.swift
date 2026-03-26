@@ -17,7 +17,7 @@ extension TerrainRenderer {
             if event.key.repeat {
                 return
             }
-            if event.key.scancode == SDL_SCANCODE_SLASH {
+            if keyMatches(event.key.key, action: .openCommandPrompt) {
                 openCommandPrompt(window: window)
                 return
             }
@@ -35,33 +35,37 @@ extension TerrainRenderer {
     }
 
     func setKeyState(key: SDL_Keycode, pressed: Bool) {
-        switch key {
-        case SDLK_W:
+        if keyMatches(key, action: .moveForward) {
             keyW = pressed
-        case SDLK_A:
+        }
+        if keyMatches(key, action: .moveLeft) {
             keyA = pressed
-        case SDLK_S:
+        }
+        if keyMatches(key, action: .moveBackward) {
             keyS = pressed
-        case SDLK_D:
+        }
+        if keyMatches(key, action: .moveRight) {
             keyD = pressed
-        case SDLK_SPACE:
+        }
+        if keyMatches(key, action: .moveUp) {
             keySpace = pressed
-        case SDLK_LSHIFT, SDLK_RSHIFT:
+        }
+        if keyMatches(key, action: .moveDown) {
             keyShift = pressed
-        case SDLK_R:
+        }
+        if keyMatches(key, action: .fastMove) {
             keyR = pressed
-        case SDLK_X:
+        }
+        if keyMatches(key, action: .zoom) {
             keyX = pressed
-        case SDLK_LEFTBRACKET:
-            if pressed {
-                streamer.adjustRenderRadius(by: -1)
-            }
-        case SDLK_RIGHTBRACKET:
-            if pressed {
-                streamer.adjustRenderRadius(by: 1)
-            }
-        default:
-            break
+        }
+        if pressed, keyMatches(key, action: .decreaseRenderDistance) {
+            let renderRadius = streamer.adjustRenderRadius(by: -1)
+            renderDistanceDidChange?(renderRadius)
+        }
+        if pressed, keyMatches(key, action: .increaseRenderDistance) {
+            let renderRadius = streamer.adjustRenderRadius(by: 1)
+            renderDistanceDidChange?(renderRadius)
         }
     }
 
@@ -154,6 +158,10 @@ extension TerrainRenderer {
             return value / divisor
         }
         return -(((-value) + divisor - 1) / divisor)
+    }
+
+    func keyMatches(_ key: SDL_Keycode, action: KeybindAction) -> Bool {
+        key == (keycodeForAction?(action) ?? action.defaultValue.keycode)
     }
 
     func lookAtRH(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {

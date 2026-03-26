@@ -35,6 +35,13 @@ final class MineSceneApp {
         info [name]: list all waypoints, or show one waypoint's details.
         file save|load <file>: use the platform waypoint directory, with .txt implied.
         """
+
+        static let setting = """
+        Usage: /setting <subcommand>
+        get <setting>: print the current value.
+        set <setting> <value>: set a value immediately.
+        help [setting]: list settings, or show one setting's description and default.
+        """
     }
 
     private enum ActiveRenderer {
@@ -104,12 +111,19 @@ final class MineSceneApp {
     private var renderFinishedByImage: [VulkanOwnedSemaphore] = []
     private let biomeColorPalette = BiomeColorPalette.defaultPalette()
     private let overworldSettingsKey = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
+    private let renderDistanceSetting: Setting<IntSettingValue>
+    private let keybindSettings: [KeybindAction: Setting<KeybindSettingValue>]
+    private let settingsByName: [String: any SettingProtocol]
     private var dataPacks: [DataPack] = []
     private var currentWorldSeed: Int64 = 0
     private var waypoints: [String: Waypoint] = [:]
     private var activeRenderer: ActiveRenderer = .terrain
 
     init() throws {
+        let settings = Self.makeSettings()
+        self.renderDistanceSetting = settings.renderDistance
+        self.keybindSettings = settings.keybinds
+        self.settingsByName = settings.byName
         self.sdl = try SDLRuntime()
 
         let windowPtr = "MineScene".withCString { title in
@@ -159,6 +173,7 @@ final class MineSceneApp {
         let dataPackPath = "vanilla/1.21.11"
         let dataPackURL = URL(fileURLWithPath: dataPackPath, isDirectory: true)
         let dataPack = try DataPack(fromRootPath: dataPackURL)
+        Self.loadSettingsFromDisk(settingsByName: settings.byName)
         self.dataPacks = [dataPack]
         self.currentWorldSeed = seed
         let worldGenerator = try makeWorldGenerator(seed: seed)
@@ -199,13 +214,13 @@ final class MineSceneApp {
                     running = false
                 case .keyDown:
                     if !event.key.repeat,
-                       event.key.key == SDLK_M,
+                       keyMatches(event.key.key, action: .toggleBiomeMap),
                        (activeRenderer == .biomeMap || terrainRenderer?.isCommandPromptActive != true) {
                         toggleRendererMode()
                         continue
                     }
                     if !event.key.repeat,
-                       event.key.key == SDLK_ESCAPE,
+                       keyMatches(event.key.key, action: .quitApplication),
                        terrainRenderer?.isCommandPromptActive != true {
                         running = false
                     } else {
@@ -227,6 +242,12 @@ final class MineSceneApp {
 
         if let engine {
             _ = try? engine.device.waitIdle()
+        }
+
+        do {
+            try saveSettingsToDisk()
+        } catch {
+            print("Failed to save settings: \(error)")
         }
 
         terrainRenderer = nil
@@ -283,6 +304,43 @@ final class MineSceneApp {
         }
     }
 
+    private static func makeSettings() -> (
+        renderDistance: Setting<IntSettingValue>,
+        keybinds: [KeybindAction: Setting<KeybindSettingValue>],
+        byName: [String: any SettingProtocol]
+    ) {
+        let renderDistanceSetting = Setting(
+            name: "video.renderDistance",
+            summary: "Terrain render distance in chunks.",
+            defaultValue: IntSettingValue(value: 12),
+            validator: { value in
+                value.value >= 0 ? nil : "must be zero or greater"
+            }
+        )
+
+        var keybindSettings: [KeybindAction: Setting<KeybindSettingValue>] = [:]
+        for action in KeybindAction.allCases {
+            keybindSettings[action] = Setting(
+                name: action.settingName,
+                summary: action.summary,
+                defaultValue: action.defaultValue
+            )
+        }
+
+        var settingsByName: [String: any SettingProtocol] = [
+            renderDistanceSetting.name: renderDistanceSetting
+        ]
+        for setting in keybindSettings.values {
+            settingsByName[setting.name] = setting
+        }
+
+        return (
+            renderDistance: renderDistanceSetting,
+            keybinds: keybindSettings,
+            byName: settingsByName
+        )
+    }
+
     private func makeWorldGenerator(seed: Int64) throws -> WorldGenerator {
         try WorldGenerator(
             withWorldSeed: UInt64(bitPattern: seed),
@@ -294,7 +352,8 @@ final class MineSceneApp {
     private func makeTerrainRenderer(worldGenerator: WorldGenerator) -> TerrainRenderer {
         let renderer = TerrainRenderer(
             worldGenerator: worldGenerator,
-            biomeColorPalette: biomeColorPalette
+            biomeColorPalette: biomeColorPalette,
+            renderRadius: renderDistanceSetting.value.value
         )
         renderer.externalCommandExecutor = { [weak self] commandName, arguments, terrainRenderer in
             guard let self else {
@@ -305,6 +364,12 @@ final class MineSceneApp {
                 arguments: arguments,
                 renderer: terrainRenderer
             )
+        }
+        renderer.keycodeForAction = { [weak self] action in
+            self?.keycode(for: action) ?? action.defaultValue.keycode
+        }
+        renderer.renderDistanceDidChange = { [weak self] renderDistance in
+            self?.updateRenderDistanceSetting(renderDistance)
         }
         return renderer
     }
@@ -323,7 +388,8 @@ final class MineSceneApp {
                     "/help [command]: show command help.",
                     "/tp <pos>: teleport the camera.",
                     "/seed <subcommand>: view or change the world seed.",
-                    "/waypoint <subcommand>: manage saved waypoints."
+                    "/waypoint <subcommand>: manage saved waypoints.",
+                    "/setting <subcommand>: view or change settings."
                 ], renderer: renderer)
             } else {
                 let requestedCommand = normalizedCommandName(try parser.getNextString())
@@ -458,6 +524,40 @@ final class MineSceneApp {
                 throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
             }
             return true
+        case "setting":
+            var parser = TerrainRendererCommandArgumentParser(arguments)
+            let subcommand = try parser.getNextString()
+            switch subcommand {
+            case "set":
+                let settingName = try parser.getNextString()
+                let value = try parser.getNextString()
+                try parser.end()
+                let setting = try setting(named: settingName)
+                try setting.setValue(from: value)
+                applyRuntimeSettingIfNeeded(named: settingName)
+                renderer.logCommandMessage("Set setting \(settingName) to \(setting.currentValueDescription).")
+            case "get":
+                let settingName = try parser.getNextString()
+                try parser.end()
+                let setting = try setting(named: settingName)
+                renderer.logCommandMessage("\(settingName) = \(setting.currentValueDescription)")
+            case "help":
+                if parser.remainingCount == 0 {
+                    try parser.end()
+                    let names = settingsByName.keys.sorted().joined(separator: ", ")
+                    renderer.logCommandMessage("Available settings: \(names)")
+                } else {
+                    let settingName = try parser.getNextString()
+                    try parser.end()
+                    let setting = try setting(named: settingName)
+                    renderer.logCommandMessage(
+                        "\(setting.name): \(setting.summary) Default: \(setting.defaultValueDescription)."
+                    )
+                }
+            default:
+                throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
+            }
+            return true
         default:
             return false
         }
@@ -542,6 +642,8 @@ final class MineSceneApp {
             return CommandHelp.seed.split(separator: "\n").map(String.init)
         case "waypoint":
             return CommandHelp.waypoint.split(separator: "\n").map(String.init)
+        case "setting":
+            return CommandHelp.setting.split(separator: "\n").map(String.init)
         default:
             throw CommandError.unknownCommand(command)
         }
@@ -553,13 +655,38 @@ final class MineSceneApp {
         }
     }
 
+    private func keycode(for action: KeybindAction) -> SDL_Keycode {
+        keybindSettings[action]?.value.keycode ?? action.defaultValue.keycode
+    }
+
+    private func keyMatches(_ key: SDL_Keycode, action: KeybindAction) -> Bool {
+        key == keycode(for: action)
+    }
+
+    private func setting(named name: String) throws -> any SettingProtocol {
+        guard let setting = settingsByName[name] else {
+            throw SettingError.unknownSetting(name)
+        }
+        return setting
+    }
+
+    private func applyRuntimeSettingIfNeeded(named name: String) {
+        if name == renderDistanceSetting.name {
+            terrainRenderer?.setRenderRadius(renderDistanceSetting.value.value)
+        }
+    }
+
+    private func updateRenderDistanceSetting(_ renderDistance: Int) {
+        try? renderDistanceSetting.setValue(from: String(renderDistance))
+    }
+
     private func sortedWaypoints() -> [(name: String, waypoint: Waypoint)] {
         waypoints
             .map { (name: $0.key, waypoint: $0.value) }
             .sorted { $0.name < $1.name }
     }
 
-    private func waypointFilesDirectoryURL() -> URL {
+    private static func appDataDirectoryURL() -> URL {
 #if os(Linux)
         let baseDirectory: URL
         if let xdgDataHome = ProcessInfo.processInfo.environment["XDG_DATA_HOME"],
@@ -572,12 +699,65 @@ final class MineSceneApp {
         }
         return baseDirectory
             .appendingPathComponent("minescene", isDirectory: true)
-            .appendingPathComponent("waypoints", isDirectory: true)
 #else
-        FileManager.default.homeDirectoryForCurrentUser
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Documents", isDirectory: true)
-            .appendingPathComponent("minescene-waypoints", isDirectory: true)
+            .appendingPathComponent("minescene", isDirectory: true)
 #endif
+    }
+
+    private static func appDataDirectoryDisplayName() -> String {
+#if os(Linux)
+        if let xdgDataHome = ProcessInfo.processInfo.environment["XDG_DATA_HOME"],
+           !xdgDataHome.isEmpty {
+            return "\(xdgDataHome)/minescene"
+        }
+        return "~/.local/share/minescene"
+#else
+        return "~/Documents/minescene"
+#endif
+    }
+
+    private static func settingsFileURL() -> URL {
+        appDataDirectoryURL().appendingPathComponent("settings.json", isDirectory: false)
+    }
+
+    private static func loadSettingsFromDisk(settingsByName: [String: any SettingProtocol]) {
+        let fileURL = settingsFileURL()
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return
+        }
+
+        do {
+            let data = try Data(contentsOf: fileURL)
+            let storedSettings = try JSONDecoder().decode([String: String].self, from: data)
+            for (name, value) in storedSettings {
+                guard let setting = settingsByName[name] else {
+                    continue
+                }
+                do {
+                    try setting.loadPersistedValue(from: value)
+                } catch {
+                    print("Failed to load setting \(name): \(error)")
+                }
+            }
+        } catch {
+            print("Failed to load settings from \(fileURL.path): \(error)")
+        }
+    }
+
+    private func saveSettingsToDisk() throws {
+        let directoryURL = Self.appDataDirectoryURL()
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let storedSettings = Dictionary(uniqueKeysWithValues: settingsByName.map { name, setting in
+            (name, setting.persistedValueString())
+        })
+        let data = try JSONEncoder().encode(storedSettings)
+        try data.write(to: Self.settingsFileURL(), options: .atomic)
+    }
+
+    private func waypointFilesDirectoryURL() -> URL {
+        Self.appDataDirectoryURL().appendingPathComponent("waypoints", isDirectory: true)
     }
 
     private func waypointFileURL(for localPath: String) throws -> URL {
@@ -597,18 +777,7 @@ final class MineSceneApp {
         } else {
             normalizedPath = "\(localPath).txt"
         }
-#if os(Linux)
-        let directoryDisplayName: String
-        if let xdgDataHome = ProcessInfo.processInfo.environment["XDG_DATA_HOME"],
-           !xdgDataHome.isEmpty {
-            directoryDisplayName = "\(xdgDataHome)/minescene/waypoints"
-        } else {
-            directoryDisplayName = "~/.local/share/minescene/waypoints"
-        }
-        return "\(directoryDisplayName)/\(normalizedPath)"
-#else
-        return "~/Documents/minescene-waypoints/\(normalizedPath)"
-#endif
+        return "\(Self.appDataDirectoryDisplayName())/waypoints/\(normalizedPath)"
     }
 
     private func saveWaypoints(to fileURL: URL, displayName: String) throws {

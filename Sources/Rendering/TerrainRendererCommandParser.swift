@@ -252,7 +252,6 @@ extension TerrainRenderer {
     func appendCommandPromptText(_ text: String) {
         let sanitized = String(
             text
-                .lowercased()
                 .unicodeScalars
                 .filter { !CharacterSet.controlCharacters.contains($0) && $0.value != 0x7F }
         )

@@ -152,18 +152,25 @@ final class TerrainRenderer {
             self.orderedOffsets = Self.makeOrderedOffsets(radius: self.renderRadius)
         }
 
-        func adjustRenderRadius(by delta: Int) {
+        func adjustRenderRadius(by delta: Int) -> Int {
+            setRenderRadius(to: renderRadius + delta)
+        }
+
+        func setRenderRadius(to requestedRadius: Int) -> Int {
             var generationWorkersToStart = 0
             var meshWorkersToStart = 0
+            var currentRenderRadius = 0
 
             lock.lock()
-            let nextRadius = max(0, renderRadius + delta)
+            let nextRadius = max(0, requestedRadius)
             guard nextRadius != renderRadius else {
+                currentRenderRadius = renderRadius
                 lock.unlock()
-                return
+                return currentRenderRadius
             }
 
             renderRadius = nextRadius
+            currentRenderRadius = renderRadius
             orderedOffsets = Self.makeOrderedOffsets(radius: renderRadius)
 
             if let center = targetCenter {
@@ -190,6 +197,14 @@ final class TerrainRenderer {
                     meshWorkerLoop()
                 }
             }
+            return currentRenderRadius
+        }
+
+        func currentRenderRadius() -> Int {
+            lock.lock()
+            let currentRenderRadius = renderRadius
+            lock.unlock()
+            return currentRenderRadius
         }
 
         func updateTarget(center: ChunkCoord, cameraBlock: SIMD3<Int>) {
@@ -931,6 +946,8 @@ final class TerrainRenderer {
     let commandLogErrorColor = SIMD4<Float>(0.92, 0.28, 0.24, 1.0)
 
     var externalCommandExecutor: ((String, String, TerrainRenderer) throws -> Bool)?
+    var keycodeForAction: ((KeybindAction) -> SDL_Keycode)?
+    var renderDistanceDidChange: ((Int) -> Void)?
     var chunkMeshes: [ChunkCoord: ChunkRenderMesh] = [:]
     var hudBuffer: VulkanOwnedBuffer?
     var hudMemory: VulkanOwnedDeviceMemory?
@@ -1148,6 +1165,14 @@ final class TerrainRenderer {
 
     func requestChunkMeshRebuild() {
         streamer.requestMeshRebuild()
+    }
+
+    func setRenderRadius(_ renderRadius: Int) {
+        _ = streamer.setRenderRadius(to: renderRadius)
+    }
+
+    func currentRenderRadius() -> Int {
+        streamer.currentRenderRadius()
     }
 }
 

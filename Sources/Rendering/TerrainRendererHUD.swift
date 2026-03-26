@@ -239,18 +239,23 @@ extension TerrainRenderer {
         let cellSize: Float = 2
         let glyphAdvance: Float = 14
         let promptBarHeight: Float = 38
-        let logBarHeight: Float = 28
+        let logLineHeight: Float = 18
+        let logVerticalPadding: Float = 10
         let logSpacing: Float = 4
         let visibleEntries = commandLogEntries.suffix(5).reversed()
+        let maxColumns = max(1, Int(floor((viewportWidth - 24) / glyphAdvance)))
+        var nextLineBottom = viewportHeight - promptBarHeight
 
-        for (offset, entry) in visibleEntries.enumerated() {
+        for entry in visibleEntries {
             let fadeProgress = max(0, entry.age - commandLogHoldDuration) / commandLogFadeDuration
             let fade = max(0, 1 - fadeProgress)
             guard fade > 0 else {
                 continue
             }
 
-            let lineBottom = viewportHeight - promptBarHeight - Float(offset) * (logBarHeight + logSpacing)
+            let wrappedLines = wrapCommandLogText(entry.message, maxColumns: maxColumns)
+            let logBarHeight = logVerticalPadding + Float(wrappedLines.count) * logLineHeight
+            let lineBottom = nextLineBottom
             let lineTop = lineBottom - logBarHeight
             let backgroundColor = SIMD4<Float>(
                 commandLogBackgroundColor.x,
@@ -274,15 +279,75 @@ extension TerrainRenderer {
                 color: backgroundColor,
                 into: &vertices
             )
-            appendPromptFontText(
-                entry.message,
-                origin: SIMD2<Float>(12, lineTop + 6),
-                cellSize: cellSize,
-                glyphAdvance: glyphAdvance,
-                color: textColor,
-                into: &vertices
-            )
+            for (lineIndex, line) in wrappedLines.enumerated() {
+                appendPromptFontText(
+                    line,
+                    origin: SIMD2<Float>(12, lineTop + 6 + Float(lineIndex) * logLineHeight),
+                    cellSize: cellSize,
+                    glyphAdvance: glyphAdvance,
+                    color: textColor,
+                    into: &vertices
+                )
+            }
+            nextLineBottom = lineTop - logSpacing
         }
+    }
+
+    private func wrapCommandLogText(_ text: String, maxColumns: Int) -> [String] {
+        guard maxColumns > 0 else {
+            return [text]
+        }
+
+        var lines: [String] = []
+        for paragraph in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let paragraphText = String(paragraph)
+            if paragraphText.isEmpty {
+                lines.append("")
+                continue
+            }
+
+            var currentLine = ""
+            for word in paragraphText.split(separator: " ", omittingEmptySubsequences: true).map(String.init) {
+                if currentLine.isEmpty {
+                    if word.count <= maxColumns {
+                        currentLine = word
+                    } else {
+                        lines.append(contentsOf: wrapLongCommandWord(word, maxColumns: maxColumns))
+                    }
+                    continue
+                }
+
+                let candidate = "\(currentLine) \(word)"
+                if candidate.count <= maxColumns {
+                    currentLine = candidate
+                } else {
+                    lines.append(currentLine)
+                    if word.count <= maxColumns {
+                        currentLine = word
+                    } else {
+                        lines.append(contentsOf: wrapLongCommandWord(word, maxColumns: maxColumns))
+                        currentLine = ""
+                    }
+                }
+            }
+
+            if !currentLine.isEmpty {
+                lines.append(currentLine)
+            }
+        }
+
+        return lines.isEmpty ? [""] : lines
+    }
+
+    private func wrapLongCommandWord(_ word: String, maxColumns: Int) -> [String] {
+        var lines: [String] = []
+        var startIndex = word.startIndex
+        while startIndex < word.endIndex {
+            let endIndex = word.index(startIndex, offsetBy: maxColumns, limitedBy: word.endIndex) ?? word.endIndex
+            lines.append(String(word[startIndex..<endIndex]))
+            startIndex = endIndex
+        }
+        return lines
     }
 
     private func appendCommandPrompt(

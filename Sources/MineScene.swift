@@ -89,6 +89,17 @@ final class MineSceneApp {
         }
     }
 
+    private enum ResourceLookupError: Error, CustomStringConvertible {
+        case missing(String)
+
+        var description: String {
+            switch self {
+            case .missing(let relativePath):
+                return "missing required resource '\(relativePath)'"
+            }
+        }
+    }
+
     private final class SDLRuntime {
         init() throws {
             try SDL_Init(.video)
@@ -170,8 +181,7 @@ final class MineSceneApp {
         self.surface = surface
 
         let seed: Int64 = 8608000014473684604
-        let dataPackPath = "vanilla/1.21.11"
-        let dataPackURL = URL(fileURLWithPath: dataPackPath, isDirectory: true)
+        let dataPackURL = try Self.resourceURL(relativePath: "vanilla/1.21.11", isDirectory: true)
         let dataPack = try DataPack(fromRootPath: dataPackURL)
         Self.loadSettingsFromDisk(settingsByName: settings.byName)
         self.dataPacks = [dataPack]
@@ -182,10 +192,10 @@ final class MineSceneApp {
         let engine = try VulkanEngine(
             instance: instance,
             surface: surface,
-            vertSpirvPath: "Shaders/SPIRV/colour2D.vert.spv",
-            fragSpirvPath: "Shaders/SPIRV/colour2D.frag.spv",
-            vertSpirv3DPath: "Shaders/SPIRV/colour3D.vert.spv",
-            fragSpirv3DPath: "Shaders/SPIRV/colour3D.frag.spv",
+            vertSpirvPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour2D.vert.spv").path,
+            fragSpirvPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour2D.frag.spv").path,
+            vertSpirv3DPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour3D.vert.spv").path,
+            fragSpirv3DPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour3D.frag.spv").path,
             desiredExtent: .init(width: 1200, height: 840)
         )
         self.engine = engine
@@ -200,6 +210,37 @@ final class MineSceneApp {
     static func main() throws {
         let app = try MineSceneApp()
         try app.run()
+    }
+
+    private static func resourceURL(relativePath: String, isDirectory: Bool = false) throws -> URL {
+        let fileManager = FileManager.default
+        let candidateBaseURLs = [
+            URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true),
+            URL(fileURLWithPath: CommandLine.arguments[0], isDirectory: false)
+                .resolvingSymlinksInPath()
+                .deletingLastPathComponent(),
+            URL(fileURLWithPath: CommandLine.arguments[0], isDirectory: false)
+                .resolvingSymlinksInPath()
+                .deletingLastPathComponent()
+                .appendingPathComponent("../Resources", isDirectory: true)
+                .standardizedFileURL
+        ]
+
+        for baseURL in candidateBaseURLs {
+            let candidateURL = baseURL.appendingPathComponent(relativePath, isDirectory: isDirectory)
+            if fileManager.fileExists(atPath: candidateURL.path) {
+                return candidateURL
+            }
+        }
+
+        if let bundleResourceURL = Bundle.main.resourceURL {
+            let candidateURL = bundleResourceURL.appendingPathComponent(relativePath, isDirectory: isDirectory)
+            if fileManager.fileExists(atPath: candidateURL.path) {
+                return candidateURL
+            }
+        }
+
+        throw ResourceLookupError.missing(relativePath)
     }
 
     private func run() throws {

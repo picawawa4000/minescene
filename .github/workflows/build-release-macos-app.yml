@@ -1,0 +1,40 @@
+name: Build macOS App on Release
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-app:
+    runs-on: macos-15
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+      RELEASE_VERSION: ${{ github.event.release.tag_name || github.ref_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install macOS runtime dependencies
+        run: brew install glslang molten-vk vulkan-loader
+
+      - name: Build bundled app
+        run: ./.github/scripts/build-release-app.sh
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MineScene-macos-${{ env.RELEASE_VERSION }}
+          path: dist/MineScene-macos-${{ env.RELEASE_VERSION }}.zip
+          if-no-files-found: error
+
+      - name: Attach asset to GitHub release
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "dist/MineScene-macos-${{ env.RELEASE_VERSION }}.zip" --clobber

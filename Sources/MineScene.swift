@@ -131,6 +131,11 @@ final class MineSceneApp {
     private var currentWorldSeed: Int64 = 0
     private var waypoints: [String: Waypoint] = [:]
     private var activeRenderer: ActiveRenderer = .terrain
+    private var hasShutdown = false
+
+    deinit {
+        shutdown()
+    }
 
     init() throws {
         let environment = ProcessInfo.processInfo.environment
@@ -160,7 +165,7 @@ final class MineSceneApp {
             throw SDL_Error.error
         }
         self.window = SDLObject<OpaquePointer>(windowPtr, tag: .custom("window"), destroy: { SDL_DestroyWindow($0) })
-        if !SDL_SetWindowRelativeMouseMode(windowPtr, !debugBlockstatesEnabled) {
+        if !SDL_SetWindowRelativeMouseMode(windowPtr, true) {
             throw SDL_Error.error
         }
 
@@ -308,6 +313,15 @@ final class MineSceneApp {
         var previousTickNs = DispatchTime.now().uptimeNanoseconds
         let appWindowID = try window?.id.get()
 
+        defer {
+            do {
+                try saveSettingsToDisk()
+            } catch {
+                print("Failed to save settings: \(error)")
+            }
+            shutdown()
+        }
+
         discardPendingStartupEvents()
 
         while running {
@@ -346,28 +360,6 @@ final class MineSceneApp {
             try renderFrame()
             SDL_Delay(16)
         }
-
-        if let engine {
-            _ = try? engine.device.waitIdle()
-        }
-
-        do {
-            try saveSettingsToDisk()
-        } catch {
-            print("Failed to save settings: \(error)")
-        }
-
-        terrainRenderer = nil
-        biomeMapRenderer = nil
-        debugBlockStateRenderer = nil
-        imageAvailable = nil
-        renderFinishedByImage.removeAll()
-        engine?.shutdown()
-        engine = nil
-        worldGenerator = nil
-        surface = nil
-        instance = nil
-        window = nil
     }
 
     private func discardPendingStartupEvents() {
@@ -509,9 +501,25 @@ final class MineSceneApp {
     private func makeDebugBlockStateRenderer() throws -> DebugBlockStateRenderer {
         let environment = ProcessInfo.processInfo.environment
         let requestedVersion = environment["MINESCENE_VANILLA_ASSETS_VERSION"]
+        let requestedPath = environment["MINESCENE_VANILLA_ASSETS_PATH"].flatMap { path -> URL? in
+            guard !path.isEmpty else {
+                return nil
+            }
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
         let limit = environment["MINESCENE_DEBUG_BLOCKSTATE_LIMIT"].flatMap(Int.init)
-        let repository = try VanillaAssetRepository.locate(version: requestedVersion)
-        return DebugBlockStateRenderer(repository: repository, limit: limit)
+        let repository: VanillaAssetRepository
+        if let requestedPath {
+            repository = try VanillaAssetRepository(rootURL: requestedPath.resolvingSymlinksInPath())
+                .validated()
+        } else {
+            repository = try VanillaAssetRepository.locate(version: requestedVersion)
+        }
+        let renderer = DebugBlockStateRenderer(repository: repository, limit: limit)
+        renderer.keycodeForAction = { [weak self] action in
+            self?.keycode(for: action) ?? action.defaultValue.keycode
+        }
+        return renderer
     }
 
     private func handleTerrainCommand(
@@ -1050,6 +1058,29 @@ final class MineSceneApp {
             return
         }
         _ = SDL_SetWindowRelativeMouseMode(window, enabled)
+    }
+
+    private func shutdown() {
+        guard !hasShutdown else {
+            return
+        }
+        hasShutdown = true
+
+        if let engine {
+            _ = try? engine.device.waitIdle()
+        }
+
+        terrainRenderer = nil
+        biomeMapRenderer = nil
+        debugBlockStateRenderer = nil
+        imageAvailable = nil
+        renderFinishedByImage.removeAll()
+        engine?.shutdown()
+        engine = nil
+        worldGenerator = nil
+        surface = nil
+        instance = nil
+        window = nil
     }
 
     private static func getSdlVulkanInstanceExtensions() throws -> [String] {

@@ -52,5 +52,9 @@ VSOutput mainVS(VSInput input) {
 
 [shader("fragment")]
 float4 mainPS(VSOutput input) : SV_Target0 {
-    return uTexture.Sample(uSampler, input.textureCoordinates) * input.color;
+    float4 sampled = uTexture.Sample(uSampler, input.textureCoordinates) * input.color;
+    if (sampled.a <= 0.001) {
+        discard;
+    }
+    return sampled;
 }

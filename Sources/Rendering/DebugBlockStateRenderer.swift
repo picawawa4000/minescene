@@ -22,6 +22,11 @@ final class DebugBlockStateRenderer {
         self.limit = limit
     }
 
+    var keycodeForAction: ((KeybindAction) -> SDL_Keycode)? {
+        get { structureRenderer.keycodeForAction }
+        set { structureRenderer.keycodeForAction = newValue }
+    }
+
     func prepare(engine: VulkanEngine) throws {
         guard !prepared else {
             return
@@ -31,8 +36,19 @@ final class DebugBlockStateRenderer {
         var quads: [StructureRenderer.TexturedQuad] = []
         quads.reserveCapacity(blockstates.count * 12)
 
+        let columnCount = max(1, Int(ceil(sqrt(Double(max(1, blockstates.count))))))
+        let rowCount = max(1, Int(ceil(Double(blockstates.count) / Double(columnCount))))
+        let totalWidth = Float(max(0, columnCount - 1)) * blockSpacing
+        let totalDepth = Float(max(0, rowCount - 1)) * blockSpacing
+
         for (index, state) in blockstates.enumerated() {
-            let offset = SIMD3<Float>(Float(index) * blockSpacing, 0, 0)
+            let column = index % columnCount
+            let row = index / columnCount
+            let offset = SIMD3<Float>(
+                Float(column) * blockSpacing - totalWidth * 0.5,
+                0,
+                Float(row) * blockSpacing - totalDepth * 0.5
+            )
             quads.append(contentsOf: modelLoader.texturedQuads(for: state, worldOffset: offset))
         }
 

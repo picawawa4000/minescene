@@ -99,10 +99,16 @@ final class VanillaBlockModelLoader {
         let elements: [Element]?
     }
 
+    private struct ModelResolutionContext {
+        let ambientOcclusion: Bool
+        let textures: [String: String]
+        let rawElements: [RawModelFile.Element]
+    }
+
     private let repository: VanillaAssetRepository
     private var rawModelCache: [VanillaAssetRepository.AssetIdentifier: RawModelFile] = [:]
     private var resolvedModelCache: [VanillaAssetRepository.AssetIdentifier: VanillaResolvedBlockModel] = [:]
-    private var resolvedTextureMapCache: [VanillaAssetRepository.AssetIdentifier: [String: String]] = [:]
+    private var loggedFallbackModels: Set<VanillaAssetRepository.AssetIdentifier> = []
 
     init(repository: VanillaAssetRepository) {
         self.repository = repository
@@ -142,6 +148,11 @@ final class VanillaBlockModelLoader {
     ) -> [StructureRenderer.TexturedQuad] {
         var quads: [StructureRenderer.TexturedQuad] = []
         for placement in state.placements {
+            if placement.model.elements.isEmpty {
+                logPlaceholderFallbackIfNeeded(for: placement.model.identifier)
+                quads.append(contentsOf: placeholderQuads(for: placement, worldOffset: worldOffset))
+                continue
+            }
             for element in placement.model.elements {
                 for direction in VanillaBlockFaceDirection.allCases {
                     guard let face = element.faces[direction] else {
@@ -164,7 +175,12 @@ final class VanillaBlockModelLoader {
                             corners: finalCorners,
                             textureName: face.textureName,
                             tint: shadedTint(for: direction, shade: element.shade),
-                            textureCoordinates: textureCoordinates(for: face)
+                            textureCoordinates: textureCoordinates(
+                                for: face,
+                                from: element.from,
+                                to: element.to,
+                                corners: baseCorners
+                            )
                         )
                     )
                 }
@@ -195,22 +211,16 @@ final class VanillaBlockModelLoader {
         }
 
         if let multipartArray = root["multipart"] as? [Any] {
-            var applyValues: [Any] = []
-            for entry in multipartArray {
-                guard let dict = entry as? [String: Any] else {
-                    continue
+            let multipartEntries = multipartArray.compactMap { $0 as? [String: Any] }
+            let representativeValues = chooseRepresentativeMultipartValues(from: multipartEntries)
+            let applyValues = multipartEntries.compactMap { entry -> Any? in
+                guard let apply = entry["apply"] else {
+                    return nil
                 }
-                if dict["when"] == nil, let apply = dict["apply"] {
-                    applyValues.append(apply)
+                guard let when = entry["when"] else {
+                    return apply
                 }
-            }
-            if applyValues.isEmpty {
-                for entry in multipartArray {
-                    guard let dict = entry as? [String: Any], let apply = dict["apply"] else {
-                        continue
-                    }
-                    applyValues.append(apply)
-                }
+                return multipartConditionMatches(when, values: representativeValues) ? apply : nil
             }
             let placements = try applyValues.flatMap { try decodePlacements(fromVariantValue: $0) }
             guard !placements.isEmpty else {
@@ -271,36 +281,48 @@ final class VanillaBlockModelLoader {
         identifier: VanillaAssetRepository.AssetIdentifier,
         visited: Set<VanillaAssetRepository.AssetIdentifier>
     ) throws -> VanillaResolvedBlockModel {
-        if visited.contains(identifier) {
-            throw Error.malformedModel(try repository.modelURL(for: identifier), "cyclic parent chain")
-        }
-        let raw = try loadRawModel(identifier: identifier)
-
-        let parentModel: VanillaResolvedBlockModel?
-        let mergedTextures: [String: String]
-        if let parentName = raw.parent {
-            if parentName.hasPrefix("builtin/") {
-                throw Error.unsupportedParent(parentName)
-            }
-            let parentIdentifier = parseIdentifier(parentName)
-            parentModel = try resolveModel(identifier: parentIdentifier, visited: visited.union([identifier]))
-            let parentTextures = try resolveTextureMap(identifier: parentIdentifier, visited: visited.union([identifier]))
-            mergedTextures = parentTextures.merging(raw.textures ?? [:]) { _, child in child }
-        } else {
-            parentModel = nil
-            mergedTextures = raw.textures ?? [:]
-        }
-
-        let elements = if let rawElements = raw.elements {
-            try rawElements.map { try resolveElement($0, textures: mergedTextures, modelIdentifier: identifier) }
-        } else {
-            parentModel?.elements ?? []
+        let context = try resolveModelContext(identifier: identifier, visited: visited)
+        let elements = try context.rawElements.map {
+            try resolveElement($0, textures: context.textures, modelIdentifier: identifier)
         }
 
         return VanillaResolvedBlockModel(
             identifier: identifier,
-            ambientOcclusion: raw.ambientocclusion ?? parentModel?.ambientOcclusion ?? true,
+            ambientOcclusion: context.ambientOcclusion,
             elements: elements
+        )
+    }
+
+    private func resolveModelContext(
+        identifier: VanillaAssetRepository.AssetIdentifier,
+        visited: Set<VanillaAssetRepository.AssetIdentifier>
+    ) throws -> ModelResolutionContext {
+        if visited.contains(identifier) {
+            throw Error.malformedModel(try repository.modelURL(for: identifier), "cyclic parent chain")
+        }
+
+        let raw = try loadRawModel(identifier: identifier)
+        if let parentName = raw.parent {
+            if parentName.hasPrefix("builtin/") {
+                throw Error.unsupportedParent(parentName)
+            }
+
+            let parentIdentifier = parseIdentifier(parentName)
+            let parentContext = try resolveModelContext(
+                identifier: parentIdentifier,
+                visited: visited.union([identifier])
+            )
+            return ModelResolutionContext(
+                ambientOcclusion: raw.ambientocclusion ?? parentContext.ambientOcclusion,
+                textures: parentContext.textures.merging(raw.textures ?? [:]) { _, child in child },
+                rawElements: raw.elements ?? parentContext.rawElements
+            )
+        }
+
+        return ModelResolutionContext(
+            ambientOcclusion: raw.ambientocclusion ?? true,
+            textures: raw.textures ?? [:],
+            rawElements: raw.elements ?? []
         )
     }
 
@@ -372,18 +394,28 @@ final class VanillaBlockModelLoader {
     ) throws -> String {
         var resolved = reference
         var remainingExpansions = 16
-        while resolved.hasPrefix("#") {
+        while resolved.hasPrefix("#") || shouldExpandBareTextureAlias(resolved, textures: textures) {
             guard remainingExpansions > 0 else {
                 break
             }
             remainingExpansions -= 1
-            let key = String(resolved.dropFirst())
+            let key = resolved.hasPrefix("#") ? String(resolved.dropFirst()) : resolved
             guard let next = textures[key] else {
                 throw Error.missingTextureVariable(key, model: "\(modelIdentifier.namespace):\(modelIdentifier.path)")
             }
             resolved = next
         }
         return resolved
+    }
+
+    private func shouldExpandBareTextureAlias(_ value: String, textures: [String: String]) -> Bool {
+        guard !value.hasPrefix("#"),
+              !value.contains("/"),
+              !value.contains(":"),
+              textures[value] != nil else {
+            return false
+        }
+        return true
     }
 
     private func loadRawModel(identifier: VanillaAssetRepository.AssetIdentifier) throws -> RawModelFile {
@@ -396,27 +428,6 @@ final class VanillaBlockModelLoader {
         let rawModel = try JSONDecoder().decode(RawModelFile.self, from: data)
         rawModelCache[identifier] = rawModel
         return rawModel
-    }
-
-    private func resolveTextureMap(
-        identifier: VanillaAssetRepository.AssetIdentifier,
-        visited: Set<VanillaAssetRepository.AssetIdentifier>
-    ) throws -> [String: String] {
-        if let cached = resolvedTextureMapCache[identifier] {
-            return cached
-        }
-
-        let raw = try loadRawModel(identifier: identifier)
-        let mergedTextures: [String: String]
-        if let parentName = raw.parent, !parentName.hasPrefix("builtin/") {
-            let parentIdentifier = parseIdentifier(parentName)
-            let parentTextures = try resolveTextureMap(identifier: parentIdentifier, visited: visited.union([identifier]))
-            mergedTextures = parentTextures.merging(raw.textures ?? [:]) { _, child in child }
-        } else {
-            mergedTextures = raw.textures ?? [:]
-        }
-        resolvedTextureMapCache[identifier] = mergedTextures
-        return mergedTextures
     }
 
     private func parseIdentifier(_ reference: String) -> VanillaAssetRepository.AssetIdentifier {
@@ -568,29 +579,196 @@ final class VanillaBlockModelLoader {
         return rotated + origin
     }
 
-    private func textureCoordinates(for face: VanillaResolvedBlockModel.Face) -> [SIMD2<Float>] {
+    private func textureCoordinates(
+        for face: VanillaResolvedBlockModel.Face,
+        from: SIMD3<Float>,
+        to: SIMD3<Float>,
+        corners: [SIMD3<Float>]
+    ) -> [SIMD2<Float>] {
         let minU = face.uv.x / 16
         let minV = face.uv.y / 16
         let maxU = face.uv.z / 16
         let maxV = face.uv.w / 16
-        var coordinates = [
-            SIMD2<Float>(minU, minV),
-            SIMD2<Float>(maxU, minV),
-            SIMD2<Float>(maxU, maxV),
-            SIMD2<Float>(minU, maxV)
-        ]
+        return corners.map { corner in
+            let localUV = rotatedFaceUV(
+                localFaceUV(for: face.direction, corner: corner, from: from, to: to),
+                degrees: face.rotation
+            )
+            return SIMD2<Float>(
+                minU + (maxU - minU) * localUV.x,
+                minV + (maxV - minV) * localUV.y
+            )
+        }
+    }
 
-        let rotationSteps = ((face.rotation % 360) + 360) % 360 / 90
-        if rotationSteps > 0 {
-            for _ in 0..<rotationSteps {
-                coordinates = [
-                    coordinates[3],
-                    coordinates[0],
-                    coordinates[1],
-                    coordinates[2]
-                ]
+    private func localFaceUV(
+        for direction: VanillaBlockFaceDirection,
+        corner: SIMD3<Float>,
+        from: SIMD3<Float>,
+        to: SIMD3<Float>
+    ) -> SIMD2<Float> {
+        let size = max(to - from, SIMD3<Float>(repeating: 0.0001))
+
+        switch direction {
+        case .down:
+            return SIMD2<Float>(
+                (corner.x - from.x) / size.x,
+                (to.z - corner.z) / size.z
+            )
+        case .up:
+            return SIMD2<Float>(
+                (corner.x - from.x) / size.x,
+                (corner.z - from.z) / size.z
+            )
+        case .north:
+            return SIMD2<Float>(
+                (to.x - corner.x) / size.x,
+                (to.y - corner.y) / size.y
+            )
+        case .south:
+            return SIMD2<Float>(
+                (corner.x - from.x) / size.x,
+                (to.y - corner.y) / size.y
+            )
+        case .west:
+            return SIMD2<Float>(
+                (corner.z - from.z) / size.z,
+                (to.y - corner.y) / size.y
+            )
+        case .east:
+            return SIMD2<Float>(
+                (to.z - corner.z) / size.z,
+                (to.y - corner.y) / size.y
+            )
+        }
+    }
+
+    private func rotatedFaceUV(_ uv: SIMD2<Float>, degrees: Int) -> SIMD2<Float> {
+        switch ((degrees % 360) + 360) % 360 {
+        case 90:
+            return SIMD2<Float>(1 - uv.y, uv.x)
+        case 180:
+            return SIMD2<Float>(1 - uv.x, 1 - uv.y)
+        case 270:
+            return SIMD2<Float>(uv.y, 1 - uv.x)
+        default:
+            return uv
+        }
+    }
+
+    private func placeholderQuads(
+        for placement: VanillaResolvedBlockState.Placement,
+        worldOffset: SIMD3<Float>
+    ) -> [StructureRenderer.TexturedQuad] {
+        let from = SIMD3<Float>(repeating: 0.25)
+        let to = SIMD3<Float>(repeating: 0.75)
+        let tint = SIMD4<Float>(1, 0, 0, 1)
+        let textureName = "minecraft:block/white_concrete"
+
+        return VanillaBlockFaceDirection.allCases.map { direction in
+            let baseCorners = corners(for: direction, from: from, to: to)
+            let finalCorners = baseCorners.map { corner in
+                let xRotated = rotateVariant(point: corner, axis: .x, degrees: placement.xRotationDegrees)
+                let xyRotated = rotateVariant(point: xRotated, axis: .y, degrees: placement.yRotationDegrees)
+                return xyRotated + worldOffset
+            }
+            return StructureRenderer.TexturedQuad(
+                corners: finalCorners,
+                textureName: textureName,
+                tint: tint
+            )
+        }
+    }
+
+    private func logPlaceholderFallbackIfNeeded(
+        for identifier: VanillaAssetRepository.AssetIdentifier
+    ) {
+        guard loggedFallbackModels.insert(identifier).inserted else {
+            return
+        }
+        let message = "Using red-cube fallback for model \(identifier.namespace):\(identifier.path)\n"
+        FileHandle.standardError.write(Data(message.utf8))
+    }
+
+    private func chooseRepresentativeMultipartValues(from entries: [[String: Any]]) -> [String: String] {
+        var assignments: [String: String] = [:]
+        for entry in entries {
+            guard let when = entry["when"] else {
+                continue
+            }
+            if let updatedAssignments = satisfyingAssignments(for: when, existing: assignments) {
+                assignments = updatedAssignments
             }
         }
-        return coordinates
+        return assignments
+    }
+
+    private func multipartConditionMatches(_ when: Any, values: [String: String]) -> Bool {
+        if let dictionary = when as? [String: Any] {
+            if let andArray = dictionary["AND"] as? [Any] {
+                return andArray.allSatisfy { multipartConditionMatches($0, values: values) }
+            }
+            if let orArray = dictionary["OR"] as? [Any] {
+                return orArray.contains { multipartConditionMatches($0, values: values) }
+            }
+            return dictionary.allSatisfy { key, value in
+                guard let stringValue = value as? String,
+                      let assigned = values[key] else {
+                    return false
+                }
+                return stringValue
+                    .split(separator: "|", omittingEmptySubsequences: false)
+                    .map(String.init)
+                    .contains(assigned)
+            }
+        }
+        return false
+    }
+
+    private func satisfyingAssignments(
+        for when: Any,
+        existing: [String: String]
+    ) -> [String: String]? {
+        if let dictionary = when as? [String: Any] {
+            if let andArray = dictionary["AND"] as? [Any] {
+                var assignments = existing
+                for condition in andArray {
+                    guard let updatedAssignments = satisfyingAssignments(for: condition, existing: assignments) else {
+                        return nil
+                    }
+                    assignments = updatedAssignments
+                }
+                return assignments
+            }
+            if let orArray = dictionary["OR"] as? [Any] {
+                for condition in orArray {
+                    if let assignments = satisfyingAssignments(for: condition, existing: existing) {
+                        return assignments
+                    }
+                }
+                return nil
+            }
+
+            var assignments = existing
+            for (key, value) in dictionary {
+                guard let stringValue = value as? String else {
+                    return nil
+                }
+                let options = stringValue
+                    .split(separator: "|", omittingEmptySubsequences: false)
+                    .map(String.init)
+                if let assigned = assignments[key] {
+                    guard options.contains(assigned) else {
+                        return nil
+                    }
+                } else if let selected = options.first {
+                    assignments[key] = selected
+                } else {
+                    return nil
+                }
+            }
+            return assignments
+        }
+        return nil
     }
 }

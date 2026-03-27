@@ -544,7 +544,7 @@ final class VulkanEngine {
                 vertexInput: VulkanEngine.vertexInputTextured3D(),
                 cullMode: VkCullModeFlags(VK_CULL_MODE_BACK_BIT.rawValue),
                 enableDepthTest: true,
-                enableBlending: false,
+                enableBlending: true,
                 vertSpirv: vertSpirvTextured3D,
                 fragSpirv: fragSpirvTextured3D
             )
@@ -2203,6 +2203,50 @@ final class VulkanEngine {
         )
     }
 
+    func updateTexture2D(_ texture: Texture2D, rgba8: [UInt8]) throws {
+        let expectedByteCount = texture.width * texture.height * 4
+        guard rgba8.count == expectedByteCount else {
+            throw Errors.textureDataSizeMismatch
+        }
+
+        let stagingSize = VkDeviceSize(expectedByteCount)
+        let (stagingBuffer, stagingMemory) = try createBufferWithMemory(
+            size: stagingSize,
+            usage: VkBufferUsageFlags(VK_BUFFER_USAGE_TRANSFER_SRC_BIT.rawValue),
+            properties: VkMemoryPropertyFlags(
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.rawValue |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.rawValue
+            )
+        )
+        let stagingMapped = try device.mapMemory(stagingMemory, offset: 0, size: stagingSize)
+        rgba8.withUnsafeBytes { bytes in
+            stagingMapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(stagingMemory)
+
+        try withSingleUseCommandBuffer { commandBuffer in
+            transitionImageLayout(
+                commandBuffer: commandBuffer,
+                image: texture.image.image,
+                oldLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                newLayout: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+            )
+            copyBufferToImage(
+                commandBuffer: commandBuffer,
+                buffer: stagingBuffer.buffer,
+                image: texture.image.image,
+                width: texture.width,
+                height: texture.height
+            )
+            transitionImageLayout(
+                commandBuffer: commandBuffer,
+                image: texture.image.image,
+                oldLayout: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                newLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            )
+        }
+    }
+
     func bindTextureTextured3D(_ texture: Texture2D) throws {
         guard let modeTextured3D = resources?.modeTextured3D else {
             throw Errors.missingTextured3DPipeline
@@ -2367,6 +2411,11 @@ final class VulkanEngine {
             srcAccessMask = 0
             dstAccessMask = VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT.rawValue)
             sourceStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT.rawValue)
+            destinationStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue)
+        case (VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL):
+            srcAccessMask = VkAccessFlags(VK_ACCESS_SHADER_READ_BIT.rawValue)
+            dstAccessMask = VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT.rawValue)
+            sourceStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT.rawValue)
             destinationStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue)
         case (VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL):
             srcAccessMask = VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT.rawValue)

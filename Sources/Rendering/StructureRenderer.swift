@@ -178,17 +178,30 @@ final class StructureRenderer {
     }
 
     private let assetLoader: VanillaAssetLoader
+    var keycodeForAction: ((KeybindAction) -> SDL_Keycode)?
     private var blocks: [BlockInstance] = []
+    private var texturedQuads: [TexturedQuad] = []
     private var meshBuffer: VulkanOwnedBuffer?
     private var meshMemory: VulkanOwnedDeviceMemory?
     private var meshVertexCount: UInt32 = 0
     private var meshVertexCapacity = 0
     private var meshTexture: VulkanEngine.Texture2D?
+    private var currentAnimationTick: Float = 0
+    private var atlasAnimationSignature: [String: Int] = [:]
     private var meshBounds = Bounds(min: .zero, max: SIMD3<Float>(repeating: 1))
-    private var orbitYaw: Float = -.pi / 4
-    private var orbitPitch: Float = .pi / 7
-    private var orbitDistance: Float = 8
-    private var rotating = false
+    private var cameraPosition = SIMD3<Float>(0, 2, -6)
+    private var cameraYaw: Float = .pi / 4
+    private var cameraPitch: Float = -.pi / 7
+    private var moveSpeed: Float = 6
+    private var fastMoveMultiplier: Float = 4
+    private var mouseSensitivity: Float = 0.0025
+    private var keyForward = false
+    private var keyLeft = false
+    private var keyBackward = false
+    private var keyRight = false
+    private var keyUp = false
+    private var keyDown = false
+    private var keyFastMove = false
 
     init(repository: VanillaAssetRepository, assetLoader: VanillaAssetLoader? = nil) {
         if let assetLoader {
@@ -200,11 +213,14 @@ final class StructureRenderer {
 
     func setBlocks(_ blocks: [BlockInstance], engine: VulkanEngine) throws {
         self.blocks = blocks
-        try setTexturedQuads(makeTexturedQuads(from: blocks), engine: engine)
+        let quads = makeTexturedQuads(from: blocks)
+        texturedQuads = quads
+        try setTexturedQuads(quads, engine: engine)
     }
 
     func setQuads(_ quads: [TexturedQuad], engine: VulkanEngine) throws {
         blocks.removeAll(keepingCapacity: false)
+        texturedQuads = quads
         try setTexturedQuads(quads, engine: engine)
     }
 
@@ -215,35 +231,57 @@ final class StructureRenderer {
         meshVertexCount = 0
         meshVertexCapacity = 0
         meshTexture = nil
+        texturedQuads.removeAll(keepingCapacity: false)
+        atlasAnimationSignature.removeAll(keepingCapacity: false)
+        currentAnimationTick = 0
         meshBounds = Bounds(min: .zero, max: SIMD3<Float>(repeating: 1))
     }
 
     func handleEvent(_ event: SDL_Event) {
         switch event.eventType {
-        case .mouseButtonDown:
-            if event.button.button == SDL_BUTTON_LEFT {
-                rotating = true
-            }
-        case .mouseButtonUp:
-            if event.button.button == SDL_BUTTON_LEFT {
-                rotating = false
-            }
-        case .mouseMotion:
-            guard rotating else {
+        case .keyDown:
+            if event.key.repeat {
                 return
             }
+            setKeyState(event.key.key, pressed: true)
+        case .keyUp:
+            setKeyState(event.key.key, pressed: false)
+        case .mouseMotion:
             let delta = event.motion.relative(as: Float.self)
-            orbitYaw += delta.x * 0.01
-            orbitPitch = clamp(orbitPitch - delta.y * 0.01, min: -(.pi / 2 - 0.05), max: .pi / 2 - 0.05)
-        case .mouseWheel:
-            let directionMultiplier: Float = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1 : 1
-            orbitDistance = max(1.5, orbitDistance - Float(event.wheel.y) * directionMultiplier * 0.75)
+            cameraYaw += delta.x * mouseSensitivity
+            cameraPitch = clamp(cameraPitch - delta.y * mouseSensitivity, min: -(.pi / 2 - 0.05), max: .pi / 2 - 0.05)
         default:
             break
         }
     }
 
-    func update(deltaTime _: Float) {}
+    func update(deltaTime: Float) {
+        currentAnimationTick += max(0, deltaTime) * 20
+        let horizontalForward = normalizeOrZero(SIMD3<Float>(
+            x: cos(cameraYaw),
+            y: 0,
+            z: sin(cameraYaw)
+        ))
+        let horizontalRight = normalizeOrZero(SIMD3<Float>(
+            x: -horizontalForward.z,
+            y: 0,
+            z: horizontalForward.x
+        ))
+
+        var movement = SIMD3<Float>(repeating: 0)
+        if keyForward { movement += horizontalForward }
+        if keyBackward { movement -= horizontalForward }
+        if keyRight { movement += horizontalRight }
+        if keyLeft { movement -= horizontalRight }
+        if keyUp { movement.y += 1 }
+        if keyDown { movement.y -= 1 }
+
+        if simd_length_squared(movement) > 0 {
+            movement = simd_normalize(movement)
+            let speed = moveSpeed * (keyFastMove ? fastMoveMultiplier : 1)
+            cameraPosition += movement * (speed * max(0, deltaTime))
+        }
+    }
 
     func render(
         engine: VulkanEngine,
@@ -259,26 +297,28 @@ final class StructureRenderer {
         }
 
         try engine.device.waitForFences([engine.inFlightFence.fence], waitAll: true, timeout: UInt64.max)
+        try updateAnimatedAtlasIfNeeded(engine: engine)
         try engine.bindTextureTextured3D(meshTexture)
 
         let viewport = currentViewport(window: window)
         let aspect = max(1, Float(viewport.x)) / max(1, Float(viewport.y))
+        let farPlane = max(2048, meshBounds.radius * 12 + 256)
         let view = lookAtRH(
-            eye: cameraPosition(),
-            center: meshBounds.center,
+            eye: cameraPosition,
+            center: cameraPosition + viewForward(),
             up: SIMD3<Float>(0, 1, 0)
         )
         let projection = perspectiveRH(
             fovYRadians: 55 * .pi / 180,
             aspect: aspect,
             nearZ: 0.05,
-            farZ: 512
+            farZ: farPlane
         )
 
         try engine.updateTransformTextured3D(projection)
         try engine.updateModelTextured3D(matrix_identity_float4x4)
         try engine.updateViewTextured3D(view)
-        engine.setClearColor(SIMD4<Float>(0.12, 0.13, 0.16, 1))
+        engine.setClearColor(SIMD4<Float>(0.63, 0.82, 0.98, 1.0))
 
         let imageIndex = try engine.device.acquireNextImage(from: engine.swapchain, semaphore: imageAvailable)
         guard Int(imageIndex) < renderFinishedByImage.count else {
@@ -318,7 +358,8 @@ final class StructureRenderer {
     private func buildMesh(from blocks: [BlockInstance]) throws -> (
         vertices: [VulkanEngine.VertexTextured3D],
         atlas: VanillaTextureImage,
-        bounds: Bounds
+        bounds: Bounds,
+        animationSignature: [String: Int]
     ) {
         try buildMesh(from: makeTexturedQuads(from: blocks))
     }
@@ -326,10 +367,14 @@ final class StructureRenderer {
     private func buildMesh(from quads: [TexturedQuad]) throws -> (
         vertices: [VulkanEngine.VertexTextured3D],
         atlas: VanillaTextureImage,
-        bounds: Bounds
+        bounds: Bounds,
+        animationSignature: [String: Int]
     ) {
         let textureNames = quads.map(\.textureName)
-        let atlasBuild = try assetLoader.buildAtlas(textureNames: textureNames)
+        let atlasBuild = try assetLoader.buildAtlas(
+            textureNames: textureNames,
+            animationTick: Int(currentAnimationTick.rounded(.down))
+        )
 
         var vertices: [VulkanEngine.VertexTextured3D] = []
         vertices.reserveCapacity(max(6, quads.count * 6))
@@ -356,7 +401,7 @@ final class StructureRenderer {
             bounds = Bounds(min: .zero, max: SIMD3<Float>(repeating: 1))
         }
 
-        return (vertices, atlasBuild.image, bounds)
+        return (vertices, atlasBuild.image, bounds, atlasBuild.animationSignature)
     }
 
     private func makeTexturedQuads(from blocks: [BlockInstance]) -> [TexturedQuad] {
@@ -415,8 +460,24 @@ final class StructureRenderer {
             height: meshBuild.atlas.height,
             rgba8: meshBuild.atlas.rgba8
         )
+        atlasAnimationSignature = meshBuild.animationSignature
         meshBounds = meshBuild.bounds
         refocusCamera()
+    }
+
+    private func updateAnimatedAtlasIfNeeded(engine: VulkanEngine) throws {
+        guard let meshTexture, !texturedQuads.isEmpty else {
+            return
+        }
+        let atlasBuild = try assetLoader.buildAtlas(
+            textureNames: texturedQuads.map(\.textureName),
+            animationTick: Int(currentAnimationTick.rounded(.down))
+        )
+        guard atlasBuild.animationSignature != atlasAnimationSignature else {
+            return
+        }
+        try engine.updateTexture2D(meshTexture, rgba8: atlasBuild.image.rgba8)
+        atlasAnimationSignature = atlasBuild.animationSignature
     }
 
     private func appendFace(
@@ -432,11 +493,11 @@ final class StructureRenderer {
         let uv3 = atlasUV(atlasFrame: atlasFrame, localUV: textureCoordinates[3])
 
         vertices.append(.init(position: corners[0], color: tint, textureCoordinates: uv0))
+        vertices.append(.init(position: corners[2], color: tint, textureCoordinates: uv2))
         vertices.append(.init(position: corners[1], color: tint, textureCoordinates: uv1))
-        vertices.append(.init(position: corners[2], color: tint, textureCoordinates: uv2))
         vertices.append(.init(position: corners[0], color: tint, textureCoordinates: uv0))
-        vertices.append(.init(position: corners[2], color: tint, textureCoordinates: uv2))
         vertices.append(.init(position: corners[3], color: tint, textureCoordinates: uv3))
+        vertices.append(.init(position: corners[2], color: tint, textureCoordinates: uv2))
     }
 
     private func atlasUV(atlasFrame: SIMD4<Float>, localUV: SIMD2<Float>) -> SIMD2<Float> {
@@ -447,16 +508,79 @@ final class StructureRenderer {
     }
 
     private func refocusCamera() {
-        orbitDistance = max(4, meshBounds.radius * 3.2 + 2)
+        cameraYaw = .pi / 4
+        cameraPitch = -.pi / 7
+        let distance = max(4, meshBounds.radius * 1.6 + 4)
+        let forward = viewForward()
+        cameraPosition = meshBounds.center - forward * distance
     }
 
-    private func cameraPosition() -> SIMD3<Float> {
-        let center = meshBounds.center
-        let horizontal = cos(orbitPitch) * orbitDistance
-        return center + SIMD3<Float>(
-            x: cos(orbitYaw) * horizontal,
-            y: sin(orbitPitch) * orbitDistance,
-            z: sin(orbitYaw) * horizontal
+    private func setKeyState(_ key: SDL_Keycode, pressed: Bool) {
+        if keyMatches(key, action: .moveForward) {
+            keyForward = pressed
+        }
+        if keyMatches(key, action: .moveLeft) {
+            keyLeft = pressed
+        }
+        if keyMatches(key, action: .moveBackward) {
+            keyBackward = pressed
+        }
+        if keyMatches(key, action: .moveRight) {
+            keyRight = pressed
+        }
+        if keyMatches(key, action: .moveUp) {
+            keyUp = pressed
+        }
+        if keyMatches(key, action: .moveDown) {
+            keyDown = pressed
+        }
+        if keyMatches(key, action: .fastMove) {
+            keyFastMove = pressed
+        }
+    }
+
+    private func keyMatches(_ key: SDL_Keycode, action: KeybindAction) -> Bool {
+        key == (keycodeForAction?(action) ?? action.defaultValue.keycode)
+    }
+
+    private func viewForward() -> SIMD3<Float> {
+        let cp = cos(cameraPitch)
+        return normalizeOrZero(SIMD3<Float>(
+            x: cos(cameraYaw) * cp,
+            y: sin(cameraPitch),
+            z: sin(cameraYaw) * cp
+        ))
+    }
+
+    private func normalizeOrZero(_ v: SIMD3<Float>) -> SIMD3<Float> {
+        let lenSq = simd_length_squared(v)
+        if lenSq <= 1e-8 {
+            return .zero
+        }
+        return v / sqrt(lenSq)
+    }
+
+    private func simd_length_squared(_ v: SIMD3<Float>) -> Float {
+        simd_dot(v, v)
+    }
+
+    private func simd_dot(_ lhs: SIMD3<Float>, _ rhs: SIMD3<Float>) -> Float {
+        lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z
+    }
+
+    private func simd_normalize(_ v: SIMD3<Float>) -> SIMD3<Float> {
+        let length = sqrt(simd_length_squared(v))
+        if length <= 0 {
+            return .zero
+        }
+        return v / length
+    }
+
+    private func simd_cross(_ lhs: SIMD3<Float>, _ rhs: SIMD3<Float>) -> SIMD3<Float> {
+        SIMD3<Float>(
+            lhs.y * rhs.z - lhs.z * rhs.y,
+            lhs.z * rhs.x - lhs.x * rhs.z,
+            lhs.x * rhs.y - lhs.y * rhs.x
         )
     }
 

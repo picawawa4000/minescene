@@ -1,5 +1,5 @@
 import Foundation
-import DPReader
+@preconcurrency import DPReader
 #if canImport(simd)
 import simd
 #endif
@@ -15,7 +15,7 @@ enum BiomeMapRendererError: Error {
     case biomeSamplingUnavailable
 }
 
-final class BiomeQuadTreeCache {
+final class BiomeQuadTreeCache: @unchecked Sendable {
     struct TreeKey: Hashable {
         let sampleY: Int
     }

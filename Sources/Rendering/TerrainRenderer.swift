@@ -1,5 +1,5 @@
 import Foundation
-import DPReader
+@preconcurrency import DPReader
 import SwiftSDL
 import Vulkan
 import VulkanBindings
@@ -17,6 +17,11 @@ final class TerrainRenderer {
     struct ChunkCoord: Hashable {
         let x: Int
         let z: Int
+    }
+
+    @inline(__always)
+    static func currentTimeSeconds() -> Double {
+        ProcessInfo.processInfo.systemUptime
     }
 
     private struct CompactBiomeEntry {
@@ -350,10 +355,10 @@ final class TerrainRenderer {
                 chunkCoord = nextChunk
                 lock.unlock()
 
-                let generationStart = CFAbsoluteTimeGetCurrent()
+                let generationStart = TerrainRenderer.currentTimeSeconds()
                 let protoChunk = ProtoChunk()
                 let generationSucceeded = (try? worldGenerator.generateInto(protoChunk, at: PosInt2D(x: Int32(chunkCoord.x), z: Int32(chunkCoord.z)))) != nil
-                let generationSeconds = CFAbsoluteTimeGetCurrent() - generationStart
+                let generationSeconds = TerrainRenderer.currentTimeSeconds() - generationStart
                 let compactChunk = generationSucceeded ? makeCompactChunk(from: protoChunk) : nil
 
                 var generationWorkersToStart = 0
@@ -504,9 +509,9 @@ final class TerrainRenderer {
                 uploadSeconds: 0
             )
 
-            let meshStart = CFAbsoluteTimeGetCurrent()
+            let meshStart = TerrainRenderer.currentTimeSeconds()
             let vertices = buildGreedyMesh(coord: snapshot.coord, chunk: snapshot.chunk, neighbors: snapshot.neighbors)
-            profile.meshSeconds = CFAbsoluteTimeGetCurrent() - meshStart
+            profile.meshSeconds = TerrainRenderer.currentTimeSeconds() - meshStart
 
             return ChunkMeshResult(
                 coord: snapshot.coord,
@@ -1112,7 +1117,7 @@ final class TerrainRenderer {
         for result in completed.results {
             chunkMeshes.removeValue(forKey: result.coord)
 
-            let uploadStart = CFAbsoluteTimeGetCurrent()
+            let uploadStart = TerrainRenderer.currentTimeSeconds()
             if !result.vertices.isEmpty {
                 let (buffer, memory) = try engine.createVertexBuffer3D(result.vertices)
                 chunkMeshes[result.coord] = ChunkRenderMesh(
@@ -1123,7 +1128,7 @@ final class TerrainRenderer {
             }
 
             var profile = result.profile
-            profile.uploadSeconds = CFAbsoluteTimeGetCurrent() - uploadStart
+            profile.uploadSeconds = TerrainRenderer.currentTimeSeconds() - uploadStart
             logChunkMesh(
                 coord: result.coord,
                 profile: profile,

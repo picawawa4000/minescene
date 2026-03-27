@@ -1,5 +1,5 @@
 import Foundation
-import DPReader
+@preconcurrency import DPReader
 import SwiftSDL
 import Vulkan
 import VulkanBindings
@@ -7,7 +7,7 @@ import VulkanBindings
 import simd
 #endif
 
-final class BiomeMapViewRenderer {
+final class BiomeMapViewRenderer: @unchecked Sendable {
     private struct HudStyle {
         let cellSize: Float
         let glyphAdvance: Float

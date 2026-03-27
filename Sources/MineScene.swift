@@ -213,9 +213,14 @@ final class MineSceneApp {
         } catch DatapackSelectionScreen.SelectionError.cancelled {
             return
         } catch {
-            fputs("Error raised at top level: \(error)\n", stderr)
+            logTopLevelError(error)
             exit(1)
         }
+    }
+
+    private static func logTopLevelError(_ error: Error) {
+        let message = "Error raised at top level: \(error)\n"
+        FileHandle.standardError.write(Data(message.utf8))
     }
 
     private static func resourceURL(relativePath: String, isDirectory: Bool = false) throws -> URL {

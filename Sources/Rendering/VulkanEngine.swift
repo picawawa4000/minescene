@@ -121,6 +121,7 @@ final class VulkanEngine {
     struct DrawBatch3D {
         let buffer: VulkanOwnedBuffer
         let vertexCount: UInt32
+        let modelOffset: SIMD4<Float>
     }
 
     final class VulkanOwnedDescriptorSetLayout {
@@ -324,9 +325,15 @@ final class VulkanEngine {
         )
 
         let mode3DLayout = try VulkanEngine.createDescriptorSetLayout3D(device: self.device)
+        let mode3DPushConstantRange = VkPushConstantRange(
+            stageFlags: VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT.rawValue),
+            offset: 0,
+            size: UInt32(MemoryLayout<SIMD4<Float>>.stride)
+        )
         let mode3DPipelineLayout = try VulkanEngine.createPipelineLayout(
             device: self.device,
-            descriptorSetLayout: mode3DLayout
+            descriptorSetLayout: mode3DLayout,
+            pushConstantRange: mode3DPushConstantRange
         )
         let mode3DDescriptorPool = try VulkanEngine.createDescriptorPool(
             device: self.device,
@@ -1154,10 +1161,24 @@ final class VulkanEngine {
 
     private static func createPipelineLayout(
         device: VulkanOwnedDevice,
-        descriptorSetLayout: VulkanOwnedDescriptorSetLayout
+        descriptorSetLayout: VulkanOwnedDescriptorSetLayout,
+        pushConstantRange: VkPushConstantRange? = nil
     ) throws -> VulkanOwnedPipelineLayout {
         let layouts: [VkDescriptorSetLayout?] = [descriptorSetLayout.descriptorSetLayout]
         return try layouts.withUnsafeBufferPointer { layoutsPtr in
+            if var pushConstantRange {
+                return try withUnsafePointer(to: &pushConstantRange) { pushConstantRangePtr in
+                    var createInfo = VkPipelineLayoutCreateInfo.create(
+                        flags: 0,
+                        setLayoutCount: UInt32(layoutsPtr.count),
+                        pSetLayouts: layoutsPtr.baseAddress,
+                        pushConstantRangeCount: 1,
+                        pPushConstantRanges: pushConstantRangePtr
+                    )
+                    return try device.createPipelineLayout(&createInfo)
+                }
+            }
+
             var createInfo = VkPipelineLayoutCreateInfo.create(
                 flags: 0,
                 setLayoutCount: UInt32(layoutsPtr.count),
@@ -1492,9 +1513,8 @@ final class VulkanEngine {
         guard let pipeline = mode3D.pipeline else {
             throw Errors.missing3DPipeline
         }
-        let internalBatches = batches.map { ($0.buffer, $0.vertexCount) }
-        try drawVertexBuffers(
-            buffers: internalBatches,
+        try drawVertexBuffers3D(
+            buffers: batches.map { ($0.buffer, $0.vertexCount, $0.modelOffset) },
             pipeline: pipeline,
             pipelineLayout: mode3D.pipelineLayout,
             descriptorSet: mode3D.descriptorSet,
@@ -1541,8 +1561,8 @@ final class VulkanEngine {
             commandBuffer.beginRenderPass(renderPassBeginInfo: &renderPassBeginInfo, contents: VK_SUBPASS_CONTENTS_INLINE)
         }
 
-        recordDrawBatches(
-            batches3D.map { ($0.buffer, $0.vertexCount) },
+        recordDrawBatches3D(
+            batches3D.map { ($0.buffer, $0.vertexCount, $0.modelOffset) },
             pipeline: pipeline3D,
             pipelineLayout: mode3D.pipelineLayout,
             descriptorSet: mode3D.descriptorSet
@@ -1787,6 +1807,51 @@ final class VulkanEngine {
         try submitRecordedFrame(waitSemaphores: waitSemaphores, signalSemaphores: signalSemaphores)
     }
 
+    private func drawVertexBuffers3D(
+        buffers: [(buffer: VulkanOwnedBuffer, vertexCount: UInt32, modelOffset: SIMD4<Float>)],
+        pipeline: VulkanOwnedPipeline,
+        pipelineLayout: VulkanOwnedPipelineLayout,
+        descriptorSet: VkDescriptorSet?,
+        framebufferIndex: Int,
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
+    ) throws {
+        guard framebufferIndex >= 0 && framebufferIndex < swapchainFramebuffers.count else {
+            throw Errors.invalidFramebufferIndex
+        }
+
+        try device.waitForFences([inFlightFence.fence], waitAll: true, timeout: UInt64.max)
+        try device.resetFences([inFlightFence.fence])
+        try VulkanEngine.vulkanResultCheck(vkResetCommandBuffer(commandBuffer.commandBuffer, 0))
+        try commandBuffer.begin()
+        var clearValues = [
+            VkClearValue(color: VkClearColorValue(float32: (clearColor.x, clearColor.y, clearColor.z, clearColor.w))),
+            VkClearValue(depthStencil: VkClearDepthStencilValue(depth: 1, stencil: 0))
+        ]
+        var renderPassBeginInfo = VkRenderPassBeginInfo(
+            sType: VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            pNext: nil,
+            renderPass: renderPass.renderPass,
+            framebuffer: swapchainFramebuffers[framebufferIndex].framebuffer,
+            renderArea: VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: swapchainExtent),
+            clearValueCount: UInt32(clearValues.count),
+            pClearValues: nil
+        )
+        clearValues.withUnsafeBufferPointer { clearPtr in
+            renderPassBeginInfo.pClearValues = clearPtr.baseAddress
+            commandBuffer.beginRenderPass(renderPassBeginInfo: &renderPassBeginInfo, contents: VK_SUBPASS_CONTENTS_INLINE)
+        }
+        recordDrawBatches3D(
+            buffers,
+            pipeline: pipeline,
+            pipelineLayout: pipelineLayout,
+            descriptorSet: descriptorSet
+        )
+        commandBuffer.endRenderPass()
+        try commandBuffer.end()
+        try submitRecordedFrame(waitSemaphores: waitSemaphores, signalSemaphores: signalSemaphores)
+    }
+
     private func recordDrawBatches(
         _ buffers: [(buffer: VulkanOwnedBuffer, vertexCount: UInt32)],
         pipeline: VulkanOwnedPipeline,
@@ -1811,6 +1876,53 @@ final class VulkanEngine {
         }
 
         for batch in buffers where batch.vertexCount > 0 {
+            var vertexBuffer: VkBuffer? = batch.buffer.buffer
+            var offset: VkDeviceSize = 0
+            withUnsafePointer(to: &vertexBuffer) { bufferPtr in
+                withUnsafePointer(to: &offset) { offsetPtr in
+                    vkCmdBindVertexBuffers(commandBuffer.commandBuffer, 0, 1, bufferPtr, offsetPtr)
+                }
+            }
+            commandBuffer.draw(vertexCount: batch.vertexCount)
+        }
+    }
+
+    private func recordDrawBatches3D(
+        _ buffers: [(buffer: VulkanOwnedBuffer, vertexCount: UInt32, modelOffset: SIMD4<Float>)],
+        pipeline: VulkanOwnedPipeline,
+        pipelineLayout: VulkanOwnedPipelineLayout,
+        descriptorSet: VkDescriptorSet?
+    ) {
+        commandBuffer.bindPipeline(bindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline: pipeline.pipeline)
+        if let descriptorSet {
+            var set: VkDescriptorSet? = descriptorSet
+            withUnsafePointer(to: &set) { setPtr in
+                vkCmdBindDescriptorSets(
+                    commandBuffer.commandBuffer,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    pipelineLayout.pipelineLayout,
+                    0,
+                    1,
+                    setPtr,
+                    0,
+                    nil
+                )
+            }
+        }
+
+        for batch in buffers where batch.vertexCount > 0 {
+            var modelOffset = batch.modelOffset
+            withUnsafeBytes(of: &modelOffset) { modelOffsetBytes in
+                vkCmdPushConstants(
+                    commandBuffer.commandBuffer,
+                    pipelineLayout.pipelineLayout,
+                    VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT.rawValue),
+                    0,
+                    UInt32(modelOffsetBytes.count),
+                    modelOffsetBytes.baseAddress
+                )
+            }
+
             var vertexBuffer: VkBuffer? = batch.buffer.buffer
             var offset: VkDeviceSize = 0
             withUnsafePointer(to: &vertexBuffer) { bufferPtr in

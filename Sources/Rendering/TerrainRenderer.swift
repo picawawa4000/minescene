@@ -98,6 +98,7 @@ final class TerrainRenderer {
     struct ChunkMeshResult {
         let coord: ChunkCoord
         let revision: Int
+        let origin: SIMD3<Int>
         let vertices: [VulkanEngine.Vertex3D]
         let profile: MeshProfile
         let availableChunks: Int
@@ -108,6 +109,7 @@ final class TerrainRenderer {
         let buffer: VulkanOwnedBuffer
         let memory: VulkanOwnedDeviceMemory
         let vertexCount: UInt32
+        let origin: SIMD3<Int>
     }
 
     struct StreamDebugStatus {
@@ -510,13 +512,14 @@ final class TerrainRenderer {
             )
 
             let meshStart = TerrainRenderer.currentTimeSeconds()
-            let vertices = buildGreedyMesh(coord: snapshot.coord, chunk: snapshot.chunk, neighbors: snapshot.neighbors)
+            let meshBuild = buildGreedyMesh(coord: snapshot.coord, chunk: snapshot.chunk, neighbors: snapshot.neighbors)
             profile.meshSeconds = TerrainRenderer.currentTimeSeconds() - meshStart
 
             return ChunkMeshResult(
                 coord: snapshot.coord,
                 revision: snapshot.revision,
-                vertices: vertices,
+                origin: meshBuild.origin,
+                vertices: meshBuild.vertices,
                 profile: profile,
                 availableChunks: snapshot.availableChunks,
                 totalTargetChunks: snapshot.totalTargetChunks
@@ -655,7 +658,7 @@ final class TerrainRenderer {
             coord: ChunkCoord,
             chunk: CompactChunk,
             neighbors: [ChunkCoord: CompactChunk]
-        ) -> [VulkanEngine.Vertex3D] {
+        ) -> (origin: SIMD3<Int>, vertices: [VulkanEngine.Vertex3D]) {
             var firstSolidSection = Int.max
             var lastSolidSection = Int.min
             for sectionIndex in 0..<chunk.sectionCount {
@@ -667,13 +670,16 @@ final class TerrainRenderer {
                 lastSolidSection = max(lastSolidSection, sectionIndex)
             }
 
+            let emptyOrigin = SIMD3<Int>(coord.x * 16, chunk.minY, coord.z * 16)
+            let originX = coord.x * 16
+            let originZ = coord.z * 16
+
             guard firstSolidSection != Int.max, lastSolidSection != Int.min else {
-                return []
+                return (emptyOrigin, [])
             }
 
-            let originX = coord.x * 16
             let originY = chunk.minY + firstSolidSection * ProtoChunk.sectionHeight
-            let originZ = coord.z * 16
+            let origin = SIMD3<Int>(originX, originY, originZ)
             let dims = [16, (lastSolidSection - firstSolidSection + 1) * ProtoChunk.sectionHeight, 16]
 
             var vertices: [VulkanEngine.Vertex3D] = []
@@ -812,24 +818,24 @@ final class TerrainRenderer {
                             p[v] = j
 
                             let p0 = SIMD3<Float>(
-                                Float(originX + p[0]),
-                                Float(originY + p[1]),
-                                Float(originZ + p[2])
+                                Float(p[0]),
+                                Float(p[1]),
+                                Float(p[2])
                             )
                             let p1 = SIMD3<Float>(
-                                Float(originX + p[0] + du[0]),
-                                Float(originY + p[1] + du[1]),
-                                Float(originZ + p[2] + du[2])
+                                Float(p[0] + du[0]),
+                                Float(p[1] + du[1]),
+                                Float(p[2] + du[2])
                             )
                             let p2 = SIMD3<Float>(
-                                Float(originX + p[0] + du[0] + dv[0]),
-                                Float(originY + p[1] + du[1] + dv[1]),
-                                Float(originZ + p[2] + du[2] + dv[2])
+                                Float(p[0] + du[0] + dv[0]),
+                                Float(p[1] + du[1] + dv[1]),
+                                Float(p[2] + du[2] + dv[2])
                             )
                             let p3 = SIMD3<Float>(
-                                Float(originX + p[0] + dv[0]),
-                                Float(originY + p[1] + dv[1]),
-                                Float(originZ + p[2] + dv[2])
+                                Float(p[0] + dv[0]),
+                                Float(p[1] + dv[1]),
+                                Float(p[2] + dv[2])
                             )
                             let faceColor = shadedBiomeColor(
                                 packedBaseColor: basePackedColor,
@@ -856,7 +862,7 @@ final class TerrainRenderer {
                 }
             }
 
-            return vertices
+            return (origin, vertices)
         }
 
         private func appendQuad(
@@ -964,7 +970,7 @@ final class TerrainRenderer {
     var lastHudViewport = SIMD2<Int>(repeating: -1)
     var lastHudBiome = ""
 
-    var cameraPosition = SIMD3<Float>(x: 0.0, y: 160.0, z: 0.0)
+    var cameraPosition = SIMD3<Double>(x: 0.0, y: 160.0, z: 0.0)
     var cameraYaw: Float = -.pi / 4.0
     var cameraPitch: Float = -.pi / 5.5
     var smoothedFps: Float = 0
@@ -1034,8 +1040,8 @@ final class TerrainRenderer {
         }
 
         let view = lookAtRH(
-            eye: cameraPosition,
-            center: cameraPosition + viewForward(),
+            eye: .zero,
+            center: viewForward(),
             up: SIMD3<Float>(0, 1, 0)
         )
         let projection = perspectiveRH(
@@ -1065,7 +1071,13 @@ final class TerrainRenderer {
             guard let mesh = chunkMeshes[coord], mesh.vertexCount > 0 else {
                 return nil
             }
-            return .init(buffer: mesh.buffer, vertexCount: mesh.vertexCount)
+            let modelOffset = SIMD4<Float>(
+                Float(Double(mesh.origin.x) - cameraPosition.x),
+                Float(Double(mesh.origin.y) - cameraPosition.y),
+                Float(Double(mesh.origin.z) - cameraPosition.z),
+                0
+            )
+            return .init(buffer: mesh.buffer, vertexCount: mesh.vertexCount, modelOffset: modelOffset)
         }
         let hudBatches: [VulkanEngine.DrawBatch2D]
         if let hudBuffer, hudVertexCount > 0 {
@@ -1123,7 +1135,8 @@ final class TerrainRenderer {
                 chunkMeshes[result.coord] = ChunkRenderMesh(
                     buffer: buffer,
                     memory: memory,
-                    vertexCount: UInt32(result.vertices.count)
+                    vertexCount: UInt32(result.vertices.count),
+                    origin: result.origin
                 )
             }
 

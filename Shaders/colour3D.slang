@@ -25,9 +25,14 @@ cbuffer View : register(b2) {
     float4x4 uView;
 };
 
+[[vk::push_constant]]
+cbuffer ModelOffsetPushConstant {
+    float4 uModelOffset;
+};
+
 [shader("vertex")]
 VSOutput mainVS(VSInput input) {
-    float4 worldPos = mul(uModel, float4(input.position, 1.0));
+    float4 worldPos = float4(input.position + uModelOffset.xyz, 1.0);
     float4 viewPos = mul(uView, worldPos);
     float4 clipPos = mul(uTransform, viewPos);
     VSOutput output;

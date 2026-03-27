@@ -30,9 +30,9 @@ extension TerrainRenderer {
             "\(entry.isError ? "error" : "info"):\(entry.message)"
         }.joined(separator: "|")
         let positionRuns = [
-            HudTextRun(text: String(format: "X: %.1f ", Double(cameraPosition.x)), color: hudXColor),
-            HudTextRun(text: String(format: "Y: %.1f ", Double(cameraPosition.y)), color: hudYColor),
-            HudTextRun(text: String(format: "Z: %.1f", Double(cameraPosition.z)), color: hudZColor)
+            HudTextRun(text: String(format: "X: %.1f ", cameraPosition.x), color: hudXColor),
+            HudTextRun(text: String(format: "Y: %.1f ", cameraPosition.y), color: hudYColor),
+            HudTextRun(text: String(format: "Z: %.1f", cameraPosition.z), color: hudZColor)
         ]
         let fpsRuns = [
             HudTextRun(text: String(format: "FPS: %.0f", Double(smoothedFps)), color: hudFpsColor)

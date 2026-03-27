@@ -50,7 +50,7 @@ final class MineSceneApp {
     }
 
     private struct Waypoint {
-        let position: SIMD3<Float>
+        let position: SIMD3<Double>
         let seed: Int64
     }
 
@@ -480,11 +480,7 @@ final class MineSceneApp {
             switch subcommand {
             case "save":
                 let name = try parser.getNextString()
-                let currentPosition = SIMD3<Double>(
-                    Double(renderer.cameraPosition.x),
-                    Double(renderer.cameraPosition.y),
-                    Double(renderer.cameraPosition.z)
-                )
+                let currentPosition = renderer.cameraPosition
                 let position: SIMD3<Double>
                 let seed: Int64
                 switch parser.remainingCount {
@@ -506,14 +502,9 @@ final class MineSceneApp {
                     )
                 }
                 try parser.end()
-                let storedPosition = SIMD3<Float>(
-                    Float(position.x),
-                    Float(position.y),
-                    Float(position.z)
-                )
-                waypoints[name] = Waypoint(position: storedPosition, seed: seed)
+                waypoints[name] = Waypoint(position: position, seed: seed)
                 renderer.logCommandMessage(
-                    "Saved waypoint \(name) at \(formatPosition(storedPosition, renderer: renderer)) on world seed \(seed)."
+                    "Saved waypoint \(name) at \(formatPosition(position, renderer: renderer)) on world seed \(seed)."
                 )
             case "info":
                 if parser.remainingCount == 0 {
@@ -619,7 +610,7 @@ final class MineSceneApp {
         let newWorldGenerator = try makeWorldGenerator(seed: seed)
         waitForGpuToFinishCurrentFrame()
 
-        let previousCameraPosition = terrainRenderer?.cameraPosition ?? SIMD3<Float>(x: 0, y: 160, z: 0)
+        let previousCameraPosition = terrainRenderer?.cameraPosition ?? SIMD3<Double>(x: 0, y: 160, z: 0)
         let previousCameraYaw = terrainRenderer?.cameraYaw ?? -.pi / 4.0
         let previousCameraPitch = terrainRenderer?.cameraPitch ?? -.pi / 5.5
         let previousSmoothedFps = terrainRenderer?.smoothedFps ?? 0
@@ -665,15 +656,15 @@ final class MineSceneApp {
         return seed
     }
 
-    private func formatPosition(_ position: SIMD3<Float>, renderer: TerrainRenderer) -> String {
-        "(\(renderer.formatCommandNumber(Double(position.x))), \(renderer.formatCommandNumber(Double(position.y))), \(renderer.formatCommandNumber(Double(position.z))))"
+    private func formatPosition(_ position: SIMD3<Double>, renderer: TerrainRenderer) -> String {
+        "(\(renderer.formatCommandNumber(position.x)), \(renderer.formatCommandNumber(position.y)), \(renderer.formatCommandNumber(position.z)))"
     }
 
-    private func formatWaypointFilePosition(_ position: SIMD3<Float>, renderer: TerrainRenderer?) -> String {
+    private func formatWaypointFilePosition(_ position: SIMD3<Double>, renderer: TerrainRenderer?) -> String {
         let formatter = renderer ?? terrainRenderer
-        let x = formatter?.formatCommandNumber(Double(position.x)) ?? String(position.x)
-        let y = formatter?.formatCommandNumber(Double(position.y)) ?? String(position.y)
-        let z = formatter?.formatCommandNumber(Double(position.z)) ?? String(position.z)
+        let x = formatter?.formatCommandNumber(position.x) ?? String(position.x)
+        let y = formatter?.formatCommandNumber(position.y) ?? String(position.y)
+        let z = formatter?.formatCommandNumber(position.z) ?? String(position.z)
         return "\(x) \(y) \(z)"
     }
 
@@ -905,7 +896,7 @@ final class MineSceneApp {
             var parser = TerrainRendererCommandArgumentParser(line)
             let name: String
             let seed: Int64
-            let position: SIMD3<Float>
+            let position: SIMD3<Double>
             do {
                 name = try parser.getNextString()
                 seed = try parser.getNextWorldSeed()
@@ -913,7 +904,7 @@ final class MineSceneApp {
                 let y = try parser.getNextDouble()
                 let z = try parser.getNextDouble()
                 try parser.end()
-                position = SIMD3<Float>(Float(x), Float(y), Float(z))
+                position = SIMD3<Double>(x, y, z)
             } catch let error as TerrainRendererCommandParseError {
                 throw CommandError.invalidWaypointFile(line: lineNumber, reason: error.description)
             }

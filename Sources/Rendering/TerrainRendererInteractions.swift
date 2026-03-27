@@ -6,7 +6,11 @@ import simd
 
 extension TerrainRenderer {
     var currentCameraPosition: SIMD3<Float> {
-        cameraPosition
+        SIMD3<Float>(
+            Float(cameraPosition.x),
+            Float(cameraPosition.y),
+            Float(cameraPosition.z)
+        )
     }
 
     func handleEvent(_ event: SDL_Event, window: OpaquePointer?) {
@@ -124,7 +128,12 @@ extension TerrainRenderer {
         if simd_length_squared(movement) > 0 {
             movement = simd_normalize(movement)
             let currentMoveSpeed = moveSpeed * (keyR ? fastMoveMultiplier : 1)
-            cameraPosition += movement * currentMoveSpeed * max(0, deltaTime)
+            let distance = Double(currentMoveSpeed * max(0, deltaTime))
+            cameraPosition += SIMD3<Double>(
+                Double(movement.x) * distance,
+                Double(movement.y) * distance,
+                Double(movement.z) * distance
+            )
         }
 
         let cameraBlock = SIMD3<Int>(

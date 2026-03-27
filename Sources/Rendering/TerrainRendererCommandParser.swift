@@ -296,18 +296,10 @@ extension TerrainRenderer {
             switch commandName {
             case "tp":
                 var parser = TerrainRendererCommandArgumentParser(arguments)
-                let currentPosition = SIMD3<Double>(
-                    Double(cameraPosition.x),
-                    Double(cameraPosition.y),
-                    Double(cameraPosition.z)
-                )
+                let currentPosition = cameraPosition
                 let targetPosition = try parser.getNextPos(currentPosition: currentPosition)
                 try parser.end()
-                cameraPosition = SIMD3<Float>(
-                    Float(targetPosition.x),
-                    Float(targetPosition.y),
-                    Float(targetPosition.z)
-                )
+                cameraPosition = targetPosition
                 logCommandMessage(
                     "Teleported to (\(formatCommandNumber(targetPosition.x)), \(formatCommandNumber(targetPosition.y)), \(formatCommandNumber(targetPosition.z)))"
                 )

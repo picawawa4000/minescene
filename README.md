@@ -24,6 +24,11 @@ There's in-app documentation for these, but it's not that obvious, so this can't
   - `/waypoint info [name]` - Get information about a waypoint, or list all waypoints.
   - `/waypoint file <save|load> <file>` - Save waypoints to or load waypoints from a `.txt` file (extension not required in command). File location is platform-dependent.
 
+- `/colormap <file>` - Load biome colour overrides from a `.txt` file in the platform `minescene/colormaps` directory (extension not required in command).
+  - Line format: `<namespaced-biome-id> <red> <green> <blue>`.
+  - Biome IDs without a namespace default to `minecraft:`. (This is done primarily so that colourmaps from cubiomes-viewer can be directly loaded into MineScene with no modification.)
+  - Colour components must be decimal integers from `0` to `255`.
+
 - `/setting` - Configure settings. As of now, only really useful for keybinds.
   - `/setting set <setting> <value>` - Set the value of a setting.
   - `/setting get <setting>` - Get the current value of a setting.

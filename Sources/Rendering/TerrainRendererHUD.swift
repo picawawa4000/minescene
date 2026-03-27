@@ -25,10 +25,7 @@ extension TerrainRenderer {
         let debugLines = currentDebugHudLines()
         let promptDisplayText = currentCommandPromptDisplayText()
         let promptCursorVisible = isCommandPromptCursorVisible()
-        let hasActiveCommandLog = !commandLogEntries.isEmpty
-        let commandLogSignature = commandLogEntries.map { entry in
-            "\(entry.isError ? "error" : "info"):\(entry.message)"
-        }.joined(separator: "|")
+        let commandLogSignature = currentCommandLogSignature()
         let positionRuns = [
             HudTextRun(text: String(format: "X: %.1f ", cameraPosition.x), color: hudXColor),
             HudTextRun(text: String(format: "Y: %.1f ", cameraPosition.y), color: hudYColor),
@@ -45,7 +42,7 @@ extension TerrainRenderer {
             .flatMap { $0.map(\.text) }
             .joined(separator: "\n") + "\nprompt:\(promptDisplayText ?? ""):\(promptCursorVisible ? 1 : 0)\nlog:\(commandLogSignature)"
         let viewport = SIMD2<Int>(viewportWidth, viewportHeight)
-        guard hasActiveCommandLog || hudText != lastHudText || viewport != lastHudViewport || biomeText != lastHudBiome else {
+        guard hudText != lastHudText || viewport != lastHudViewport || biomeText != lastHudBiome else {
             return
         }
 
@@ -244,13 +241,19 @@ extension TerrainRenderer {
         let logLineHeight: Float = 18
         let logVerticalPadding: Float = 10
         let logSpacing: Float = 4
-        let visibleEntries = commandLogEntries.suffix(5).reversed()
+        let selectedHistoryIndex = commandPromptActive ? commandPromptHistoryIndex : nil
+        let visibleEntries = visibleCommandLogEntries().reversed()
         let maxColumns = max(1, Int(floor((viewportWidth - 24) / glyphAdvance)))
         var nextLineBottom = viewportHeight - promptBarHeight
 
         for entry in visibleEntries {
-            let fadeProgress = max(0, entry.age - commandLogHoldDuration) / commandLogFadeDuration
-            let fade = max(0, 1 - fadeProgress)
+            let fade: Float
+            if commandPromptActive {
+                fade = 1
+            } else {
+                let fadeProgress = max(0, entry.age - commandLogHoldDuration) / commandLogFadeDuration
+                fade = max(0, 1 - fadeProgress)
+            }
             guard fade > 0 else {
                 continue
             }
@@ -259,11 +262,15 @@ extension TerrainRenderer {
             let logBarHeight = logVerticalPadding + Float(wrappedLines.count) * logLineHeight
             let lineBottom = nextLineBottom
             let lineTop = lineBottom - logBarHeight
+            let isSelected = selectedHistoryIndex != nil && entry.commandHistoryIndex == selectedHistoryIndex
+            let backgroundBaseColor = isSelected
+                ? commandLogSelectedBackgroundColor
+                : commandLogBackgroundColor
             let backgroundColor = SIMD4<Float>(
-                commandLogBackgroundColor.x,
-                commandLogBackgroundColor.y,
-                commandLogBackgroundColor.z,
-                commandLogBackgroundColor.w * fade
+                backgroundBaseColor.x,
+                backgroundBaseColor.y,
+                backgroundBaseColor.z,
+                backgroundBaseColor.w * fade
             )
             let baseTextColor = entry.isError ? commandLogErrorColor : commandPromptTextColor
             let textColor = SIMD4<Float>(
@@ -293,6 +300,42 @@ extension TerrainRenderer {
             }
             nextLineBottom = lineTop - logSpacing
         }
+    }
+
+    private func visibleCommandLogEntries() -> ArraySlice<TerrainRendererCommandLogEntry> {
+        let visibleLimit = commandPromptActive ? commandPromptLogVisibleEntryLimit : commandLogVisibleEntryLimit
+        guard commandLogEntries.count > visibleLimit else {
+            return commandLogEntries[...]
+        }
+        let clampedOffset = min(commandLogScrollOffset, max(0, commandLogEntries.count - visibleLimit))
+        let upperBound = commandLogEntries.count - clampedOffset
+        let lowerBound = max(0, upperBound - visibleLimit)
+        return commandLogEntries[lowerBound..<upperBound]
+    }
+
+    private func currentCommandLogSignature() -> String {
+        let visibleEntries = visibleCommandLogEntries()
+        let selectedHistoryIndex = commandPromptActive ? commandPromptHistoryIndex : nil
+        return visibleEntries.enumerated().map { index, entry in
+            let fade: Float
+            if commandPromptActive {
+                fade = 1
+            } else {
+                let fadeProgress = max(0, entry.age - commandLogHoldDuration) / commandLogFadeDuration
+                fade = max(0, 1 - fadeProgress)
+            }
+            let isSelected = selectedHistoryIndex != nil && selectedHistoryIndex == entry.commandHistoryIndex
+            return [
+                String(index),
+                entry.isError ? "error" : "info",
+                entry.commandHistoryIndex.map(String.init) ?? "nil",
+                isSelected ? "selected" : "plain",
+                String(format: "%.3f", fade),
+                entry.message
+            ].joined(separator: ":")
+        }.joined(separator: "|")
+        + "#scroll:\(commandLogScrollOffset)"
+        + "#count:\(commandLogEntries.count)"
     }
 
     private func wrapCommandLogText(_ text: String, maxColumns: Int) -> [String] {

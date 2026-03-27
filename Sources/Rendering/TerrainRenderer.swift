@@ -955,7 +955,10 @@ final class TerrainRenderer {
     let commandPromptCursorBlinkPeriod: Float = 0.5
     let commandLogHoldDuration: Float = 5.0
     let commandLogFadeDuration: Float = 5.0
+    let commandLogVisibleEntryLimit = 5
+    let commandPromptLogVisibleEntryLimit = 10
     let commandLogBackgroundColor = SIMD4<Float>(0.0, 0.0, 0.0, 0.72)
+    let commandLogSelectedBackgroundColor = SIMD4<Float>(0.20, 0.28, 0.44, 0.92)
     let commandLogErrorColor = SIMD4<Float>(0.92, 0.28, 0.24, 1.0)
 
     var externalCommandExecutor: ((String, String, TerrainRenderer) throws -> Bool)?
@@ -990,6 +993,8 @@ final class TerrainRenderer {
     var commandPromptHistory: [String] = []
     var commandPromptHistoryIndex: Int?
     var commandLogEntries: [TerrainRendererCommandLogEntry] = []
+    var commandLogScrollOffset = 0
+    var activeCommandLogHistoryIndex: Int?
 
     init(
         worldGenerator: WorldGenerator,

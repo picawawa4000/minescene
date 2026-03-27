@@ -36,6 +36,11 @@ final class MineSceneApp {
         file save|load <file>: use the platform waypoint directory, with .txt implied.
         """
 
+        static let colormap = """
+        Usage: /colormap <file>
+        Load biome colours from the platform colormap directory, with .txt implied.
+        """
+
         static let setting = """
         Usage: /setting <subcommand>
         get <setting>: print the current value.
@@ -64,6 +69,8 @@ final class MineSceneApp {
         case waypointFileReadFailed(String)
         case waypointFileWriteFailed(String)
         case invalidWaypointFile(line: Int, reason: String)
+        case colormapFileReadFailed(String)
+        case invalidColormapFile(line: Int, reason: String)
 
         var description: String {
             switch self {
@@ -85,6 +92,10 @@ final class MineSceneApp {
                 return "failed to write waypoint file '\(name)'"
             case .invalidWaypointFile(let line, let reason):
                 return "invalid waypoint file at line \(line): \(reason)"
+            case .colormapFileReadFailed(let name):
+                return "failed to read colormap file '\(name)'"
+            case .invalidColormapFile(let line, let reason):
+                return "invalid colormap file at line \(line): \(reason)"
             }
         }
     }
@@ -120,7 +131,7 @@ final class MineSceneApp {
     private var biomeMapRenderer: BiomeMapViewRenderer?
     private var imageAvailable: VulkanOwnedSemaphore?
     private var renderFinishedByImage: [VulkanOwnedSemaphore] = []
-    private let biomeColorPalette = BiomeColorPalette.defaultPalette()
+    private var biomeColorPalette = BiomeColorPalette.defaultPalette()
     private let overworldSettingsKey = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
     private let renderDistanceSetting: Setting<IntSettingValue>
     private let keybindSettings: [KeybindAction: Setting<KeybindSettingValue>]
@@ -535,6 +546,7 @@ final class MineSceneApp {
                     "/tp <pos>: teleport the camera.",
                     "/seed <subcommand>: view or change the world seed.",
                     "/waypoint <subcommand>: manage saved waypoints.",
+                    "/colormap <file>: load a biome colormap file.",
                     "/setting <subcommand>: view or change settings."
                 ], renderer: renderer)
             } else {
@@ -661,6 +673,18 @@ final class MineSceneApp {
                 throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
             }
             return true
+        case "colormap":
+            var parser = TerrainRendererCommandArgumentParser(arguments)
+            let filepath = try parser.getNextLocalFilepath()
+            try parser.end()
+            let displayName = colormapFileDisplayName(for: filepath)
+            let palette = try loadColormap(
+                from: try colormapFileURL(for: filepath),
+                displayName: displayName
+            )
+            applyBiomeColorPalette(palette)
+            terrainRenderer?.logCommandMessage("Loaded colormap from \(displayName).")
+            return true
         case "setting":
             var parser = TerrainRendererCommandArgumentParser(arguments)
             let subcommand = try parser.getNextString()
@@ -704,27 +728,12 @@ final class MineSceneApp {
         let newWorldGenerator = try makeWorldGenerator(seed: seed)
         waitForGpuToFinishCurrentFrame()
 
-        let previousCameraPosition = terrainRenderer?.cameraPosition ?? SIMD3<Double>(x: 0, y: 160, z: 0)
-        let previousCameraYaw = terrainRenderer?.cameraYaw ?? -.pi / 4.0
-        let previousCameraPitch = terrainRenderer?.cameraPitch ?? -.pi / 5.5
-        let previousSmoothedFps = terrainRenderer?.smoothedFps ?? 0
-        let previousCommandLogEntries = terrainRenderer?.commandLogEntries ?? []
-        let previousCommandPromptHistory = terrainRenderer?.commandPromptHistory ?? []
-
         terrainRenderer?.discardChunkMeshes()
         biomeMapRenderer?.discardData()
 
         worldGenerator = newWorldGenerator
         currentWorldSeed = seed
-
-        let newTerrainRenderer = makeTerrainRenderer(worldGenerator: newWorldGenerator)
-        newTerrainRenderer.cameraPosition = previousCameraPosition
-        newTerrainRenderer.cameraYaw = previousCameraYaw
-        newTerrainRenderer.cameraPitch = previousCameraPitch
-        newTerrainRenderer.smoothedFps = previousSmoothedFps
-        newTerrainRenderer.commandLogEntries = previousCommandLogEntries
-        newTerrainRenderer.commandPromptHistory = previousCommandPromptHistory
-        terrainRenderer = newTerrainRenderer
+        replaceTerrainRenderer(worldGenerator: newWorldGenerator)
     }
 
     private func copyTextToClipboard(_ text: String) throws {
@@ -779,6 +788,8 @@ final class MineSceneApp {
             return CommandHelp.seed.split(separator: "\n").map(String.init)
         case "waypoint":
             return CommandHelp.waypoint.split(separator: "\n").map(String.init)
+        case "colormap":
+            return CommandHelp.colormap.split(separator: "\n").map(String.init)
         case "setting":
             return CommandHelp.setting.split(separator: "\n").map(String.init)
         default:
@@ -942,6 +953,10 @@ final class MineSceneApp {
         Self.appDataDirectoryURL().appendingPathComponent("waypoints", isDirectory: true)
     }
 
+    private func colormapFilesDirectoryURL() -> URL {
+        Self.appDataDirectoryURL().appendingPathComponent("colormaps", isDirectory: true)
+    }
+
     private func waypointFileURL(for localPath: String) throws -> URL {
         let normalizedPath: String
         if localPath.hasSuffix(".txt") {
@@ -960,6 +975,26 @@ final class MineSceneApp {
             normalizedPath = "\(localPath).txt"
         }
         return "\(Self.appDataDirectoryDisplayName())/waypoints/\(normalizedPath)"
+    }
+
+    private func colormapFileURL(for localPath: String) throws -> URL {
+        let normalizedPath: String
+        if localPath.hasSuffix(".txt") {
+            normalizedPath = localPath
+        } else {
+            normalizedPath = "\(localPath).txt"
+        }
+        return colormapFilesDirectoryURL().appendingPathComponent(normalizedPath, isDirectory: false)
+    }
+
+    private func colormapFileDisplayName(for localPath: String) -> String {
+        let normalizedPath: String
+        if localPath.hasSuffix(".txt") {
+            normalizedPath = localPath
+        } else {
+            normalizedPath = "\(localPath).txt"
+        }
+        return "\(Self.appDataDirectoryDisplayName())/colormaps/\(normalizedPath)"
     }
 
     private func saveWaypoints(to fileURL: URL, displayName: String) throws {
@@ -1016,6 +1051,102 @@ final class MineSceneApp {
         return loadedWaypointCount
     }
 
+    private func loadColormap(from fileURL: URL, displayName: String) throws -> BiomeColorPalette {
+        let contents: String
+        do {
+            contents = try String(contentsOf: fileURL, encoding: .utf8)
+        } catch {
+            throw CommandError.colormapFileReadFailed(displayName)
+        }
+
+        var overrides: [String: (UInt8, UInt8, UInt8, UInt8)] = [:]
+        let lines = contents.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        for (lineIndex, rawLine) in lines.enumerated() {
+            let lineNumber = lineIndex + 1
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty {
+                continue
+            }
+
+            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard parts.count == 4 else {
+                throw CommandError.invalidColormapFile(
+                    line: lineNumber,
+                    reason: "expected '<biome-id> <red> <green> <blue>'"
+                )
+            }
+
+            let biomeID = BiomeColorPalette.normalizedBiomeID(parts[0])
+            guard !biomeID.isEmpty else {
+                throw CommandError.invalidColormapFile(
+                    line: lineNumber,
+                    reason: "expected a biome identifier"
+                )
+            }
+
+            let red = try parseColormapComponent(parts[1], line: lineNumber, name: "red")
+            let green = try parseColormapComponent(parts[2], line: lineNumber, name: "green")
+            let blue = try parseColormapComponent(parts[3], line: lineNumber, name: "blue")
+            overrides[biomeID] = (red, green, blue, 255)
+        }
+
+        return BiomeColorPalette.defaultPalette().overridingColorsRGBA8(overrides)
+    }
+
+    private func parseColormapComponent(
+        _ token: String,
+        line: Int,
+        name: String
+    ) throws -> UInt8 {
+        guard !token.isEmpty, token.allSatisfy(Self.isASCIIDigit), let value = Int(token), (0...255).contains(value) else {
+            throw CommandError.invalidColormapFile(
+                line: line,
+                reason: "\(name) component '\(token)' is not a decimal number from 0 to 255"
+            )
+        }
+        return UInt8(value)
+    }
+
+    private func applyBiomeColorPalette(_ palette: BiomeColorPalette) {
+        guard let worldGenerator else {
+            biomeColorPalette = palette
+            return
+        }
+
+        waitForGpuToFinishCurrentFrame()
+        terrainRenderer?.discardChunkMeshes()
+        biomeMapRenderer?.discardData()
+        biomeColorPalette = palette
+        replaceTerrainRenderer(worldGenerator: worldGenerator)
+
+        if activeRenderer == .biomeMap, let terrainRenderer {
+            let biomeMapRenderer = BiomeMapViewRenderer(
+                worldGenerator: worldGenerator,
+                biomeColorPalette: biomeColorPalette
+            )
+            biomeMapRenderer.recenter(on: terrainRenderer.currentCameraPosition)
+            self.biomeMapRenderer = biomeMapRenderer
+        }
+    }
+
+    private func replaceTerrainRenderer(worldGenerator: WorldGenerator) {
+        let previousCameraPosition = terrainRenderer?.cameraPosition ?? SIMD3<Double>(x: 0, y: 160, z: 0)
+        let previousCameraYaw = terrainRenderer?.cameraYaw ?? -.pi / 4.0
+        let previousCameraPitch = terrainRenderer?.cameraPitch ?? -.pi / 5.5
+        let previousSmoothedFps = terrainRenderer?.smoothedFps ?? 0
+        let previousCommandLogEntries = terrainRenderer?.commandLogEntries ?? []
+        let previousCommandPromptHistory = terrainRenderer?.commandPromptHistory ?? []
+
+        let newTerrainRenderer = makeTerrainRenderer(worldGenerator: worldGenerator)
+        newTerrainRenderer.cameraPosition = previousCameraPosition
+        newTerrainRenderer.cameraYaw = previousCameraYaw
+        newTerrainRenderer.cameraPitch = previousCameraPitch
+        newTerrainRenderer.smoothedFps = previousSmoothedFps
+        newTerrainRenderer.commandLogEntries = previousCommandLogEntries
+        newTerrainRenderer.commandPromptHistory = previousCommandPromptHistory
+        terrainRenderer = newTerrainRenderer
+    }
+
     private func toggleRendererMode() {
         switch activeRenderer {
         case .terrain:
@@ -1063,5 +1194,9 @@ final class MineSceneApp {
         }
         let buffer = UnsafeBufferPointer(start: extensionsPtr, count: Int(count))
         return buffer.compactMap { $0 }.map { String(cString: $0) }
+    }
+
+    private static func isASCIIDigit(_ character: Character) -> Bool {
+        character >= "0" && character <= "9"
     }
 }

@@ -41,7 +41,6 @@ final class BiomeMapViewRenderer: @unchecked Sendable {
     private let gridScreenSpacing = 128
     private let gridLineColor = SIMD4<Float>(0.0, 0.0, 0.0, 0.18)
     private let biomeOverlayTextColor = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
-    private let gridTextColor = SIMD4<Float>(0.62, 0.52, 0.08, 1.0)
     private let biomeOverlayBackgroundColor = SIMD4<Float>(0.0, 0.0, 0.0, 0.55)
     private let zoomStepThreshold: Float = 3
     private let zoomWheelUnitsPerDisplayStep: Float = 8
@@ -395,38 +394,33 @@ final class BiomeMapViewRenderer: @unchecked Sendable {
         viewport: SIMD2<Int>,
         into vertices: inout [VulkanEngine.Vertex2D]
     ) {
+        let style = worldSpaceStyle(for: biomeOverlayStyle)
         let lineWidth = textWidth(hoveredBiomeText, style: biomeOverlayStyle)
         let paddingX = 8 as Float
         let paddingY = 6 as Float
         let originX = max(0, Float(viewport.x) - 12 - lineWidth)
+        let originScreen = SIMD2<Float>(originX, 12)
         let origin = worldPositionFloat(
-            atScreenPosition: SIMD2<Float>(originX, 12),
+            atScreenPosition: originScreen,
             viewport: viewport
         )
-        let backgroundOrigin = worldPositionFloat(
-            atScreenPosition: SIMD2<Float>(max(0, originX - paddingX), max(0, 12 - paddingY)),
+        let backgroundMin = worldPositionFloat(
+            atScreenPosition: SIMD2<Float>(originX - paddingX, 12 - paddingY),
             viewport: viewport
         )
         let backgroundMax = worldPositionFloat(
             atScreenPosition: SIMD2<Float>(
-                min(Float(viewport.x), originX + lineWidth + paddingX),
-                min(Float(viewport.y), 12 + biomeOverlayStyle.lineAdvance + paddingY)
+                originX + lineWidth + paddingX,
+                12 + biomeOverlayStyle.lineAdvance + paddingY
             ),
             viewport: viewport
         )
-        appendQuad(
-            minX: backgroundOrigin.x,
-            minY: backgroundOrigin.y,
-            maxX: backgroundMax.x,
-            maxY: backgroundMax.y,
-            color: biomeOverlayBackgroundColor,
-            into: &vertices
-        )
-        appendText(
+        appendTextWithBackground(
             hoveredBiomeText,
             origin: origin,
-            style: worldSpaceStyle(for: biomeOverlayStyle),
-            color: biomeOverlayTextColor,
+            style: style,
+            backgroundMin: backgroundMin,
+            backgroundMax: backgroundMax,
             into: &vertices
         )
     }
@@ -484,15 +478,47 @@ final class BiomeMapViewRenderer: @unchecked Sendable {
                     Float(worldX) + 4 * pixelWorldSize,
                     Float(worldZ) - labelStyle.lineAdvance
                 )
-                appendText(
+                appendTextWithBackground(
                     label,
                     origin: labelOrigin,
                     style: labelStyle,
-                    color: gridTextColor,
+                    backgroundMin: SIMD2<Float>(
+                        labelOrigin.x - 3 * pixelWorldSize,
+                        labelOrigin.y - 2 * pixelWorldSize
+                    ),
+                    backgroundMax: SIMD2<Float>(
+                        labelOrigin.x + textWidth(label, style: labelStyle) + 3 * pixelWorldSize,
+                        labelOrigin.y + labelStyle.lineAdvance + 2 * pixelWorldSize
+                    ),
                     into: &vertices
                 )
             }
         }
+    }
+
+    private func appendTextWithBackground(
+        _ text: String,
+        origin: SIMD2<Float>,
+        style: HudStyle,
+        backgroundMin: SIMD2<Float>,
+        backgroundMax: SIMD2<Float>,
+        into vertices: inout [VulkanEngine.Vertex2D]
+    ) {
+        appendQuad(
+            minX: backgroundMin.x,
+            minY: backgroundMin.y,
+            maxX: backgroundMax.x,
+            maxY: backgroundMax.y,
+            color: biomeOverlayBackgroundColor,
+            into: &vertices
+        )
+        appendText(
+            text,
+            origin: origin,
+            style: style,
+            color: biomeOverlayTextColor,
+            into: &vertices
+        )
     }
 
     private func appendText(

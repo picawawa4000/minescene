@@ -98,11 +98,10 @@ extension TerrainRenderer {
             if commandPromptActive {
                 commandPromptCursorElapsed += deltaTime
             }
-            if !commandLogEntries.isEmpty {
+            if !commandPromptActive, !commandLogEntries.isEmpty {
                 for index in commandLogEntries.indices {
                     commandLogEntries[index].age += deltaTime
                 }
-                commandLogEntries.removeAll { $0.age >= commandLogHoldDuration + commandLogFadeDuration }
             }
         }
 

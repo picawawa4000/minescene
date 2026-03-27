@@ -187,6 +187,7 @@ struct TerrainRendererCommandArgumentParser {
 struct TerrainRendererCommandLogEntry {
     let message: String
     let isError: Bool
+    let commandHistoryIndex: Int?
     var age: Float = 0
 }
 
@@ -205,6 +206,10 @@ extension TerrainRenderer {
                 navigateCommandPromptHistory(direction: -1)
             case SDLK_DOWN:
                 navigateCommandPromptHistory(direction: 1)
+            case SDLK_LEFT:
+                adjustCommandLogScroll(by: 1)
+            case SDLK_RIGHT:
+                adjustCommandLogScroll(by: -1)
             case SDLK_BACKSPACE:
                 beginEditingCommandPromptHistorySelectionIfNeeded()
                 if !commandPromptText.isEmpty {
@@ -230,6 +235,7 @@ extension TerrainRenderer {
         commandPromptText = ""
         commandPromptDraftText = ""
         commandPromptHistoryIndex = nil
+        commandLogScrollOffset = 0
         commandPromptCursorElapsed = 0
         resetMovementKeys()
         if let window {
@@ -245,6 +251,7 @@ extension TerrainRenderer {
         commandPromptText = ""
         commandPromptDraftText = ""
         commandPromptHistoryIndex = nil
+        commandLogScrollOffset = 0
         commandPromptCursorElapsed = 0
         if let window {
             _ = SDL_StopTextInput(window)
@@ -271,11 +278,15 @@ extension TerrainRenderer {
             return
         }
 
+        let historyIndex: Int
         if commandPromptHistory.last != trimmedCommand {
             commandPromptHistory.append(trimmedCommand)
             if commandPromptHistory.count > 100 {
                 commandPromptHistory.removeFirst(commandPromptHistory.count - 100)
             }
+            historyIndex = commandPromptHistory.count - 1
+        } else {
+            historyIndex = commandPromptHistory.count - 1
         }
         commandPromptDraftText = ""
         commandPromptHistoryIndex = nil
@@ -291,6 +302,10 @@ extension TerrainRenderer {
         }
 
         let commandLabel = "/\(commandName)"
+        activeCommandLogHistoryIndex = historyIndex
+        defer {
+            activeCommandLogHistoryIndex = nil
+        }
 
         do {
             switch commandName {
@@ -319,10 +334,13 @@ extension TerrainRenderer {
 
     func logCommandMessage(_ message: String, isError: Bool = false) {
         print(message)
-        commandLogEntries.append(TerrainRendererCommandLogEntry(message: message, isError: isError))
-        if commandLogEntries.count > 5 {
-            commandLogEntries.removeFirst(commandLogEntries.count - 5)
-        }
+        commandLogEntries.append(
+            TerrainRendererCommandLogEntry(
+                message: message,
+                isError: isError,
+                commandHistoryIndex: activeCommandLogHistoryIndex
+            )
+        )
     }
 
     func formatCommandNumber(_ value: Double) -> String {
@@ -382,5 +400,13 @@ extension TerrainRenderer {
         }
         commandPromptHistoryIndex = nil
         commandPromptDraftText = commandPromptText
+    }
+
+    private func adjustCommandLogScroll(by delta: Int) {
+        guard commandPromptActive else {
+            return
+        }
+        let maxOffset = max(0, commandLogEntries.count - commandPromptLogVisibleEntryLimit)
+        commandLogScrollOffset = min(max(0, commandLogScrollOffset + delta), maxOffset)
     }
 }

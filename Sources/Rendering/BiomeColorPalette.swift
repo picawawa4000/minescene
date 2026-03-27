@@ -10,7 +10,9 @@ struct BiomeColorPalette {
         colorsRGBA8: [String: (UInt8, UInt8, UInt8, UInt8)],
         fallbackRGBA8: (UInt8, UInt8, UInt8, UInt8) = (255, 0, 255, 255)
     ) {
-        self.colorsRGBA8 = colorsRGBA8
+        self.colorsRGBA8 = Dictionary(uniqueKeysWithValues: colorsRGBA8.map { biomeID, color in
+            (Self.normalizedBiomeID(biomeID), color)
+        })
         self.fallbackRGBA8 = fallbackRGBA8
     }
 
@@ -84,11 +86,32 @@ struct BiomeColorPalette {
         ])
     }
 
+    static func normalizedBiomeID(_ biomeID: String) -> String {
+        let trimmed = biomeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return trimmed
+        }
+        if trimmed.contains(":") {
+            return trimmed
+        }
+        return "minecraft:\(trimmed)"
+    }
+
+    func overridingColorsRGBA8(
+        _ overrides: [String: (UInt8, UInt8, UInt8, UInt8)]
+    ) -> Self {
+        var merged = colorsRGBA8
+        for (biomeID, color) in overrides {
+            merged[Self.normalizedBiomeID(biomeID)] = color
+        }
+        return Self(colorsRGBA8: merged, fallbackRGBA8: fallbackRGBA8)
+    }
+
     func rgba8(forBiomeID biomeID: String?) -> (UInt8, UInt8, UInt8, UInt8) {
         guard let biomeID else {
             return fallbackRGBA8
         }
-        return colorsRGBA8[biomeID] ?? fallbackRGBA8
+        return colorsRGBA8[Self.normalizedBiomeID(biomeID)] ?? fallbackRGBA8
     }
 
     func float4(forBiomeID biomeID: String?) -> SIMD4<Float> {

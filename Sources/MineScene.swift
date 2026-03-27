@@ -48,6 +48,7 @@ final class MineSceneApp {
         case terrain
         case biomeMap
         case debugBlockstates
+        case structureViewer
     }
 
     private struct Waypoint {
@@ -120,6 +121,7 @@ final class MineSceneApp {
     private var terrainRenderer: TerrainRenderer?
     private var biomeMapRenderer: BiomeMapViewRenderer?
     private var debugBlockStateRenderer: DebugBlockStateRenderer?
+    private var oceanMonumentStructureViewer: OceanMonumentStructureViewer?
     private var imageAvailable: VulkanOwnedSemaphore?
     private var renderFinishedByImage: [VulkanOwnedSemaphore] = []
     private let biomeColorPalette = BiomeColorPalette.defaultPalette()
@@ -139,6 +141,7 @@ final class MineSceneApp {
 
     init() throws {
         let environment = ProcessInfo.processInfo.environment
+        let structureViewerEnabled = environment["MINESCENE_STRUCTURE_VIEWER"] == "1"
         let debugBlockstatesEnabled = environment["MINESCENE_DEBUG_BLOCKSTATES"] == "1"
 
         Self.logStartupStep("initializing settings")
@@ -150,7 +153,7 @@ final class MineSceneApp {
         Self.logStartupStep("initializing SDL")
         self.sdl = try SDLRuntime()
 
-        if !debugBlockstatesEnabled {
+        if !debugBlockstatesEnabled && !structureViewerEnabled {
             Self.logStartupStep("loading datapack paths")
             let datapackPathURLs = try Self.loadOrPromptForDatapackPathURLs()
             Self.logStartupStep("loading \(datapackPathURLs.count) datapack(s)")
@@ -209,7 +212,7 @@ final class MineSceneApp {
         Self.loadSettingsFromDisk(settingsByName: settings.byName)
         self.currentWorldSeed = seed
         let worldGenerator: WorldGenerator?
-        if debugBlockstatesEnabled {
+        if debugBlockstatesEnabled || structureViewerEnabled {
             worldGenerator = nil
         } else {
             Self.logStartupStep("creating world generator")
@@ -218,10 +221,11 @@ final class MineSceneApp {
             self.worldGenerator = generatedWorld
         }
 
-        let texturedVertSpirvPath = debugBlockstatesEnabled
+        let texturedRenderingEnabled = debugBlockstatesEnabled || structureViewerEnabled
+        let texturedVertSpirvPath = texturedRenderingEnabled
             ? try Self.resourceURL(relativePath: "Shaders/SPIRV/textured3D.vert.spv").path
             : (try? Self.resourceURL(relativePath: "Shaders/SPIRV/textured3D.vert.spv").path)
-        let texturedFragSpirvPath = debugBlockstatesEnabled
+        let texturedFragSpirvPath = texturedRenderingEnabled
             ? try Self.resourceURL(relativePath: "Shaders/SPIRV/textured3D.frag.spv").path
             : (try? Self.resourceURL(relativePath: "Shaders/SPIRV/textured3D.frag.spv").path)
 
@@ -244,7 +248,11 @@ final class MineSceneApp {
         self.renderFinishedByImage = try engine.swapchainImages.map { _ in
             try engine.device.createSemaphore()
         }
-        if debugBlockstatesEnabled {
+        if structureViewerEnabled {
+            Self.logStartupStep("creating ocean monument structure viewer")
+            self.oceanMonumentStructureViewer = try makeOceanMonumentStructureViewer()
+            self.activeRenderer = .structureViewer
+        } else if debugBlockstatesEnabled {
             Self.logStartupStep("creating debug blockstate renderer")
             self.debugBlockStateRenderer = try makeDebugBlockStateRenderer()
             self.activeRenderer = .debugBlockstates
@@ -403,6 +411,14 @@ final class MineSceneApp {
                 imageAvailable: imageAvailable.semaphore,
                 renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
             )
+        case .structureViewer:
+            guard let oceanMonumentStructureViewer else { return }
+            try oceanMonumentStructureViewer.render(
+                engine: engine,
+                window: window?.pointer,
+                imageAvailable: imageAvailable.semaphore,
+                renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
+            )
         }
     }
 
@@ -414,6 +430,8 @@ final class MineSceneApp {
             biomeMapRenderer?.handleEvent(event, window: window?.pointer)
         case .debugBlockstates:
             debugBlockStateRenderer?.handleEvent(event, window: window?.pointer)
+        case .structureViewer:
+            oceanMonumentStructureViewer?.handleEvent(event, window: window?.pointer)
         }
     }
 
@@ -425,6 +443,8 @@ final class MineSceneApp {
             biomeMapRenderer?.update(deltaTime: deltaTime)
         case .debugBlockstates:
             debugBlockStateRenderer?.update(deltaTime: deltaTime)
+        case .structureViewer:
+            oceanMonumentStructureViewer?.update(deltaTime: deltaTime)
         }
     }
 
@@ -499,6 +519,25 @@ final class MineSceneApp {
     }
 
     private func makeDebugBlockStateRenderer() throws -> DebugBlockStateRenderer {
+        let repository = try makeVanillaAssetRepository()
+        let limit = ProcessInfo.processInfo.environment["MINESCENE_DEBUG_BLOCKSTATE_LIMIT"].flatMap(Int.init)
+        let renderer = DebugBlockStateRenderer(repository: repository, limit: limit)
+        renderer.keycodeForAction = { [weak self] action in
+            self?.keycode(for: action) ?? action.defaultValue.keycode
+        }
+        return renderer
+    }
+
+    private func makeOceanMonumentStructureViewer() throws -> OceanMonumentStructureViewer {
+        let repository = try makeVanillaAssetRepository()
+        let renderer = OceanMonumentStructureViewer(repository: repository)
+        renderer.keycodeForAction = { [weak self] action in
+            self?.keycode(for: action) ?? action.defaultValue.keycode
+        }
+        return renderer
+    }
+
+    private func makeVanillaAssetRepository() throws -> VanillaAssetRepository {
         let environment = ProcessInfo.processInfo.environment
         let requestedVersion = environment["MINESCENE_VANILLA_ASSETS_VERSION"]
         let requestedPath = environment["MINESCENE_VANILLA_ASSETS_PATH"].flatMap { path -> URL? in
@@ -507,19 +546,11 @@ final class MineSceneApp {
             }
             return URL(fileURLWithPath: path, isDirectory: true)
         }
-        let limit = environment["MINESCENE_DEBUG_BLOCKSTATE_LIMIT"].flatMap(Int.init)
-        let repository: VanillaAssetRepository
         if let requestedPath {
-            repository = try VanillaAssetRepository(rootURL: requestedPath.resolvingSymlinksInPath())
+            return try VanillaAssetRepository(rootURL: requestedPath.resolvingSymlinksInPath())
                 .validated()
-        } else {
-            repository = try VanillaAssetRepository.locate(version: requestedVersion)
         }
-        let renderer = DebugBlockStateRenderer(repository: repository, limit: limit)
-        renderer.keycodeForAction = { [weak self] action in
-            self?.keycode(for: action) ?? action.defaultValue.keycode
-        }
-        return renderer
+        return try VanillaAssetRepository.locate(version: requestedVersion)
     }
 
     private func handleTerrainCommand(
@@ -1041,7 +1072,7 @@ final class MineSceneApp {
             terrainRenderer?.requestChunkMeshRebuild()
             setRelativeMouseMode(enabled: true)
             activeRenderer = .terrain
-        case .debugBlockstates:
+        case .debugBlockstates, .structureViewer:
             return
         }
     }
@@ -1073,6 +1104,7 @@ final class MineSceneApp {
         terrainRenderer = nil
         biomeMapRenderer = nil
         debugBlockStateRenderer = nil
+        oceanMonumentStructureViewer = nil
         imageAvailable = nil
         renderFinishedByImage.removeAll()
         engine?.shutdown()

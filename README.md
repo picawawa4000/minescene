@@ -18,6 +18,10 @@ Set `MINESCENE_DEBUG_BLOCKSTATES=1` to launch the blockstate debug viewer instea
 - `MINESCENE_VANILLA_ASSETS_PATH=relative/path/to/1.21.11` to point directly at an extracted asset root containing `assets/`.
 - `MINESCENE_DEBUG_BLOCKSTATE_LIMIT=128` to cap how many blockstates are loaded into the debug strip.
 
+Set `MINESCENE_STRUCTURE_VIEWER=1` to launch the ocean monument structure viewer instead of terrain rendering. It uses DPReader's public ocean monument simulation for seed `123456789`, `startChunk (0, 0)`, and an all-air sampler, then normalizes the generated write volume so the viewer's local origin is `(0, 0, 0)`.
+
+Notes on gaps in the current DPReader ocean monument API are documented in [Docs/ocean-monument-api-holes.md](Docs/ocean-monument-api-holes.md).
+
 ## Commands
 
 There's in-app documentation for these, but it's not that obvious, so this can't hurt. (These may not be accurate or complete, as I wrote them from memory.)

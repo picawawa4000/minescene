@@ -143,7 +143,12 @@ final class MineSceneApp {
         Self.logStartupStep("loading datapack paths")
         let datapackPathURLs = try Self.loadOrPromptForDatapackPathURLs()
         Self.logStartupStep("loading \(datapackPathURLs.count) datapack(s)")
-        self.dataPacks = try datapackPathURLs.map { try DataPack(fromRootPath: $0) }
+        do {
+            self.dataPacks = try datapackPathURLs.map { try DataPack(fromRootPath: $0) }
+        } catch {
+            Self.logStartupError("loading datapacks", error: error)
+            throw error
+        }
 
         Self.logStartupStep("creating main window")
         let windowPtr = "MineScene".withCString { title in
@@ -197,25 +202,42 @@ final class MineSceneApp {
         Self.loadSettingsFromDisk(settingsByName: settings.byName)
         self.currentWorldSeed = seed
         Self.logStartupStep("creating world generator")
-        let worldGenerator = try makeWorldGenerator(seed: seed)
+        let worldGenerator: WorldGenerator
+        do {
+            worldGenerator = try makeWorldGenerator(seed: seed)
+        } catch {
+            Self.logStartupError("creating world generator", error: error)
+            throw error
+        }
         self.worldGenerator = worldGenerator
 
         Self.logStartupStep("creating Vulkan engine")
-        let engine = try VulkanEngine(
-            instance: instance,
-            surface: surface,
-            vertSpirvPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour2D.vert.spv").path,
-            fragSpirvPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour2D.frag.spv").path,
-            vertSpirv3DPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour3D.vert.spv").path,
-            fragSpirv3DPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour3D.frag.spv").path,
-            desiredExtent: .init(width: 1200, height: 840)
-        )
+        let engine: VulkanEngine
+        do {
+            engine = try VulkanEngine(
+                instance: instance,
+                surface: surface,
+                vertSpirvPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour2D.vert.spv").path,
+                fragSpirvPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour2D.frag.spv").path,
+                vertSpirv3DPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour3D.vert.spv").path,
+                fragSpirv3DPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour3D.frag.spv").path,
+                desiredExtent: .init(width: 1200, height: 840)
+            )
+        } catch {
+            Self.logStartupError("creating Vulkan engine", error: error)
+            throw error
+        }
         self.engine = engine
 
         Self.logStartupStep("creating synchronization primitives")
-        self.imageAvailable = try engine.device.createSemaphore()
-        self.renderFinishedByImage = try engine.swapchainImages.map { _ in
-            try engine.device.createSemaphore()
+        do {
+            self.imageAvailable = try engine.device.createSemaphore()
+            self.renderFinishedByImage = try engine.swapchainImages.map { _ in
+                try engine.device.createSemaphore()
+            }
+        } catch {
+            Self.logStartupError("creating synchronization primitives", error: error)
+            throw error
         }
         Self.logStartupStep("creating terrain renderer")
         self.terrainRenderer = makeTerrainRenderer(worldGenerator: worldGenerator)
@@ -241,6 +263,10 @@ final class MineSceneApp {
 
     private static func logStartupStep(_ message: String) {
         FileHandle.standardError.write(Data("Startup: \(message)\n".utf8))
+    }
+
+    private static func logStartupError(_ step: String, error: Error) {
+        FileHandle.standardError.write(Data("Startup error during \(step): \(error)\n".utf8))
     }
 
     private static func resourceURL(relativePath: String, isDirectory: Bool = false) throws -> URL {

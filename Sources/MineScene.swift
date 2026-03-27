@@ -47,6 +47,7 @@ final class MineSceneApp {
     private enum ActiveRenderer {
         case terrain
         case biomeMap
+        case debugBlockstates
     }
 
     private struct Waypoint {
@@ -118,6 +119,7 @@ final class MineSceneApp {
     private var worldGenerator: WorldGenerator?
     private var terrainRenderer: TerrainRenderer?
     private var biomeMapRenderer: BiomeMapViewRenderer?
+    private var debugBlockStateRenderer: DebugBlockStateRenderer?
     private var imageAvailable: VulkanOwnedSemaphore?
     private var renderFinishedByImage: [VulkanOwnedSemaphore] = []
     private let biomeColorPalette = BiomeColorPalette.defaultPalette()
@@ -131,6 +133,9 @@ final class MineSceneApp {
     private var activeRenderer: ActiveRenderer = .terrain
 
     init() throws {
+        let environment = ProcessInfo.processInfo.environment
+        let debugBlockstatesEnabled = environment["MINESCENE_DEBUG_BLOCKSTATES"] == "1"
+
         Self.logStartupStep("initializing settings")
         let settings = Self.makeSettings()
         self.renderDistanceSetting = settings.renderDistance
@@ -140,10 +145,12 @@ final class MineSceneApp {
         Self.logStartupStep("initializing SDL")
         self.sdl = try SDLRuntime()
 
-        Self.logStartupStep("loading datapack paths")
-        let datapackPathURLs = try Self.loadOrPromptForDatapackPathURLs()
-        Self.logStartupStep("loading \(datapackPathURLs.count) datapack(s)")
-        self.dataPacks = try datapackPathURLs.map { try DataPack(fromRootPath: $0) }
+        if !debugBlockstatesEnabled {
+            Self.logStartupStep("loading datapack paths")
+            let datapackPathURLs = try Self.loadOrPromptForDatapackPathURLs()
+            Self.logStartupStep("loading \(datapackPathURLs.count) datapack(s)")
+            self.dataPacks = try datapackPathURLs.map { try DataPack(fromRootPath: $0) }
+        }
 
         Self.logStartupStep("creating main window")
         let windowPtr = "MineScene".withCString { title in
@@ -153,7 +160,7 @@ final class MineSceneApp {
             throw SDL_Error.error
         }
         self.window = SDLObject<OpaquePointer>(windowPtr, tag: .custom("window"), destroy: { SDL_DestroyWindow($0) })
-        if !SDL_SetWindowRelativeMouseMode(windowPtr, true) {
+        if !SDL_SetWindowRelativeMouseMode(windowPtr, !debugBlockstatesEnabled) {
             throw SDL_Error.error
         }
 
@@ -196,9 +203,22 @@ final class MineSceneApp {
         Self.logStartupStep("loading persisted settings")
         Self.loadSettingsFromDisk(settingsByName: settings.byName)
         self.currentWorldSeed = seed
-        Self.logStartupStep("creating world generator")
-        let worldGenerator = try makeWorldGenerator(seed: seed)
-        self.worldGenerator = worldGenerator
+        let worldGenerator: WorldGenerator?
+        if debugBlockstatesEnabled {
+            worldGenerator = nil
+        } else {
+            Self.logStartupStep("creating world generator")
+            let generatedWorld = try makeWorldGenerator(seed: seed)
+            worldGenerator = generatedWorld
+            self.worldGenerator = generatedWorld
+        }
+
+        let texturedVertSpirvPath = debugBlockstatesEnabled
+            ? try Self.resourceURL(relativePath: "Shaders/SPIRV/textured3D.vert.spv").path
+            : (try? Self.resourceURL(relativePath: "Shaders/SPIRV/textured3D.vert.spv").path)
+        let texturedFragSpirvPath = debugBlockstatesEnabled
+            ? try Self.resourceURL(relativePath: "Shaders/SPIRV/textured3D.frag.spv").path
+            : (try? Self.resourceURL(relativePath: "Shaders/SPIRV/textured3D.frag.spv").path)
 
         Self.logStartupStep("creating Vulkan engine")
         let engine = try VulkanEngine(
@@ -208,6 +228,8 @@ final class MineSceneApp {
             fragSpirvPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour2D.frag.spv").path,
             vertSpirv3DPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour3D.vert.spv").path,
             fragSpirv3DPath: try Self.resourceURL(relativePath: "Shaders/SPIRV/colour3D.frag.spv").path,
+            vertSpirvTextured3DPath: texturedVertSpirvPath,
+            fragSpirvTextured3DPath: texturedFragSpirvPath,
             desiredExtent: .init(width: 1200, height: 840)
         )
         self.engine = engine
@@ -217,8 +239,14 @@ final class MineSceneApp {
         self.renderFinishedByImage = try engine.swapchainImages.map { _ in
             try engine.device.createSemaphore()
         }
-        Self.logStartupStep("creating terrain renderer")
-        self.terrainRenderer = makeTerrainRenderer(worldGenerator: worldGenerator)
+        if debugBlockstatesEnabled {
+            Self.logStartupStep("creating debug blockstate renderer")
+            self.debugBlockStateRenderer = try makeDebugBlockStateRenderer()
+            self.activeRenderer = .debugBlockstates
+        } else if let worldGenerator {
+            Self.logStartupStep("creating terrain renderer")
+            self.terrainRenderer = makeTerrainRenderer(worldGenerator: worldGenerator)
+        }
         Self.logStartupStep("startup complete")
     }
 
@@ -331,6 +359,7 @@ final class MineSceneApp {
 
         terrainRenderer = nil
         biomeMapRenderer = nil
+        debugBlockStateRenderer = nil
         imageAvailable = nil
         renderFinishedByImage.removeAll()
         engine?.shutdown()
@@ -374,6 +403,14 @@ final class MineSceneApp {
                 imageAvailable: imageAvailable.semaphore,
                 renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
             )
+        case .debugBlockstates:
+            guard let debugBlockStateRenderer else { return }
+            try debugBlockStateRenderer.render(
+                engine: engine,
+                window: window?.pointer,
+                imageAvailable: imageAvailable.semaphore,
+                renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
+            )
         }
     }
 
@@ -383,6 +420,8 @@ final class MineSceneApp {
             terrainRenderer?.handleEvent(event, window: window?.pointer)
         case .biomeMap:
             biomeMapRenderer?.handleEvent(event, window: window?.pointer)
+        case .debugBlockstates:
+            debugBlockStateRenderer?.handleEvent(event, window: window?.pointer)
         }
     }
 
@@ -392,6 +431,8 @@ final class MineSceneApp {
             terrainRenderer?.update(deltaTime: deltaTime)
         case .biomeMap:
             biomeMapRenderer?.update(deltaTime: deltaTime)
+        case .debugBlockstates:
+            debugBlockStateRenderer?.update(deltaTime: deltaTime)
         }
     }
 
@@ -463,6 +504,14 @@ final class MineSceneApp {
             self?.updateRenderDistanceSetting(renderDistance)
         }
         return renderer
+    }
+
+    private func makeDebugBlockStateRenderer() throws -> DebugBlockStateRenderer {
+        let environment = ProcessInfo.processInfo.environment
+        let requestedVersion = environment["MINESCENE_VANILLA_ASSETS_VERSION"]
+        let limit = environment["MINESCENE_DEBUG_BLOCKSTATE_LIMIT"].flatMap(Int.init)
+        let repository = try VanillaAssetRepository.locate(version: requestedVersion)
+        return DebugBlockStateRenderer(repository: repository, limit: limit)
     }
 
     private func handleTerrainCommand(
@@ -984,6 +1033,8 @@ final class MineSceneApp {
             terrainRenderer?.requestChunkMeshRebuild()
             setRelativeMouseMode(enabled: true)
             activeRenderer = .terrain
+        case .debugBlockstates:
+            return
         }
     }
 

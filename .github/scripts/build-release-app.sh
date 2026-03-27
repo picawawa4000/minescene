@@ -28,6 +28,8 @@ compile_shaders() {
       "$spirv_dir/colour2D.frag.spv"
       "$spirv_dir/colour3D.vert.spv"
       "$spirv_dir/colour3D.frag.spv"
+      "$spirv_dir/textured3D.vert.spv"
+      "$spirv_dir/textured3D.frag.spv"
     )
     local output
     for output in "${required_outputs[@]}"; do
@@ -43,6 +45,8 @@ compile_shaders() {
   "$shader_compiler" -V -D -S frag -e mainPS -o "$spirv_dir/colour2D.frag.spv" "$shader_dir/colour2D.slang"
   "$shader_compiler" -V -D -S vert -e mainVS -o "$spirv_dir/colour3D.vert.spv" "$shader_dir/colour3D.slang"
   "$shader_compiler" -V -D -S frag -e mainPS -o "$spirv_dir/colour3D.frag.spv" "$shader_dir/colour3D.slang"
+  "$shader_compiler" -V -D -S vert -e mainVS -o "$spirv_dir/textured3D.vert.spv" "$shader_dir/textured3D.slang"
+  "$shader_compiler" -V -D -S frag -e mainPS -o "$spirv_dir/textured3D.frag.spv" "$shader_dir/textured3D.slang"
 }
 
 require_file() {

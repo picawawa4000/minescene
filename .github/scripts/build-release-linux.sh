@@ -27,6 +27,8 @@ compile_shaders() {
   "$shader_compiler" -V -D -S frag -e mainPS -o "$spirv_dir/colour2D.frag.spv" "$shader_dir/colour2D.slang"
   "$shader_compiler" -V -D -S vert -e mainVS -o "$spirv_dir/colour3D.vert.spv" "$shader_dir/colour3D.slang"
   "$shader_compiler" -V -D -S frag -e mainPS -o "$spirv_dir/colour3D.frag.spv" "$shader_dir/colour3D.slang"
+  "$shader_compiler" -V -D -S vert -e mainVS -o "$spirv_dir/textured3D.vert.spv" "$shader_dir/textured3D.slang"
+  "$shader_compiler" -V -D -S frag -e mainPS -o "$spirv_dir/textured3D.frag.spv" "$shader_dir/textured3D.slang"
 }
 
 find_first_existing() {

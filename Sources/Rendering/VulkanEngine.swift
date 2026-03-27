@@ -25,6 +25,7 @@ final class VulkanEngine {
         var renderPass: VulkanOwnedRenderPass?
         var mode2D: DrawingMode2D?
         var mode3D: DrawingMode3D?
+        var modeTextured3D: DrawingModeTextured3D?
 
         init(
             commandPool: VulkanOwnedCommandPool,
@@ -42,7 +43,8 @@ final class VulkanEngine {
             swapchainExtent: VkExtent2D,
             renderPass: VulkanOwnedRenderPass,
             mode2D: DrawingMode2D,
-            mode3D: DrawingMode3D
+            mode3D: DrawingMode3D,
+            modeTextured3D: DrawingModeTextured3D?
         ) {
             self.commandPool = commandPool
             self.commandBuffer = commandBuffer
@@ -60,10 +62,12 @@ final class VulkanEngine {
             self.renderPass = renderPass
             self.mode2D = mode2D
             self.mode3D = mode3D
+            self.modeTextured3D = modeTextured3D
         }
 
         deinit {
             // Explicit teardown order: pipelines -> framebuffers -> render pass -> depth -> views -> swapchain -> command pool.
+            modeTextured3D = nil
             mode3D = nil
             mode2D = nil
             swapchainFramebuffers = nil
@@ -103,6 +107,14 @@ final class VulkanEngine {
         static let view: UInt32 = 2
     }
 
+    enum DescriptorBindingsTextured3D {
+        static let transform: UInt32 = 0
+        static let model: UInt32 = 1
+        static let view: UInt32 = 2
+        static let texture: UInt32 = 3
+        static let sampler: UInt32 = 4
+    }
+
     struct Vertex2D {
         var position: SIMD2<Float>
         var color: SIMD4<Float>
@@ -113,12 +125,24 @@ final class VulkanEngine {
         var color: SIMD4<Float>
     }
 
+    struct VertexTextured3D {
+        var position: SIMD3<Float>
+        var color: SIMD4<Float>
+        var textureCoordinates: SIMD2<Float>
+    }
+
     struct DrawBatch2D {
         let buffer: VulkanOwnedBuffer
         let vertexCount: UInt32
     }
 
     struct DrawBatch3D {
+        let buffer: VulkanOwnedBuffer
+        let vertexCount: UInt32
+        let modelOffset: SIMD4<Float>
+    }
+
+    struct DrawBatchTextured3D {
         let buffer: VulkanOwnedBuffer
         let vertexCount: UInt32
         let modelOffset: SIMD4<Float>
@@ -135,6 +159,20 @@ final class VulkanEngine {
 
         deinit {
             vkDestroyDescriptorSetLayout(self.device, self.descriptorSetLayout, nil)
+        }
+    }
+
+    final class VulkanOwnedSampler {
+        let sampler: VkSampler
+        private let device: VkDevice
+
+        init(device: VkDevice, sampler: VkSampler) {
+            self.device = device
+            self.sampler = sampler
+        }
+
+        deinit {
+            vkDestroySampler(self.device, self.sampler, nil)
         }
     }
 
@@ -160,6 +198,29 @@ final class VulkanEngine {
         let modelUniformMemory: VulkanOwnedDeviceMemory
         let viewUniformBuffer: VulkanOwnedBuffer
         let viewUniformMemory: VulkanOwnedDeviceMemory
+    }
+
+    struct DrawingModeTextured3D {
+        let descriptorSetLayout: VulkanOwnedDescriptorSetLayout
+        let pipelineLayout: VulkanOwnedPipelineLayout
+        let pipeline: VulkanOwnedPipeline
+        let descriptorPool: VulkanOwnedDescriptorPool
+        let descriptorSet: VkDescriptorSet
+        let transformUniformBuffer: VulkanOwnedBuffer
+        let transformUniformMemory: VulkanOwnedDeviceMemory
+        let modelUniformBuffer: VulkanOwnedBuffer
+        let modelUniformMemory: VulkanOwnedDeviceMemory
+        let viewUniformBuffer: VulkanOwnedBuffer
+        let viewUniformMemory: VulkanOwnedDeviceMemory
+    }
+
+    struct Texture2D {
+        let image: VulkanOwnedImage
+        let memory: VulkanOwnedDeviceMemory
+        let imageView: VulkanOwnedImageView
+        let sampler: VulkanOwnedSampler
+        let width: Int
+        let height: Int
     }
 
     final class VulkanOwnedDescriptorPool {
@@ -203,6 +264,8 @@ final class VulkanEngine {
     var renderPass: VulkanOwnedRenderPass { resources!.renderPass! }
     var mode2D: DrawingMode2D { resources!.mode2D! }
     var mode3D: DrawingMode3D { resources!.mode3D! }
+    var modeTextured3D: DrawingModeTextured3D { resources!.modeTextured3D! }
+    var hasTextured3DPipeline: Bool { resources?.modeTextured3D != nil }
 
     /// Creates a new Vulkan engine.
     /// Parameters:
@@ -218,6 +281,8 @@ final class VulkanEngine {
         fragSpirv: [UInt32],
         vertSpirv3D: [UInt32]? = nil,
         fragSpirv3D: [UInt32]? = nil,
+        vertSpirvTextured3D: [UInt32]? = nil,
+        fragSpirvTextured3D: [UInt32]? = nil,
         validationLayers: [String]? = nil,
         desiredExtent: VkExtent2D = VkExtent2D(width: 640, height: 480)
     ) throws {
@@ -411,6 +476,95 @@ final class VulkanEngine {
             viewUniformMemory: mode3DViewUniformMemory
         )
 
+        let modeTextured3D: DrawingModeTextured3D?
+        if let vertSpirvTextured3D, let fragSpirvTextured3D {
+            let texturedLayout = try VulkanEngine.createDescriptorSetLayoutTextured3D(device: self.device)
+            let texturedPushConstantRange = VkPushConstantRange(
+                stageFlags: VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT.rawValue),
+                offset: 0,
+                size: UInt32(MemoryLayout<SIMD4<Float>>.stride)
+            )
+            let texturedPipelineLayout = try VulkanEngine.createPipelineLayout(
+                device: self.device,
+                descriptorSetLayout: texturedLayout,
+                pushConstantRange: texturedPushConstantRange
+            )
+            let texturedDescriptorPool = try VulkanEngine.createDescriptorPool(
+                device: self.device,
+                maxSets: 1,
+                poolSizes: [
+                    VkDescriptorPoolSize(type: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, descriptorCount: 3),
+                    VkDescriptorPoolSize(type: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, descriptorCount: 1),
+                    VkDescriptorPoolSize(type: VK_DESCRIPTOR_TYPE_SAMPLER, descriptorCount: 1)
+                ]
+            )
+            let texturedDescriptorSet = try VulkanEngine.allocateDescriptorSet(
+                device: self.device,
+                descriptorPool: texturedDescriptorPool,
+                layout: texturedLayout
+            )
+            let (texturedTransformUniformBuffer, texturedTransformUniformMemory) = try VulkanEngine.createUniformBuffer3D(
+                device: self.device,
+                physicalDevice: self.physicalDevice
+            )
+            let (texturedModelUniformBuffer, texturedModelUniformMemory) = try VulkanEngine.createUniformBuffer3D(
+                device: self.device,
+                physicalDevice: self.physicalDevice
+            )
+            let (texturedViewUniformBuffer, texturedViewUniformMemory) = try VulkanEngine.createUniformBuffer3D(
+                device: self.device,
+                physicalDevice: self.physicalDevice
+            )
+            VulkanEngine.updateDescriptorSet(
+                device: self.device,
+                descriptorSet: texturedDescriptorSet,
+                binding: DescriptorBindingsTextured3D.transform,
+                buffer: texturedTransformUniformBuffer,
+                range: VkDeviceSize(MemoryLayout<Float>.size * 16)
+            )
+            VulkanEngine.updateDescriptorSet(
+                device: self.device,
+                descriptorSet: texturedDescriptorSet,
+                binding: DescriptorBindingsTextured3D.model,
+                buffer: texturedModelUniformBuffer,
+                range: VkDeviceSize(MemoryLayout<Float>.size * 16)
+            )
+            VulkanEngine.updateDescriptorSet(
+                device: self.device,
+                descriptorSet: texturedDescriptorSet,
+                binding: DescriptorBindingsTextured3D.view,
+                buffer: texturedViewUniformBuffer,
+                range: VkDeviceSize(MemoryLayout<Float>.size * 16)
+            )
+            let texturedPipeline = try VulkanEngine.createPipeline(
+                device: self.device,
+                renderPass: renderPass,
+                extent: swapchainBundle.extent,
+                pipelineLayout: texturedPipelineLayout,
+                vertexInput: VulkanEngine.vertexInputTextured3D(),
+                cullMode: VkCullModeFlags(VK_CULL_MODE_BACK_BIT.rawValue),
+                enableDepthTest: true,
+                enableBlending: false,
+                vertSpirv: vertSpirvTextured3D,
+                fragSpirv: fragSpirvTextured3D
+            )
+            modeTextured3D = DrawingModeTextured3D(
+                descriptorSetLayout: texturedLayout,
+                pipelineLayout: texturedPipelineLayout,
+                pipeline: texturedPipeline,
+                descriptorPool: texturedDescriptorPool,
+                descriptorSet: texturedDescriptorSet,
+                transformUniformBuffer: texturedTransformUniformBuffer,
+                transformUniformMemory: texturedTransformUniformMemory,
+                modelUniformBuffer: texturedModelUniformBuffer,
+                modelUniformMemory: texturedModelUniformMemory,
+                viewUniformBuffer: texturedViewUniformBuffer,
+                viewUniformMemory: texturedViewUniformMemory
+            )
+        } else {
+            modeTextured3D = nil
+        }
+
         self.resources = Resources(
             commandPool: commandBundle.commandPool,
             commandBuffer: commandBundle.commandBuffer,
@@ -427,7 +581,8 @@ final class VulkanEngine {
             swapchainExtent: swapchainBundle.extent,
             renderPass: renderPass,
             mode2D: mode2D,
-            mode3D: mode3D
+            mode3D: mode3D,
+            modeTextured3D: modeTextured3D
         )
     }
 
@@ -438,6 +593,8 @@ final class VulkanEngine {
         fragSpirvPath: String,
         vertSpirv3DPath: String? = nil,
         fragSpirv3DPath: String? = nil,
+        vertSpirvTextured3DPath: String? = nil,
+        fragSpirvTextured3DPath: String? = nil,
         validationLayers: [String]? = nil,
         desiredExtent: VkExtent2D = VkExtent2D(width: 640, height: 480)
     ) throws {
@@ -445,6 +602,8 @@ final class VulkanEngine {
         let fragCode = try VulkanEngine.loadSpirvWords(from: fragSpirvPath)
         let vertCode3D = try vertSpirv3DPath.map { try VulkanEngine.loadSpirvWords(from: $0) }
         let fragCode3D = try fragSpirv3DPath.map { try VulkanEngine.loadSpirvWords(from: $0) }
+        let vertCodeTextured3D = try vertSpirvTextured3DPath.map { try VulkanEngine.loadSpirvWords(from: $0) }
+        let fragCodeTextured3D = try fragSpirvTextured3DPath.map { try VulkanEngine.loadSpirvWords(from: $0) }
         try self.init(
             instance: instance,
             surface: surface,
@@ -452,6 +611,8 @@ final class VulkanEngine {
             fragSpirv: fragCode,
             vertSpirv3D: vertCode3D,
             fragSpirv3D: fragCode3D,
+            vertSpirvTextured3D: vertCodeTextured3D,
+            fragSpirvTextured3D: fragCodeTextured3D,
             validationLayers: validationLayers,
             desiredExtent: desiredExtent
         )
@@ -1159,6 +1320,58 @@ final class VulkanEngine {
         }
     }
 
+    private static func createDescriptorSetLayoutTextured3D(device: VulkanOwnedDevice) throws -> VulkanOwnedDescriptorSetLayout {
+        var bindings = [
+            VkDescriptorSetLayoutBinding(
+                binding: DescriptorBindingsTextured3D.transform,
+                descriptorType: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                descriptorCount: 1,
+                stageFlags: VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT.rawValue),
+                pImmutableSamplers: nil
+            ),
+            VkDescriptorSetLayoutBinding(
+                binding: DescriptorBindingsTextured3D.model,
+                descriptorType: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                descriptorCount: 1,
+                stageFlags: VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT.rawValue),
+                pImmutableSamplers: nil
+            ),
+            VkDescriptorSetLayoutBinding(
+                binding: DescriptorBindingsTextured3D.view,
+                descriptorType: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                descriptorCount: 1,
+                stageFlags: VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT.rawValue),
+                pImmutableSamplers: nil
+            ),
+            VkDescriptorSetLayoutBinding(
+                binding: DescriptorBindingsTextured3D.texture,
+                descriptorType: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                descriptorCount: 1,
+                stageFlags: VkShaderStageFlags(VK_SHADER_STAGE_FRAGMENT_BIT.rawValue),
+                pImmutableSamplers: nil
+            ),
+            VkDescriptorSetLayoutBinding(
+                binding: DescriptorBindingsTextured3D.sampler,
+                descriptorType: VK_DESCRIPTOR_TYPE_SAMPLER,
+                descriptorCount: 1,
+                stageFlags: VkShaderStageFlags(VK_SHADER_STAGE_FRAGMENT_BIT.rawValue),
+                pImmutableSamplers: nil
+            )
+        ]
+        var layout: VkDescriptorSetLayout?
+        return try bindings.withUnsafeMutableBufferPointer { bindingsPtr in
+            var createInfo = VkDescriptorSetLayoutCreateInfo(
+                sType: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                pNext: nil,
+                flags: 0,
+                bindingCount: UInt32(bindingsPtr.count),
+                pBindings: bindingsPtr.baseAddress
+            )
+            try VulkanEngine.vulkanResultCheck(vkCreateDescriptorSetLayout(device.device, &createInfo, nil, &layout))
+            return VulkanOwnedDescriptorSetLayout(device: device.device, descriptorSetLayout: layout!)
+        }
+    }
+
     private static func createPipelineLayout(
         device: VulkanOwnedDevice,
         descriptorSetLayout: VulkanOwnedDescriptorSetLayout,
@@ -1253,6 +1466,63 @@ final class VulkanEngine {
                 descriptorType: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                 pImageInfo: nil,
                 pBufferInfo: bufferInfoPtr,
+                pTexelBufferView: nil
+            )
+            vkUpdateDescriptorSets(device.device, 1, &write, 0, nil)
+        }
+    }
+
+    private static func updateDescriptorSet(
+        device: VulkanOwnedDevice,
+        descriptorSet: VkDescriptorSet,
+        binding: UInt32,
+        imageView: VulkanOwnedImageView,
+        layout: VkImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    ) {
+        var imageInfo = VkDescriptorImageInfo(
+            sampler: nil,
+            imageView: imageView.imageView,
+            imageLayout: layout
+        )
+        withUnsafePointer(to: &imageInfo) { imageInfoPtr in
+            var write = VkWriteDescriptorSet(
+                sType: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                pNext: nil,
+                dstSet: descriptorSet,
+                dstBinding: binding,
+                dstArrayElement: 0,
+                descriptorCount: 1,
+                descriptorType: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                pImageInfo: imageInfoPtr,
+                pBufferInfo: nil,
+                pTexelBufferView: nil
+            )
+            vkUpdateDescriptorSets(device.device, 1, &write, 0, nil)
+        }
+    }
+
+    private static func updateDescriptorSet(
+        device: VulkanOwnedDevice,
+        descriptorSet: VkDescriptorSet,
+        binding: UInt32,
+        sampler: VulkanOwnedSampler
+    ) {
+        var imageInfo = VkDescriptorImageInfo(
+            sampler: sampler.sampler,
+            imageView: nil,
+            imageLayout: VK_IMAGE_LAYOUT_UNDEFINED
+        )
+        withUnsafePointer(to: &imageInfo) { imageInfoPtr in
+            var write = VkWriteDescriptorSet(
+                sType: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                pNext: nil,
+                dstSet: descriptorSet,
+                dstBinding: binding,
+                dstArrayElement: 0,
+                descriptorCount: 1,
+                descriptorType: VK_DESCRIPTOR_TYPE_SAMPLER,
+                pImageInfo: imageInfoPtr,
+                pBufferInfo: nil,
                 pTexelBufferView: nil
             )
             vkUpdateDescriptorSets(device.device, 1, &write, 0, nil)
@@ -1401,6 +1671,38 @@ final class VulkanEngine {
         return VertexInputDescription(bindings: [binding], attributes: attributes)
     }
 
+    private static func vertexInputTextured3D() -> VertexInputDescription {
+        let binding = VkVertexInputBindingDescription(
+            binding: 0,
+            stride: UInt32(MemoryLayout<VertexTextured3D>.stride),
+            inputRate: VK_VERTEX_INPUT_RATE_VERTEX
+        )
+        let positionOffset = UInt32(MemoryLayout<VertexTextured3D>.offset(of: \.position) ?? 0)
+        let colorOffset = UInt32(MemoryLayout<VertexTextured3D>.offset(of: \.color) ?? 0)
+        let textureCoordinateOffset = UInt32(MemoryLayout<VertexTextured3D>.offset(of: \.textureCoordinates) ?? 0)
+        let attributes = [
+            VkVertexInputAttributeDescription(
+                location: 0,
+                binding: 0,
+                format: VK_FORMAT_R32G32B32_SFLOAT,
+                offset: positionOffset
+            ),
+            VkVertexInputAttributeDescription(
+                location: 1,
+                binding: 0,
+                format: VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: colorOffset
+            ),
+            VkVertexInputAttributeDescription(
+                location: 2,
+                binding: 0,
+                format: VK_FORMAT_R32G32_SFLOAT,
+                offset: textureCoordinateOffset
+            )
+        ]
+        return VertexInputDescription(bindings: [binding], attributes: attributes)
+    }
+
     func uploadVertices2D(_ vertices: [Vertex2D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         try uploadVertices(
             vertices,
@@ -1418,6 +1720,12 @@ final class VulkanEngine {
         try createVertexBuffer(vertices)
     }
 
+    func createVertexBufferTextured3D(
+        _ vertices: [VertexTextured3D]
+    ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        try createVertexBuffer(vertices)
+    }
+
     func createVertexBuffer2DCapacity(_ vertexCapacity: Int) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         guard vertexCapacity > 0 else {
             throw Errors.emptyVertexData
@@ -1431,6 +1739,16 @@ final class VulkanEngine {
             throw Errors.emptyVertexData
         }
         let byteCount = VkDeviceSize(MemoryLayout<Vertex3D>.stride * vertexCapacity)
+        return try createBufferWithMemory(size: byteCount)
+    }
+
+    func createVertexBufferTextured3DCapacity(
+        _ vertexCapacity: Int
+    ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        guard vertexCapacity > 0 else {
+            throw Errors.emptyVertexData
+        }
+        let byteCount = VkDeviceSize(MemoryLayout<VertexTextured3D>.stride * vertexCapacity)
         return try createBufferWithMemory(size: byteCount)
     }
 
@@ -1477,6 +1795,32 @@ final class VulkanEngine {
         }
 
         let copySize = VkDeviceSize(MemoryLayout<Vertex3D>.stride * vertices.count)
+        let mapped = try device.mapMemory(memory, offset: 0, size: copySize)
+        vertices.withUnsafeBytes { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(memory)
+        _ = buffer
+        return UInt32(vertices.count)
+    }
+
+    func updateVertexBufferTextured3D(
+        _ vertices: [VertexTextured3D],
+        buffer: VulkanOwnedBuffer,
+        memory: VulkanOwnedDeviceMemory,
+        capacity: Int
+    ) throws -> UInt32 {
+        guard capacity > 0 else {
+            throw Errors.emptyVertexData
+        }
+        if vertices.count > capacity {
+            throw Errors.vertexDataExceedsCapacity
+        }
+        guard !vertices.isEmpty else {
+            return 0
+        }
+
+        let copySize = VkDeviceSize(MemoryLayout<VertexTextured3D>.stride * vertices.count)
         let mapped = try device.mapMemory(memory, offset: 0, size: copySize)
         vertices.withUnsafeBytes { bytes in
             mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
@@ -1577,6 +1921,26 @@ final class VulkanEngine {
         commandBuffer.endRenderPass()
         try commandBuffer.end()
         try submitRecordedFrame(waitSemaphores: waitSemaphores, signalSemaphores: signalSemaphores)
+    }
+
+    func drawBatchesTextured3D(
+        _ batches: [DrawBatchTextured3D],
+        framebufferIndex: Int,
+        waitSemaphores: [VkSemaphore],
+        signalSemaphores: [VkSemaphore]
+    ) throws {
+        guard let modeTextured3D = resources?.modeTextured3D else {
+            throw Errors.missingTextured3DPipeline
+        }
+        try drawVertexBuffers3D(
+            buffers: batches.map { ($0.buffer, $0.vertexCount, $0.modelOffset) },
+            pipeline: modeTextured3D.pipeline,
+            pipelineLayout: modeTextured3D.pipelineLayout,
+            descriptorSet: modeTextured3D.descriptorSet,
+            framebufferIndex: framebufferIndex,
+            waitSemaphores: waitSemaphores,
+            signalSemaphores: signalSemaphores
+        )
     }
 
     func uploadVertices3D(_ vertices: [Vertex3D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
@@ -1691,6 +2055,172 @@ final class VulkanEngine {
         device.unmapMemory(mode3D.viewUniformMemory)
     }
 
+    func updateTransformTextured3D(_ transform: simd_float4x4) throws {
+        guard let modeTextured3D = resources?.modeTextured3D else {
+            throw Errors.missingTextured3DPipeline
+        }
+        let size = VkDeviceSize(MemoryLayout<simd_float4x4>.size)
+        let mapped = try device.mapMemory(modeTextured3D.transformUniformMemory, offset: 0, size: size)
+        var local = transform
+        withUnsafeBytes(of: &local) { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(modeTextured3D.transformUniformMemory)
+    }
+
+    func updateModelTextured3D(_ model: simd_float4x4) throws {
+        guard let modeTextured3D = resources?.modeTextured3D else {
+            throw Errors.missingTextured3DPipeline
+        }
+        let size = VkDeviceSize(MemoryLayout<simd_float4x4>.size)
+        let mapped = try device.mapMemory(modeTextured3D.modelUniformMemory, offset: 0, size: size)
+        var local = model
+        withUnsafeBytes(of: &local) { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(modeTextured3D.modelUniformMemory)
+    }
+
+    func updateViewTextured3D(_ view: simd_float4x4) throws {
+        guard let modeTextured3D = resources?.modeTextured3D else {
+            throw Errors.missingTextured3DPipeline
+        }
+        let size = VkDeviceSize(MemoryLayout<simd_float4x4>.size)
+        let mapped = try device.mapMemory(modeTextured3D.viewUniformMemory, offset: 0, size: size)
+        var local = view
+        withUnsafeBytes(of: &local) { bytes in
+            mapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(modeTextured3D.viewUniformMemory)
+    }
+
+    func createTexture2D(width: Int, height: Int, rgba8: [UInt8]) throws -> Texture2D {
+        guard width > 0, height > 0 else {
+            throw Errors.invalidTextureDimensions
+        }
+        let expectedByteCount = width * height * 4
+        guard rgba8.count == expectedByteCount else {
+            throw Errors.textureDataSizeMismatch
+        }
+
+        let stagingSize = VkDeviceSize(expectedByteCount)
+        let (stagingBuffer, stagingMemory) = try createBufferWithMemory(
+            size: stagingSize,
+            usage: VkBufferUsageFlags(VK_BUFFER_USAGE_TRANSFER_SRC_BIT.rawValue),
+            properties: VkMemoryPropertyFlags(
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.rawValue |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.rawValue
+            )
+        )
+        let stagingMapped = try device.mapMemory(stagingMemory, offset: 0, size: stagingSize)
+        rgba8.withUnsafeBytes { bytes in
+            stagingMapped.copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+        }
+        device.unmapMemory(stagingMemory)
+
+        var imageCreateInfo = VkImageCreateInfo.create(
+            flags: 0,
+            imageType: VK_IMAGE_TYPE_2D,
+            format: VK_FORMAT_R8G8B8A8_SRGB,
+            extent: VkExtent3D(width: UInt32(width), height: UInt32(height), depth: 1),
+            mipLevels: 1,
+            arrayLayers: 1,
+            samples: VK_SAMPLE_COUNT_1_BIT,
+            tiling: VK_IMAGE_TILING_OPTIMAL,
+            usage: VkImageUsageFlags(
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT.rawValue |
+                VK_IMAGE_USAGE_SAMPLED_BIT.rawValue
+            ),
+            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            queueFamilyIndexCount: 0,
+            pQueueFamilyIndices: nil,
+            initialLayout: VK_IMAGE_LAYOUT_UNDEFINED
+        )
+        let image = try device.createImage(&imageCreateInfo)
+        let requirements = device.getImageMemoryRequirements(image)
+        let memoryTypeIndex = try VulkanEngine.findMemoryTypeIndex(
+            physicalDevice,
+            typeBits: requirements.memoryTypeBits,
+            properties: VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.rawValue)
+        )
+        var allocationInfo = VkMemoryAllocateInfo.create(
+            allocationSize: requirements.size,
+            memoryTypeIndex: memoryTypeIndex
+        )
+        let imageMemory = try device.allocateMemory(&allocationInfo)
+        try device.bindImageMemory(image: image, memory: imageMemory)
+
+        try withSingleUseCommandBuffer { commandBuffer in
+            transitionImageLayout(
+                commandBuffer: commandBuffer,
+                image: image.image,
+                oldLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+                newLayout: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+            )
+            copyBufferToImage(
+                commandBuffer: commandBuffer,
+                buffer: stagingBuffer.buffer,
+                image: image.image,
+                width: width,
+                height: height
+            )
+            transitionImageLayout(
+                commandBuffer: commandBuffer,
+                image: image.image,
+                oldLayout: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                newLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            )
+        }
+
+        var imageViewCreateInfo = VkImageViewCreateInfo.create(
+            flags: 0,
+            image: image.image,
+            viewType: VK_IMAGE_VIEW_TYPE_2D,
+            format: VK_FORMAT_R8G8B8A8_SRGB,
+            components: VkComponentMapping(
+                r: VK_COMPONENT_SWIZZLE_IDENTITY,
+                g: VK_COMPONENT_SWIZZLE_IDENTITY,
+                b: VK_COMPONENT_SWIZZLE_IDENTITY,
+                a: VK_COMPONENT_SWIZZLE_IDENTITY
+            ),
+            subresourceRange: VkImageSubresourceRange(
+                aspectMask: VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT.rawValue),
+                baseMipLevel: 0,
+                levelCount: 1,
+                baseArrayLayer: 0,
+                layerCount: 1
+            )
+        )
+        let imageView = try device.createImageView(&imageViewCreateInfo)
+        let sampler = try createSampler()
+        return Texture2D(
+            image: image,
+            memory: imageMemory,
+            imageView: imageView,
+            sampler: sampler,
+            width: width,
+            height: height
+        )
+    }
+
+    func bindTextureTextured3D(_ texture: Texture2D) throws {
+        guard let modeTextured3D = resources?.modeTextured3D else {
+            throw Errors.missingTextured3DPipeline
+        }
+        VulkanEngine.updateDescriptorSet(
+            device: device,
+            descriptorSet: modeTextured3D.descriptorSet,
+            binding: DescriptorBindingsTextured3D.texture,
+            imageView: texture.imageView
+        )
+        VulkanEngine.updateDescriptorSet(
+            device: device,
+            descriptorSet: modeTextured3D.descriptorSet,
+            binding: DescriptorBindingsTextured3D.sampler,
+            sampler: texture.sampler
+        )
+    }
+
     func setClearColor(_ color: SIMD4<Float>) {
         clearColor = color
     }
@@ -1732,13 +2262,20 @@ final class VulkanEngine {
         return (buffer, memory)
     }
 
-    private func createBufferWithMemory(size bufferSize: VkDeviceSize) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+    private func createBufferWithMemory(
+        size bufferSize: VkDeviceSize,
+        usage: VkBufferUsageFlags = VkBufferUsageFlags(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT.rawValue),
+        properties: VkMemoryPropertyFlags = VkMemoryPropertyFlags(
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.rawValue |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.rawValue
+        )
+    ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         var bufferCreateInfo = VkBufferCreateInfo(
             sType: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             pNext: nil,
             flags: 0,
             size: bufferSize,
-            usage: VkBufferUsageFlags(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT.rawValue),
+            usage: usage,
             sharingMode: VK_SHARING_MODE_EXCLUSIVE,
             queueFamilyIndexCount: 0,
             pQueueFamilyIndices: nil
@@ -1748,10 +2285,7 @@ final class VulkanEngine {
         let memoryTypeIndex = try VulkanEngine.findMemoryTypeIndex(
             physicalDevice,
             typeBits: requirements.memoryTypeBits,
-            properties: VkMemoryPropertyFlags(
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.rawValue |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.rawValue
-            )
+            properties: properties
         )
         var allocInfo = VkMemoryAllocateInfo.create(
             allocationSize: requirements.size,
@@ -1760,6 +2294,153 @@ final class VulkanEngine {
         let memory = try device.allocateMemory(&allocInfo)
         try device.bindBufferMemory(buffer: buffer, memory: memory)
         return (buffer, memory)
+    }
+
+    private func createSampler() throws -> VulkanOwnedSampler {
+        var sampler: VkSampler?
+        var samplerCreateInfo = VkSamplerCreateInfo(
+            sType: VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            pNext: nil,
+            flags: 0,
+            magFilter: VK_FILTER_NEAREST,
+            minFilter: VK_FILTER_NEAREST,
+            mipmapMode: VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            addressModeU: VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            addressModeV: VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            addressModeW: VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            mipLodBias: 0,
+            anisotropyEnable: VK_FALSE,
+            maxAnisotropy: 1,
+            compareEnable: VK_FALSE,
+            compareOp: VK_COMPARE_OP_ALWAYS,
+            minLod: 0,
+            maxLod: 0,
+            borderColor: VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+            unnormalizedCoordinates: VK_FALSE
+        )
+        try VulkanEngine.vulkanResultCheck(vkCreateSampler(device.device, &samplerCreateInfo, nil, &sampler))
+        return VulkanOwnedSampler(device: device.device, sampler: sampler!)
+    }
+
+    private func withSingleUseCommandBuffer(
+        _ body: (VkCommandBuffer) throws -> Void
+    ) throws {
+        let singleUseBuffer = try device.allocateCommandBuffers(from: commandPool, count: 1).first!
+        defer {
+            device.freeCommandBuffers(from: commandPool, commandBuffers: [singleUseBuffer])
+        }
+
+        try singleUseBuffer.begin(flags: VkCommandBufferUsageFlags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT.rawValue))
+        try body(singleUseBuffer.commandBuffer)
+        try singleUseBuffer.end()
+
+        let fence = try device.createFence()
+        var commandBufferHandle: VkCommandBuffer? = singleUseBuffer.commandBuffer
+        try withUnsafePointer(to: &commandBufferHandle) { commandBufferPtr in
+            let submitInfo = VkSubmitInfo.create(
+                waitSemaphoreCount: 0,
+                pWaitSemaphores: nil,
+                pWaitDstStageMask: nil,
+                commandBufferCount: 1,
+                pCommandBuffers: commandBufferPtr,
+                signalSemaphoreCount: 0,
+                pSignalSemaphores: nil
+            )
+            try device.submit(queue: graphicsQueue, submits: [submitInfo], fence: fence.fence)
+        }
+        try device.waitForFences([fence.fence], waitAll: true, timeout: UInt64.max)
+    }
+
+    private func transitionImageLayout(
+        commandBuffer: VkCommandBuffer,
+        image: VkImage,
+        oldLayout: VkImageLayout,
+        newLayout: VkImageLayout
+    ) {
+        let srcAccessMask: VkAccessFlags
+        let dstAccessMask: VkAccessFlags
+        let sourceStage: VkPipelineStageFlags
+        let destinationStage: VkPipelineStageFlags
+
+        switch (oldLayout, newLayout) {
+        case (VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL):
+            srcAccessMask = 0
+            dstAccessMask = VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT.rawValue)
+            sourceStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT.rawValue)
+            destinationStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue)
+        case (VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL):
+            srcAccessMask = VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT.rawValue)
+            dstAccessMask = VkAccessFlags(VK_ACCESS_SHADER_READ_BIT.rawValue)
+            sourceStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue)
+            destinationStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT.rawValue)
+        default:
+            return
+        }
+
+        var barrier = VkImageMemoryBarrier(
+            sType: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            pNext: nil,
+            srcAccessMask: srcAccessMask,
+            dstAccessMask: dstAccessMask,
+            oldLayout: oldLayout,
+            newLayout: newLayout,
+            srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            image: image,
+            subresourceRange: VkImageSubresourceRange(
+                aspectMask: VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT.rawValue),
+                baseMipLevel: 0,
+                levelCount: 1,
+                baseArrayLayer: 0,
+                layerCount: 1
+            )
+        )
+        withUnsafePointer(to: &barrier) { barrierPtr in
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                sourceStage,
+                destinationStage,
+                0,
+                0,
+                nil,
+                0,
+                nil,
+                1,
+                barrierPtr
+            )
+        }
+    }
+
+    private func copyBufferToImage(
+        commandBuffer: VkCommandBuffer,
+        buffer: VkBuffer,
+        image: VkImage,
+        width: Int,
+        height: Int
+    ) {
+        var region = VkBufferImageCopy(
+            bufferOffset: 0,
+            bufferRowLength: 0,
+            bufferImageHeight: 0,
+            imageSubresource: VkImageSubresourceLayers(
+                aspectMask: VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT.rawValue),
+                mipLevel: 0,
+                baseArrayLayer: 0,
+                layerCount: 1
+            ),
+            imageOffset: VkOffset3D(x: 0, y: 0, z: 0),
+            imageExtent: VkExtent3D(width: UInt32(width), height: UInt32(height), depth: 1)
+        )
+        withUnsafePointer(to: &region) { regionPtr in
+            vkCmdCopyBufferToImage(
+                commandBuffer,
+                buffer,
+                image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                regionPtr
+            )
+        }
     }
 
     private func drawVertexBuffers(
@@ -1994,6 +2675,9 @@ final class VulkanEngine {
         case vertexDataExceedsCapacity
         case invalidFramebufferIndex
         case missing3DPipeline
+        case missingTextured3DPipeline
+        case invalidTextureDimensions
+        case textureDataSizeMismatch
         case vulkanFailure(VkResult)
     }
 }

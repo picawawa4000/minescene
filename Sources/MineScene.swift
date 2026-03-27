@@ -258,12 +258,19 @@ final class MineSceneApp {
         var running = true
         var event = SDL_Event()
         var previousTickNs = DispatchTime.now().uptimeNanoseconds
+        let appWindowID = try window?.id.get()
+
+        discardPendingStartupEvents()
 
         while running {
             while SDL_PollEvent(&event) {
                 switch event.eventType {
-                case .quit, .windowCloseRequested, .windowDestroyed:
+                case .quit:
                     running = false
+                case .windowCloseRequested, .windowDestroyed:
+                    if event.window.windowID == appWindowID {
+                        running = false
+                    }
                 case .keyDown:
                     if !event.key.repeat,
                        keyMatches(event.key.key, action: .toggleBiomeMap),
@@ -312,6 +319,18 @@ final class MineSceneApp {
         surface = nil
         instance = nil
         window = nil
+    }
+
+    private func discardPendingStartupEvents() {
+        var event = SDL_Event()
+        while SDL_PollEvent(&event) {
+            switch event.eventType {
+            case .quit, .windowCloseRequested, .windowDestroyed:
+                continue
+            default:
+                continue
+            }
+        }
     }
 
     private func renderFrame() throws {
@@ -775,9 +794,15 @@ final class MineSceneApp {
             return try loadDatapackPathURLs(from: fileURL)
         }
 
-        let selectedURLs = try DatapackSelectionScreen().run()
+        let selectedURLs = try promptForDatapackPathURLs()
         try saveDatapackPathURLs(selectedURLs, to: fileURL)
         return selectedURLs
+    }
+
+    @inline(never)
+    private static func promptForDatapackPathURLs() throws -> [URL] {
+        let selectionScreen = try DatapackSelectionScreen()
+        return try selectionScreen.run()
     }
 
     private static func loadDatapackPathURLs(from fileURL: URL) throws -> [URL] {

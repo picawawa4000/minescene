@@ -97,8 +97,8 @@ final class DatapackSelectionScreen {
     private static let successTextColor = SDL_Color(r: 166, g: 224, b: 167, a: 255)
     private static let errorTextColor = SDL_Color(r: 247, g: 155, b: 155, a: 255)
 
-    private let window: SDLObject<OpaquePointer>
-    private let renderer: SDLObject<OpaquePointer>
+    private var window: SDLObject<OpaquePointer>?
+    private var renderer: SDLObject<OpaquePointer>?
     private let dialogResultBox = DialogResultBox()
 
     private var datapackPaths: [String] = []
@@ -122,11 +122,16 @@ final class DatapackSelectionScreen {
         }
         self.renderer = SDLObject<OpaquePointer>(rendererPtr, tag: .custom("datapack picker renderer"), destroy: { SDL_DestroyRenderer($0) })
 
-        _ = try? renderer.set(vsync: 1)
-        _ = try? window.set(minSize: SDL_Size([900, 640]))
+        if let renderer {
+            _ = try? renderer.set(vsync: 1)
+        }
+        if let window {
+            _ = try? window.set(minSize: SDL_Size([900, 640]))
+        }
     }
 
     func run() throws -> [URL] {
+        defer { shutdown() }
         var event = SDL_Event()
 
         while true {
@@ -143,6 +148,11 @@ final class DatapackSelectionScreen {
             try render()
             SDL_Delay(16)
         }
+    }
+
+    private func shutdown() {
+        renderer = nil
+        window = nil
     }
 
     private func handle(event: SDL_Event) throws -> Bool {
@@ -188,12 +198,13 @@ final class DatapackSelectionScreen {
     }
 
     private func handleMouseButtonDown(_ event: SDL_MouseButtonEvent) throws -> Bool {
+        let windowSize = try currentWindowSize()
         guard event.button == SDL_BUTTON_LEFT else {
             return false
         }
 
         let position = event.position(as: Float.self)
-        for button in buttons(for: try window.pixelSize().to(Float.self)) {
+        for button in buttons(for: windowSize) {
             if Self.contains(position: position, in: button.rect) {
                 switch button.action {
                 case .addFolders:
@@ -216,9 +227,9 @@ final class DatapackSelectionScreen {
             }
         }
 
-        if let index = listIndex(at: position, windowSize: try window.pixelSize().to(Float.self)) {
+        if let index = listIndex(at: position, windowSize: windowSize) {
             selectedIndex = index
-            ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: try window.pixelSize().to(Float.self)))
+            ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: windowSize))
         }
 
         return false
@@ -256,7 +267,7 @@ final class DatapackSelectionScreen {
 
         datapackPaths.append(contentsOf: newPaths)
         selectedIndex = datapackPaths.count - 1
-        ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: (try? window.pixelSize().to(Float.self)) ?? [1120, 760]))
+        ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: currentWindowSizeOrDefault()))
         statusMessage = "Added \(newPaths.count) datapack folder\(newPaths.count == 1 ? "" : "s")."
         statusColor = Self.successTextColor
     }
@@ -269,7 +280,7 @@ final class DatapackSelectionScreen {
         let currentIndex = selectedIndex ?? 0
         let nextIndex = max(0, min(datapackPaths.count - 1, currentIndex + delta))
         selectedIndex = nextIndex
-        ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: (try? window.pixelSize().to(Float.self)) ?? [1120, 760]))
+        ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: currentWindowSizeOrDefault()))
     }
 
     private func moveSelectedPath(by delta: Int) {
@@ -286,7 +297,7 @@ final class DatapackSelectionScreen {
 
         datapackPaths.swapAt(selectedIndex, destinationIndex)
         self.selectedIndex = destinationIndex
-        ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: (try? window.pixelSize().to(Float.self)) ?? [1120, 760]))
+        ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: currentWindowSizeOrDefault()))
         statusMessage = "Moved datapack \(delta < 0 ? "up" : "down")."
         statusColor = Self.successTextColor
     }
@@ -305,7 +316,7 @@ final class DatapackSelectionScreen {
         } else {
             self.selectedIndex = min(selectedIndex, datapackPaths.count - 1)
         }
-        ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: (try? window.pixelSize().to(Float.self)) ?? [1120, 760]))
+        ensureSelectionVisible(visibleRowCapacity: visibleRowCapacity(for: currentWindowSizeOrDefault()))
         statusMessage = "Removed \(removedPath)."
         statusColor = Self.successTextColor
     }
@@ -349,6 +360,13 @@ final class DatapackSelectionScreen {
         statusMessage = "Waiting for folder selection..."
         statusColor = Self.mutedTextColor
 
+        guard let window else {
+            isFolderDialogOpen = false
+            statusMessage = "Folder picker window was unavailable."
+            statusColor = Self.errorTextColor
+            return
+        }
+
         let defaultLocation = selectedIndex.flatMap { datapackPaths.indices.contains($0) ? datapackPaths[$0] : nil }
             ?? FileManager.default.homeDirectoryForCurrentUser.path
 
@@ -364,6 +382,9 @@ final class DatapackSelectionScreen {
     }
 
     private func render() throws {
+        guard let window, let renderer else {
+            throw SDL_Error.error
+        }
         let windowSize = try window.pixelSize().to(Float.self)
         let listRect = listRect(for: windowSize)
         let buttons = buttons(for: windowSize)
@@ -543,7 +564,21 @@ final class DatapackSelectionScreen {
         listScrollOffset = max(0, min(listScrollOffset, max(0, datapackPaths.count - visibleRowCapacity)))
     }
 
+    private func currentWindowSize() throws -> Size<Float> {
+        guard let window else {
+            throw SDL_Error.error
+        }
+        return try window.pixelSize().to(Float.self)
+    }
+
+    private func currentWindowSizeOrDefault() -> Size<Float> {
+        (try? currentWindowSize()) ?? [1120, 760]
+    }
+
     private func drawBorder(for rect: SDL_FRect, color: SDL_Color) throws {
+        guard let renderer else {
+            throw SDL_Error.error
+        }
         let x = rect.x
         let y = rect.y
         let w = rect.w

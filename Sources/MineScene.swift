@@ -130,6 +130,10 @@ final class MineSceneApp {
     private var waypoints: [String: Waypoint] = [:]
     private var activeRenderer: ActiveRenderer = .terrain
 
+    deinit {
+        tearDownRuntime()
+    }
+
     init() throws {
         Self.logStartupStep("initializing settings")
         let settings = Self.makeSettings()
@@ -144,7 +148,9 @@ final class MineSceneApp {
         let datapackPathURLs = try Self.loadOrPromptForDatapackPathURLs()
         Self.logStartupStep("loading \(datapackPathURLs.count) datapack(s)")
         do {
-            self.dataPacks = try datapackPathURLs.map { try DataPack(fromRootPath: $0) }
+            let loadedDataPacks = try datapackPathURLs.map { try DataPack(fromRootPath: $0) }
+            Self.logNoiseSettingsKeys(for: loadedDataPacks, datapackPaths: datapackPathURLs)
+            self.dataPacks = loadedDataPacks
         } catch {
             Self.logStartupError("loading datapacks", error: error)
             throw error
@@ -269,6 +275,25 @@ final class MineSceneApp {
         FileHandle.standardError.write(Data("Startup error during \(step): \(error)\n".utf8))
     }
 
+    private static func logNoiseSettingsKeys(for datapacks: [DataPack], datapackPaths: [URL]) {
+        for (index, datapack) in datapacks.enumerated() {
+            let path = index < datapackPaths.count ? datapackPaths[index].path : "<unknown>"
+            var keys: [String] = []
+            datapack.noiseSettingsRegistry.forEach { pair in
+                keys.append(pair.key.name)
+            }
+            keys.sort()
+
+            if keys.isEmpty {
+                FileHandle.standardError.write(Data("Startup: datapack \(path) registered no noise settings\n".utf8))
+            } else {
+                FileHandle.standardError.write(
+                    Data("Startup: datapack \(path) noise settings keys: \(keys.joined(separator: ", "))\n".utf8)
+                )
+            }
+        }
+    }
+
     private static func resourceURL(relativePath: String, isDirectory: Bool = false) throws -> URL {
         let fileManager = FileManager.default
         let candidateBaseURLs = [
@@ -355,6 +380,10 @@ final class MineSceneApp {
             print("Failed to save settings: \(error)")
         }
 
+        tearDownRuntime()
+    }
+
+    private func tearDownRuntime() {
         terrainRenderer = nil
         biomeMapRenderer = nil
         imageAvailable = nil

@@ -131,14 +131,21 @@ final class MineSceneApp {
     private var activeRenderer: ActiveRenderer = .terrain
 
     init() throws {
+        Self.logStartupStep("initializing settings")
         let settings = Self.makeSettings()
         self.renderDistanceSetting = settings.renderDistance
         self.keybindSettings = settings.keybinds
         self.settingsByName = settings.byName
+
+        Self.logStartupStep("initializing SDL")
         self.sdl = try SDLRuntime()
+
+        Self.logStartupStep("loading datapack paths")
         let datapackPathURLs = try Self.loadOrPromptForDatapackPathURLs()
+        Self.logStartupStep("loading \(datapackPathURLs.count) datapack(s)")
         self.dataPacks = try datapackPathURLs.map { try DataPack(fromRootPath: $0) }
 
+        Self.logStartupStep("creating main window")
         let windowPtr = "MineScene".withCString { title in
             SDL_CreateWindow(title, 1200, 840, SDL_WindowFlags.vulkan.rawValue | SDL_WindowFlags.resizable.rawValue)
         }
@@ -150,6 +157,7 @@ final class MineSceneApp {
             throw SDL_Error.error
         }
 
+        Self.logStartupStep("querying SDL Vulkan instance extensions")
         var instanceFlags: VulkanInstanceCreateFlags = []
         var instanceExtensions = try MineSceneApp.getSdlVulkanInstanceExtensions()
 #if os(macOS)
@@ -164,6 +172,7 @@ final class MineSceneApp {
         let instanceLayers: [String] = []
 #endif
 
+        Self.logStartupStep("creating Vulkan instance")
         let instance = try VulkanOwnedInstance(
             flags: instanceFlags,
             enabledLayers: instanceLayers,
@@ -179,15 +188,19 @@ final class MineSceneApp {
         guard let window else {
             throw SDL_Error.error
         }
+        Self.logStartupStep("creating Vulkan surface")
         let surface = try createVulkanSurface(from: window, instance: instance)
         self.surface = surface
 
         let seed: Int64 = 8608000014473684604
+        Self.logStartupStep("loading persisted settings")
         Self.loadSettingsFromDisk(settingsByName: settings.byName)
         self.currentWorldSeed = seed
+        Self.logStartupStep("creating world generator")
         let worldGenerator = try makeWorldGenerator(seed: seed)
         self.worldGenerator = worldGenerator
 
+        Self.logStartupStep("creating Vulkan engine")
         let engine = try VulkanEngine(
             instance: instance,
             surface: surface,
@@ -199,11 +212,14 @@ final class MineSceneApp {
         )
         self.engine = engine
 
+        Self.logStartupStep("creating synchronization primitives")
         self.imageAvailable = try engine.device.createSemaphore()
         self.renderFinishedByImage = try engine.swapchainImages.map { _ in
             try engine.device.createSemaphore()
         }
+        Self.logStartupStep("creating terrain renderer")
         self.terrainRenderer = makeTerrainRenderer(worldGenerator: worldGenerator)
+        Self.logStartupStep("startup complete")
     }
 
     static func main() {
@@ -221,6 +237,10 @@ final class MineSceneApp {
     private static func logTopLevelError(_ error: Error) {
         let message = "Error raised at top level: \(error)\n"
         FileHandle.standardError.write(Data(message.utf8))
+    }
+
+    private static func logStartupStep(_ message: String) {
+        FileHandle.standardError.write(Data("Startup: \(message)\n".utf8))
     }
 
     private static func resourceURL(relativePath: String, isDirectory: Bool = false) throws -> URL {

@@ -4,12 +4,99 @@ import Vulkan
 import DPReader
 
 final class OceanMonumentStructureViewer {
+    enum Error: Swift.Error {
+        case biomeUnavailable(PosInt3D)
+        case monumentPlacementNotFound(PosInt2D)
+        case resolvedStructureMissing(PosInt2D)
+        case unexpectedResolvedStructure(String)
+    }
+
+    static let structureSeed: Int64 = 123_456_789
+    static let targetLocateBlockPosition = PosInt2D(x: 1200, z: 0)
+    static let terrainChunkRadius: Int32 = 8
+
     private struct RenderBlock {
         let blockID: String
         let position: SIMD3<Int>
         let textureName: String
         let tint: SIMD4<Float>
         let isOpaque: Bool
+    }
+
+    private enum WorldBlockKind {
+        case air
+        case terrain
+        case water
+    }
+
+    private struct ChunkKey: Hashable {
+        let x: Int32
+        let z: Int32
+    }
+
+    private final class GeneratedWorldSampler {
+        private let worldGenerator: WorldGenerator
+        private let seaLevel: Int32
+        private let minimumWorldY: Int32
+        private var chunks: [ChunkKey: ProtoChunk] = [:]
+
+        init(worldGenerator: WorldGenerator, seaLevel: Int32, minimumWorldY: Int32) {
+            self.worldGenerator = worldGenerator
+            self.seaLevel = seaLevel
+            self.minimumWorldY = minimumWorldY
+        }
+
+        func kind(at pos: PosInt3D) throws -> WorldBlockKind {
+            if pos.y <= self.minimumWorldY + 1 {
+                return .terrain
+            }
+
+            let chunkPos = PosInt2D(
+                x: OceanMonumentStructureViewer.floorDiv(pos.x, by: Int32(ProtoChunk.sideLength)),
+                z: OceanMonumentStructureViewer.floorDiv(pos.z, by: Int32(ProtoChunk.sideLength))
+            )
+            let chunk = try self.chunk(at: chunkPos)
+
+            if pos.y < chunk.minY {
+                return .terrain
+            }
+            if pos.y >= chunk.minY + chunk.height {
+                return pos.y <= self.seaLevel ? .water : .air
+            }
+
+            let localPos = PosInt3D(
+                x: pos.x - chunkPos.x * Int32(ProtoChunk.sideLength),
+                y: pos.y - chunk.minY,
+                z: pos.z - chunkPos.z * Int32(ProtoChunk.sideLength)
+            )
+            if chunk.isTerrain(atLocal: localPos) {
+                return .terrain
+            }
+            return pos.y <= self.seaLevel ? .water : .air
+        }
+
+        func block(at pos: PosInt3D) throws -> BlockState {
+            switch try self.kind(at: pos) {
+            case .terrain:
+                return BlockState(type: Block(withID: "minecraft:stone"))
+            case .water:
+                return BlockState(type: Block(withID: "minecraft:water"))
+            case .air:
+                return BlockState(type: Block(withID: "minecraft:air"))
+            }
+        }
+
+        func chunk(at chunkPos: PosInt2D) throws -> ProtoChunk {
+            let key = ChunkKey(x: chunkPos.x, z: chunkPos.z)
+            if let cached = self.chunks[key] {
+                return cached
+            }
+
+            let generated = ProtoChunk()
+            try self.worldGenerator.generateInto(generated, at: chunkPos)
+            self.chunks[key] = generated
+            return generated
+        }
     }
 
     private enum Face: CaseIterable {
@@ -86,10 +173,20 @@ final class OceanMonumentStructureViewer {
     }
 
     private let structureRenderer: StructureRenderer
+    private let worldGenerator: WorldGenerator
+    private let structurePlacementSampler: StructurePlacementSampler
+    private let overworldDimensionKey = RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld")
+    private let oceanMonumentStructureSetKey = RegistryKey<StructureSet>(referencing: "minecraft:ocean_monuments")
     private var prepared = false
 
-    init(repository: VanillaAssetRepository) {
+    init(
+        repository: VanillaAssetRepository,
+        worldGenerator: WorldGenerator,
+        structurePlacementSampler: StructurePlacementSampler
+    ) {
         self.structureRenderer = StructureRenderer(repository: repository)
+        self.worldGenerator = worldGenerator
+        self.structurePlacementSampler = structurePlacementSampler
     }
 
     var keycodeForAction: ((KeybindAction) -> SDL_Keycode)? {
@@ -102,15 +199,46 @@ final class OceanMonumentStructureViewer {
             return
         }
 
-        let worldSeed: UInt64 = 123_456_789
-        let startChunk = PosInt2D(x: 0, z: 0)
+        let worldSeed = UInt64(bitPattern: Self.structureSeed)
+        let regionPos = PosInt2D(
+            x: Self.floorDiv(Self.floorDiv(Self.targetLocateBlockPosition.x, by: 16), by: 32),
+            z: Self.floorDiv(Self.floorDiv(Self.targetLocateBlockPosition.z, by: 16), by: 32)
+        )
+        guard let placementSample = try structurePlacementSampler.sampleStructureSet(
+            inRegion: regionPos,
+            for: oceanMonumentStructureSetKey
+        ) else {
+            throw Error.monumentPlacementNotFound(regionPos)
+        }
+        let biomeSamplePos = PosInt3D(x: placementSample.blockPos.x, y: 63, z: placementSample.blockPos.z)
+        guard let biome = try worldGenerator.sampleBlockBiome(at: biomeSamplePos, in: overworldDimensionKey) else {
+            throw Error.biomeUnavailable(biomeSamplePos)
+        }
+        guard let resolvedPlacement = try structurePlacementSampler.resolveStructureSet(
+            inRegion: regionPos,
+            biome: biome,
+            for: oceanMonumentStructureSetKey
+        ) else {
+            throw Error.resolvedStructureMissing(regionPos)
+        }
+        guard resolvedPlacement.structureKey.name == "minecraft:monument" else {
+            throw Error.unexpectedResolvedStructure(resolvedPlacement.structureKey.name)
+        }
+        let startChunk = resolvedPlacement.chunkPos
+        let generatedWorldSampler = GeneratedWorldSampler(
+            worldGenerator: worldGenerator,
+            seaLevel: 63,
+            minimumWorldY: -64
+        )
         let result = OceanMonument.generate(
             worldSeed: worldSeed,
             startChunk: startChunk,
             context: OceanMonumentGenerationContext(
                 seaLevel: 63,
                 minimumWorldY: -64,
-                blockSampler: { _ in BlockState(type: Block(withID: "minecraft:air")) }
+                blockSampler: { pos in
+                    (try? generatedWorldSampler.block(at: pos)) ?? BlockState(type: Block(withID: "minecraft:air"))
+                }
             )
         )
         let origin = SIMD3<Int32>(
@@ -118,31 +246,55 @@ final class OceanMonumentStructureViewer {
             result.graph.boundingBox.minY,
             result.graph.boundingBox.minZ
         )
-
-        var blocks: [RenderBlock] = []
-        blocks.reserveCapacity(result.blocks.allTouchedBlocks().count)
+        let terrainBlocks = try generateTerrainBlocks(
+            centeredOn: startChunk,
+            radiusChunks: Self.terrainChunkRadius,
+            sampler: generatedWorldSampler
+        )
+        var blocksByPosition = Dictionary(uniqueKeysWithValues: terrainBlocks.map { ($0.position, $0) })
         var unsupportedBlockIDs: Set<String> = []
 
         for (position, state) in result.blocks.allTouchedBlocks() {
-            guard let block = makeBlockInstance(
-                blockID: state.type.id,
-                position: position,
-                origin: origin
-            ) else {
-                if state.type.id != "minecraft:air" {
+            let worldPosition = SIMD3<Int>(Int(position.x), Int(position.y), Int(position.z))
+            guard let block = makeMonumentBlockInstance(blockID: state.type.id, position: worldPosition) else {
+                if state.type.id == "minecraft:air" {
+                    blocksByPosition.removeValue(forKey: worldPosition)
+                } else {
                     unsupportedBlockIDs.insert(state.type.id)
                 }
                 continue
             }
-            blocks.append(block)
+            blocksByPosition[worldPosition] = block
         }
 
+        let renderOrigin = blocksByPosition.keys.reduce(
+            SIMD3<Int>(
+                Int(origin.x),
+                Int(origin.y),
+                Int(origin.z)
+            )
+        ) { partialResult, position in
+            SIMD3<Int>(
+                Swift.min(partialResult.x, position.x),
+                Swift.min(partialResult.y, position.y),
+                Swift.min(partialResult.z, position.z)
+            )
+        }
+        let blocks = blocksByPosition.values.map { block in
+            RenderBlock(
+                blockID: block.blockID,
+                position: block.position &- renderOrigin,
+                textureName: block.textureName,
+                tint: block.tint,
+                isOpaque: block.isOpaque
+            )
+        }
         let quads = buildQuads(from: blocks)
         try structureRenderer.setQuads(quads, engine: engine)
         prepared = true
 
         let summary = """
-        Prepared ocean monument structure viewer with \(blocks.count) blocks and \(quads.count) quads, \(result.graph.pieces.count) pieces, orientation \(result.graph.orientation.rawValue), seed \(worldSeed), start chunk (0, 0), normalized origin (\(origin.x), \(origin.y), \(origin.z))
+        Prepared ocean monument structure viewer with \(blocks.count) blocks and \(quads.count) quads, \(terrainBlocks.count) terrain-shell blocks, chunk radius \(Self.terrainChunkRadius), \(result.graph.pieces.count) pieces, orientation \(result.graph.orientation.rawValue), seed \(worldSeed), start chunk (\(startChunk.x), \(startChunk.z)), locate block (\(placementSample.blockPos.x), \(placementSample.blockPos.z)), normalized origin (\(renderOrigin.x), \(renderOrigin.y), \(renderOrigin.z))
         """
         FileHandle.standardError.write(Data((summary + "\n").utf8))
         if !unsupportedBlockIDs.isEmpty {
@@ -179,26 +331,146 @@ final class OceanMonumentStructureViewer {
         )
     }
 
-    private func makeBlockInstance(
+    private func generateTerrainBlocks(
+        centeredOn centerChunk: PosInt2D,
+        radiusChunks: Int32,
+        sampler: GeneratedWorldSampler
+    ) throws -> [RenderBlock] {
+        let minChunkX = centerChunk.x - radiusChunks
+        let maxChunkX = centerChunk.x + radiusChunks
+        let minChunkZ = centerChunk.z - radiusChunks
+        let maxChunkZ = centerChunk.z + radiusChunks
+        let minWorldX = minChunkX * Int32(ProtoChunk.sideLength)
+        let maxWorldXExclusive = (maxChunkX + 1) * Int32(ProtoChunk.sideLength)
+        let minWorldZ = minChunkZ * Int32(ProtoChunk.sideLength)
+        let maxWorldZExclusive = (maxChunkZ + 1) * Int32(ProtoChunk.sideLength)
+
+        var blocks: [RenderBlock] = []
+
+        for chunkZ in minChunkZ...maxChunkZ {
+            for chunkX in minChunkX...maxChunkX {
+                let chunkPos = PosInt2D(x: chunkX, z: chunkZ)
+                let chunk = try sampler.chunk(at: chunkPos)
+                let chunkStartX = chunkPos.x * Int32(ProtoChunk.sideLength)
+                let chunkStartZ = chunkPos.z * Int32(ProtoChunk.sideLength)
+
+                for localY in 0..<chunk.height {
+                    let worldY = chunk.minY + localY
+                    for localZ in 0..<Int32(ProtoChunk.sideLength) {
+                        for localX in 0..<Int32(ProtoChunk.sideLength) {
+                            let worldPosition = PosInt3D(
+                                x: chunkStartX + localX,
+                                y: worldY,
+                                z: chunkStartZ + localZ
+                            )
+                            let localPosition = PosInt3D(x: localX, y: localY, z: localZ)
+                            let blockKind: WorldBlockKind = chunk.isTerrain(atLocal: localPosition)
+                                ? .terrain
+                                : (worldY <= 63 ? .water : .air)
+                            guard blockKind != .air else {
+                                continue
+                            }
+                            guard try shouldRenderTerrainBlock(
+                                kind: blockKind,
+                                at: worldPosition,
+                                minWorldX: minWorldX,
+                                maxWorldXExclusive: maxWorldXExclusive,
+                                minWorldZ: minWorldZ,
+                                maxWorldZExclusive: maxWorldZExclusive,
+                                sampler: sampler
+                            ) else {
+                                continue
+                            }
+                            if let block = makeTerrainBlockInstance(kind: blockKind, position: worldPosition) {
+                                blocks.append(block)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return blocks
+    }
+
+    private func shouldRenderTerrainBlock(
+        kind: WorldBlockKind,
+        at worldPosition: PosInt3D,
+        minWorldX: Int32,
+        maxWorldXExclusive: Int32,
+        minWorldZ: Int32,
+        maxWorldZExclusive: Int32,
+        sampler: GeneratedWorldSampler
+    ) throws -> Bool {
+        for face in Face.allCases {
+            let neighborWorldPosition = PosInt3D(
+                x: worldPosition.x + Int32(face.neighborOffset.x),
+                y: worldPosition.y + Int32(face.neighborOffset.y),
+                z: worldPosition.z + Int32(face.neighborOffset.z)
+            )
+            let neighborKind: WorldBlockKind
+            if neighborWorldPosition.x < minWorldX
+                || neighborWorldPosition.x >= maxWorldXExclusive
+                || neighborWorldPosition.z < minWorldZ
+                || neighborWorldPosition.z >= maxWorldZExclusive {
+                neighborKind = .air
+            } else {
+                neighborKind = try sampler.kind(at: neighborWorldPosition)
+            }
+
+            switch kind {
+            case .terrain:
+                if neighborKind != .terrain {
+                    return true
+                }
+            case .water:
+                if neighborKind == .air {
+                    return true
+                }
+            case .air:
+                continue
+            }
+        }
+        return false
+    }
+
+    private func makeTerrainBlockInstance(kind: WorldBlockKind, position: PosInt3D) -> RenderBlock? {
+        let worldPosition = SIMD3<Int>(Int(position.x), Int(position.y), Int(position.z))
+        switch kind {
+        case .terrain:
+            return .init(
+                blockID: "minecraft:stone",
+                position: worldPosition,
+                textureName: "minecraft:block/stone",
+                tint: SIMD4<Float>(repeating: 1),
+                isOpaque: true
+            )
+        case .water:
+            return .init(
+                blockID: "minecraft:water",
+                position: worldPosition,
+                textureName: "minecraft:block/water_still",
+                tint: SIMD4<Float>(1, 1, 1, 0.55),
+                isOpaque: false
+            )
+        case .air:
+            return nil
+        }
+    }
+
+    private func makeMonumentBlockInstance(
         blockID: String,
-        position: PosInt3D,
-        origin: SIMD3<Int32>
+        position: SIMD3<Int>
     ) -> RenderBlock? {
         guard blockID != "minecraft:air" else {
             return nil
         }
 
-        let localPosition = SIMD3<Int>(
-            Int(position.x - origin.x),
-            Int(position.y - origin.y),
-            Int(position.z - origin.z)
-        )
-
         switch blockID {
         case "minecraft:prismarine":
             return .init(
                 blockID: blockID,
-                position: localPosition,
+                position: position,
                 textureName: "minecraft:block/prismarine",
                 tint: SIMD4<Float>(repeating: 1),
                 isOpaque: true
@@ -206,7 +478,7 @@ final class OceanMonumentStructureViewer {
         case "minecraft:prismarine_bricks":
             return .init(
                 blockID: blockID,
-                position: localPosition,
+                position: position,
                 textureName: "minecraft:block/prismarine_bricks",
                 tint: SIMD4<Float>(repeating: 1),
                 isOpaque: true
@@ -214,7 +486,7 @@ final class OceanMonumentStructureViewer {
         case "minecraft:dark_prismarine":
             return .init(
                 blockID: blockID,
-                position: localPosition,
+                position: position,
                 textureName: "minecraft:block/dark_prismarine",
                 tint: SIMD4<Float>(repeating: 1),
                 isOpaque: true
@@ -222,7 +494,7 @@ final class OceanMonumentStructureViewer {
         case "minecraft:sea_lantern":
             return .init(
                 blockID: blockID,
-                position: localPosition,
+                position: position,
                 textureName: "minecraft:block/sea_lantern",
                 tint: SIMD4<Float>(repeating: 1),
                 isOpaque: true
@@ -230,7 +502,7 @@ final class OceanMonumentStructureViewer {
         case "minecraft:gold_block":
             return .init(
                 blockID: blockID,
-                position: localPosition,
+                position: position,
                 textureName: "minecraft:block/gold_block",
                 tint: SIMD4<Float>(repeating: 1),
                 isOpaque: true
@@ -238,7 +510,7 @@ final class OceanMonumentStructureViewer {
         case "minecraft:wet_sponge":
             return .init(
                 blockID: blockID,
-                position: localPosition,
+                position: position,
                 textureName: "minecraft:block/wet_sponge",
                 tint: SIMD4<Float>(repeating: 1),
                 isOpaque: true
@@ -246,7 +518,7 @@ final class OceanMonumentStructureViewer {
         case "minecraft:water":
             return .init(
                 blockID: blockID,
-                position: localPosition,
+                position: position,
                 textureName: "minecraft:block/water_still",
                 tint: SIMD4<Float>(1, 1, 1, 0.55),
                 isOpaque: false
@@ -290,9 +562,17 @@ final class OceanMonumentStructureViewer {
         if block.isOpaque && neighbor.isOpaque {
             return true
         }
-        if block.blockID == "minecraft:water" && neighbor.blockID == "minecraft:water" {
+        if block.blockID == "minecraft:water"
+            && (neighbor.blockID == "minecraft:water" || neighbor.isOpaque) {
             return true
         }
         return false
+    }
+
+    private static func floorDiv(_ value: Int32, by divisor: Int32) -> Int32 {
+        precondition(divisor > 0)
+        let quotient = value / divisor
+        let remainder = value % divisor
+        return remainder < 0 ? quotient - 1 : quotient
     }
 }

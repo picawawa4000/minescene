@@ -153,7 +153,7 @@ final class MineSceneApp {
         Self.logStartupStep("initializing SDL")
         self.sdl = try SDLRuntime()
 
-        if !debugBlockstatesEnabled && !structureViewerEnabled {
+        if !debugBlockstatesEnabled {
             Self.logStartupStep("loading datapack paths")
             let datapackPathURLs = try Self.loadOrPromptForDatapackPathURLs()
             Self.logStartupStep("loading \(datapackPathURLs.count) datapack(s)")
@@ -530,7 +530,17 @@ final class MineSceneApp {
 
     private func makeOceanMonumentStructureViewer() throws -> OceanMonumentStructureViewer {
         let repository = try makeVanillaAssetRepository()
-        let renderer = OceanMonumentStructureViewer(repository: repository)
+        let structureSeed = OceanMonumentStructureViewer.structureSeed
+        let worldGenerator = try makeWorldGenerator(seed: structureSeed)
+        let structurePlacementSampler = StructurePlacementSampler(
+            withWorldSeed: UInt64(bitPattern: structureSeed),
+            usingDataPacks: dataPacks
+        )
+        let renderer = OceanMonumentStructureViewer(
+            repository: repository,
+            worldGenerator: worldGenerator,
+            structurePlacementSampler: structurePlacementSampler
+        )
         renderer.keycodeForAction = { [weak self] action in
             self?.keycode(for: action) ?? action.defaultValue.keycode
         }

@@ -13,3 +13,6 @@ The generator returns raw `BlockState`s, which is correct for simulation, but th
 
 4. There is no public helper for localizing or translating the generated write volume.
 The API provides `allTouchedBlocks()` in world coordinates, but callers that want a local structure-space view must translate those coordinates themselves.
+
+5. There is no public final block-state sampler for the surrounding generated world.
+MineScene can build a `WorldGenerator` and ask it for terrain shape or biome information, but not the final placed block state at a world position. That means the viewer has to approximate the surrounding world when feeding `OceanMonumentGenerationContext.blockSampler`, which can differ from Minecraft in places where actual ocean-floor materials, fluids, plants, ice, caves, or other post-noise blocks matter.

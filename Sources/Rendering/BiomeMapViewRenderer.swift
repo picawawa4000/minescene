@@ -19,6 +19,7 @@ final class BiomeMapViewRenderer: @unchecked Sendable {
         let mapSize: SIMD2<Int>
         let sampleY: Int
         let scale: Int
+        let dimensionID: String
     }
 
     private struct CompletedMapResult {
@@ -88,6 +89,13 @@ final class BiomeMapViewRenderer: @unchecked Sendable {
     private var hoveredBiomeText = "BIOME: UNKNOWN"
     private var hoveredBiomeSample = SIMD3<Int>(repeating: Int.max)
     private var lastOverlaySignature = ""
+    var dimensionKey = RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld") {
+        didSet {
+            if oldValue.name != dimensionKey.name {
+                invalidateMapAndOverlay()
+            }
+        }
+    }
 
     init(
         worldGenerator: WorldGenerator,
@@ -660,7 +668,7 @@ final class BiomeMapViewRenderer: @unchecked Sendable {
             from: from,
             to: to,
             atY: Int32(sampleY),
-            in: RegistryKey(referencing: "minecraft:overworld"),
+            in: dimensionKey,
             scale: 1
         )
         return biomes?.first?.name
@@ -772,7 +780,8 @@ final class BiomeMapViewRenderer: @unchecked Sendable {
                 width: request.mapSize.x,
                 height: request.mapSize.y,
                 scale: request.scale,
-                sampleY: request.sampleY
+                sampleY: request.sampleY,
+                dimension: dimensionKey
             ) {
                 completed = CompletedMapResult(
                     request: request,
@@ -840,7 +849,8 @@ final class BiomeMapViewRenderer: @unchecked Sendable {
             origin: SIMD2<Int>(originX, originZ),
             mapSize: SIMD2<Int>(width, height),
             sampleY: sampleY,
-            scale: samplingScale
+            scale: samplingScale,
+            dimensionID: dimensionKey.name
         )
     }
 

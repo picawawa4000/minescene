@@ -18,6 +18,12 @@ There's in-app documentation for these, but it's not that obvious, so this can't
   - `/seed set <seed>` - Set the seed.
   - `/seed paste` - Paste the seed from the clipboard.
 
+- `/dimension` - Manipulate the active worldgen noise settings.
+  - `/dimension get` - Print the current noise settings ID.
+  - `/dimension list` - List discovered noise settings IDs from the loaded datapacks.
+  - `/dimension set <id>` - Rebuild worldgen using that noise settings entry.
+  - This operates on noise settings, not the dimension registry entry itself. Changing it can alter min Y and total build height, so it rebuilds worldgen state much like switching seeds.
+
 - `/waypoint` - Manipulate waypoints (that is, combinations of seeds and positions).
   - `/waypoint save <name> [pos] [seed]` - Create a new waypoint.
   - `/waypoint load <name>` - Teleport to a waypoint.

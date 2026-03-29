@@ -18,6 +18,7 @@ enum BiomeMapRendererError: Error {
 final class BiomeQuadTreeCache: @unchecked Sendable {
     struct TreeKey: Hashable {
         let sampleY: Int
+        let dimensionID: String
     }
 
     private struct TileCoord: Hashable {
@@ -190,8 +191,11 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
         }
     }
 
-    func currentVersion(sampleY: Int = 256) -> UInt64 {
-        _ = sampleY
+    func currentVersion(
+        sampleY: Int = 256,
+        dimension: RegistryKey<DPReader.Dimension> = RegistryKey(referencing: "minecraft:overworld")
+    ) -> UInt64 {
+        let _ = TreeKey(sampleY: sampleY, dimensionID: dimension.name)
         return lockQueue.sync { version }
     }
 
@@ -202,7 +206,8 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
         width: Int,
         height: Int,
         scale: Int,
-        sampleY: Int = 256
+        sampleY: Int = 256,
+        dimension: RegistryKey<DPReader.Dimension> = RegistryKey(referencing: "minecraft:overworld")
     ) throws -> (map: BiomePixelMap, tileOriginX: Int, tileOriginZ: Int, version: UInt64, isComplete: Bool) {
         guard width > 0, height > 0 else {
             throw BiomeMapRendererError.invalidSize
@@ -211,7 +216,7 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
             throw BiomeMapRendererError.invalidSize
         }
 
-        let treeKey = TreeKey(sampleY: sampleY)
+        let treeKey = TreeKey(sampleY: sampleY, dimensionID: dimension.name)
         let tileOriginX = topLeftX
         let tileOriginZ = topLeftZ
 
@@ -225,6 +230,7 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
             height: height,
             scale: scale,
             sampleY: sampleY,
+            dimension: dimension,
             pixels: &pixels
         )
 
@@ -240,7 +246,8 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
         width: Int,
         height: Int,
         scale: Int,
-        sampleY: Int = 256
+        sampleY: Int = 256,
+        dimension: RegistryKey<DPReader.Dimension> = RegistryKey(referencing: "minecraft:overworld")
     ) throws -> (vertices: [VulkanEngine.Vertex2D], tileOriginX: Int, tileOriginZ: Int, version: UInt64, isComplete: Bool) {
         guard width > 0, height > 0 else {
             throw BiomeMapRendererError.invalidSize
@@ -249,7 +256,7 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
             throw BiomeMapRendererError.invalidSize
         }
 
-        let treeKey = TreeKey(sampleY: sampleY)
+        let treeKey = TreeKey(sampleY: sampleY, dimensionID: dimension.name)
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
         let isComplete = fillPixelsFromTiles(
             worldGenerator: worldGenerator,
@@ -260,6 +267,7 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
             height: height,
             scale: scale,
             sampleY: sampleY,
+            dimension: dimension,
             pixels: &pixels
         )
 
@@ -309,6 +317,7 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
         height: Int,
         scale: Int,
         sampleY: Int,
+        dimension: RegistryKey<DPReader.Dimension>,
         pixels: inout [UInt8]
     ) -> Bool {
         let fillStartNs = DispatchTime.now().uptimeNanoseconds
@@ -350,7 +359,8 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
                 tileCoords: tilesToSchedule,
                 treeKey: treeKey,
                 worldGenerator: worldGenerator,
-                sampleY: sampleY
+                sampleY: sampleY,
+                dimension: dimension
             )
         }
 
@@ -410,7 +420,8 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
         tileCoords: [TileCoord],
         treeKey: TreeKey,
         worldGenerator: WorldGenerator,
-        sampleY: Int
+        sampleY: Int,
+        dimension: RegistryKey<DPReader.Dimension>
     ) {
         guard !tileCoords.isEmpty else { return }
 
@@ -430,7 +441,8 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
                     tileCoords: group,
                     treeKey: treeKey,
                     worldGenerator: worldGenerator,
-                    sampleY: sampleY
+                    sampleY: sampleY,
+                    dimension: dimension
                 )
             }
             return
@@ -446,6 +458,7 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
         let regionTopLeftX = minTileX * tileSize * baseScale
         let regionTopLeftZ = minTileZ * tileSize * baseScale
         let tileCoordsSet = Set(tileCoords)
+        let dimensionID = dimension.name
         recordBatchScheduled(tileCount: tileCoords.count, boundingTileCount: regionTileCount)
 
         lockQueue.sync(flags: .barrier) {
@@ -468,6 +481,7 @@ final class BiomeQuadTreeCache: @unchecked Sendable {
                 width: regionTileWidth * self.tileSize,
                 height: regionTileHeight * self.tileSize,
                 scale: self.baseScale,
+                dimension: RegistryKey(referencing: dimensionID),
                 sampleY: sampleY
             )
             let renderNs = DispatchTime.now().uptimeNanoseconds - renderStartNs
@@ -681,7 +695,6 @@ struct BiomeMapRenderer {
         dimension: DPReader.RegistryKey<DPReader.Dimension> = DPReader.RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld"),
         sampleY: Int = 256
     ) throws -> BiomePixelMap {
-        let _ = dimension
         guard width > 0, height > 0 else {
             throw BiomeMapRendererError.invalidSize
         }
@@ -706,7 +719,7 @@ struct BiomeMapRenderer {
             from: fromPos,
             to: toPos,
             atY: Int32(sampleY),
-            in: RegistryKey(referencing: "minecraft:overworld"),
+            in: dimension,
             scale: Int32(scale),
             forceNoBaking: forceNoBaking
         )

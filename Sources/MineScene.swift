@@ -28,6 +28,15 @@ final class MineSceneApp {
         paste: read a world seed from the clipboard and apply it.
         """
 
+        static let dimension = """
+        Usage: /dimension <subcommand>
+        get: print the current noise settings ID.
+        list: list discovered noise settings IDs from the loaded datapacks.
+        set <id>: rebuild world generation with that noise settings entry.
+        This command operates on worldgen noise settings, not the dimension registry itself.
+        Different noise settings can change min_y and total height, so this rebuilds worldgen similarly to /seed set.
+        """
+
         static let waypoint = """
         Usage: /waypoint <subcommand>
         save <name> [pos] [seed]: save a waypoint.
@@ -66,6 +75,7 @@ final class MineSceneApp {
         case clipboardReadFailed
         case clipboardWriteFailed
         case clipboardMissingWorldSeed
+        case noiseSettingsNotFound(String)
         case waypointFileReadFailed(String)
         case waypointFileWriteFailed(String)
         case invalidWaypointFile(line: Int, reason: String)
@@ -86,6 +96,8 @@ final class MineSceneApp {
                 return "failed to write to the clipboard"
             case .clipboardMissingWorldSeed:
                 return "clipboard does not contain a world seed"
+            case .noiseSettingsNotFound(let id):
+                return "noise settings '\(id)' were not found in the loaded datapacks"
             case .waypointFileReadFailed(let name):
                 return "failed to read waypoint file '\(name)'"
             case .waypointFileWriteFailed(let name):
@@ -132,12 +144,14 @@ final class MineSceneApp {
     private var imageAvailable: VulkanOwnedSemaphore?
     private var renderFinishedByImage: [VulkanOwnedSemaphore] = []
     private var biomeColorPalette = BiomeColorPalette.defaultPalette()
-    private let overworldSettingsKey = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
+    private let defaultNoiseSettingsKey = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
     private let renderDistanceSetting: Setting<IntSettingValue>
     private let keybindSettings: [KeybindAction: Setting<KeybindSettingValue>]
     private let settingsByName: [String: any SettingProtocol]
     private var dataPacks: [DataPack] = []
     private var currentWorldSeed: Int64 = 0
+    private var currentNoiseSettingsKey = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
+    private var currentBiomeDimensionKey = RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld")
     private var waypoints: [String: Waypoint] = [:]
     private var activeRenderer: ActiveRenderer = .terrain
 
@@ -218,10 +232,12 @@ final class MineSceneApp {
         Self.logStartupStep("loading persisted settings")
         Self.loadSettingsFromDisk(settingsByName: settings.byName)
         self.currentWorldSeed = seed
+        self.currentNoiseSettingsKey = defaultNoiseSettingsKey
+        self.currentBiomeDimensionKey = biomeDimensionKey(for: defaultNoiseSettingsKey)
         Self.logStartupStep("creating world generator")
         let worldGenerator: WorldGenerator
         do {
-            worldGenerator = try makeWorldGenerator(seed: seed)
+            worldGenerator = try makeWorldGenerator(seed: seed, noiseSettingsKey: defaultNoiseSettingsKey)
         } catch {
             Self.logStartupError("creating world generator", error: error)
             throw error
@@ -498,11 +514,14 @@ final class MineSceneApp {
         )
     }
 
-    private func makeWorldGenerator(seed: Int64) throws -> WorldGenerator {
+    private func makeWorldGenerator(
+        seed: Int64,
+        noiseSettingsKey: RegistryKey<NoiseSettings>
+    ) throws -> WorldGenerator {
         try WorldGenerator(
             withWorldSeed: UInt64(bitPattern: seed),
             usingDataPacks: dataPacks,
-            usingSettings: overworldSettingsKey
+            usingSettings: noiseSettingsKey
         )
     }
 
@@ -545,6 +564,7 @@ final class MineSceneApp {
                     "/help [command]: show command help.",
                     "/tp <pos>: teleport the camera.",
                     "/seed <subcommand>: view or change the world seed.",
+                    "/dimension <subcommand>: view or change the active worldgen noise settings.",
                     "/waypoint <subcommand>: manage saved waypoints.",
                     "/colormap <file>: load a biome colormap file.",
                     "/setting <subcommand>: view or change settings."
@@ -569,13 +589,40 @@ final class MineSceneApp {
             case "set":
                 let seed = try parser.getNextWorldSeed()
                 try parser.end()
-                try applyWorldSeed(seed)
+                try applyWorldGenerationState(seed: seed, noiseSettingsKey: currentNoiseSettingsKey)
                 terrainRenderer?.logCommandMessage("Set world seed to \(seed).")
             case "paste":
                 try parser.end()
                 let seed = try readWorldSeedFromClipboard()
-                try applyWorldSeed(seed)
+                try applyWorldGenerationState(seed: seed, noiseSettingsKey: currentNoiseSettingsKey)
                 terrainRenderer?.logCommandMessage("Pasted world seed \(seed) from clipboard.")
+            default:
+                throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
+            }
+            return true
+        case "dimension":
+            var parser = TerrainRendererCommandArgumentParser(arguments)
+            let subcommand = try parser.getNextString()
+            switch subcommand {
+            case "get":
+                try parser.end()
+                renderer.logCommandMessage("Current noise settings ID is \(currentNoiseSettingsKey.name).")
+            case "list":
+                try parser.end()
+                let discoveredIDs = discoveredNoiseSettingsIDs()
+                if discoveredIDs.isEmpty {
+                    renderer.logCommandMessage("No noise settings IDs were discovered in the loaded datapacks.")
+                } else {
+                    renderer.logCommandMessage(
+                        "Discovered noise settings IDs (\(discoveredIDs.count)): \(discoveredIDs.joined(separator: ", "))"
+                    )
+                }
+            case "set":
+                let requestedID = try parser.getNextString()
+                try parser.end()
+                let noiseSettingsKey = try noiseSettingsKey(for: requestedID)
+                try applyWorldGenerationState(seed: currentWorldSeed, noiseSettingsKey: noiseSettingsKey)
+                terrainRenderer?.logCommandMessage("Set worldgen noise settings to \(noiseSettingsKey.name).")
             default:
                 throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
             }
@@ -640,7 +687,7 @@ final class MineSceneApp {
                 guard let waypoint = waypoints[name] else {
                     throw CommandError.waypointNotFound(name)
                 }
-                try applyWorldSeed(waypoint.seed)
+                try applyWorldGenerationState(seed: waypoint.seed, noiseSettingsKey: currentNoiseSettingsKey)
                 terrainRenderer?.cameraPosition = waypoint.position
                 if let terrainRenderer {
                     terrainRenderer.logCommandMessage(
@@ -724,8 +771,11 @@ final class MineSceneApp {
         }
     }
 
-    private func applyWorldSeed(_ seed: Int64) throws {
-        let newWorldGenerator = try makeWorldGenerator(seed: seed)
+    private func applyWorldGenerationState(
+        seed: Int64,
+        noiseSettingsKey: RegistryKey<NoiseSettings>
+    ) throws {
+        let newWorldGenerator = try makeWorldGenerator(seed: seed, noiseSettingsKey: noiseSettingsKey)
         waitForGpuToFinishCurrentFrame()
 
         terrainRenderer?.discardChunkMeshes()
@@ -786,6 +836,8 @@ final class MineSceneApp {
             return CommandHelp.tp.split(separator: "\n").map(String.init)
         case "seed":
             return CommandHelp.seed.split(separator: "\n").map(String.init)
+        case "dimension":
+            return CommandHelp.dimension.split(separator: "\n").map(String.init)
         case "waypoint":
             return CommandHelp.waypoint.split(separator: "\n").map(String.init)
         case "colormap":
@@ -1159,6 +1211,7 @@ final class MineSceneApp {
                 worldGenerator: worldGenerator,
                 biomeColorPalette: biomeColorPalette
             )
+            biomeMapRenderer.dimensionKey = currentBiomeDimensionKey
             biomeMapRenderer.recenter(on: terrainRenderer.currentCameraPosition)
             self.biomeMapRenderer = biomeMapRenderer
             setRelativeMouseMode(enabled: false)
@@ -1198,5 +1251,38 @@ final class MineSceneApp {
 
     private static func isASCIIDigit(_ character: Character) -> Bool {
         character >= "0" && character <= "9"
+    }
+    
+    private func discoveredNoiseSettingsIDs() -> [String] {
+        var discoveredIDs: Set<String> = []
+        for dataPack in dataPacks {
+            dataPack.noiseSettingsRegistry.forEach { entry in
+                discoveredIDs.insert(entry.key.name)
+            }
+        }
+        return discoveredIDs.sorted()
+    }
+
+    private func noiseSettingsKey(for requestedID: String) throws -> RegistryKey<NoiseSettings> {
+        let normalizedID = normalizeRegistryID(requestedID)
+        guard discoveredNoiseSettingsIDs().contains(normalizedID) else {
+            throw CommandError.noiseSettingsNotFound(normalizedID)
+        }
+        return RegistryKey<NoiseSettings>(referencing: normalizedID)
+    }
+
+    private func biomeDimensionKey(for noiseSettingsKey: RegistryKey<NoiseSettings>) -> RegistryKey<DPReader.Dimension> {
+        switch noiseSettingsKey.name {
+        case "minecraft:nether":
+            return RegistryKey<DPReader.Dimension>(referencing: "minecraft:the_nether")
+        case "minecraft:end":
+            return RegistryKey<DPReader.Dimension>(referencing: "minecraft:the_end")
+        default:
+            return noiseSettingsKey.convertType()
+        }
+    }
+
+    private func normalizeRegistryID(_ identifier: String) -> String {
+        identifier.contains(":") ? identifier : "minecraft:\(identifier)"
     }
 }

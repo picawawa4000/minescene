@@ -34,7 +34,6 @@ final class MineSceneApp {
         list: list discovered noise settings IDs from the loaded datapacks.
         set <id>: rebuild world generation with that noise settings entry.
         This command operates on worldgen noise settings, not the dimension registry itself.
-        Different noise settings can change min_y and total height, so this rebuilds worldgen similarly to /seed set.
         """
 
         static let waypoint = """
@@ -783,7 +782,19 @@ final class MineSceneApp {
 
         worldGenerator = newWorldGenerator
         currentWorldSeed = seed
+        currentNoiseSettingsKey = noiseSettingsKey
+        currentBiomeDimensionKey = biomeDimensionKey(for: noiseSettingsKey)
         replaceTerrainRenderer(worldGenerator: newWorldGenerator)
+
+        if activeRenderer == .biomeMap, let terrainRenderer {
+            let biomeMapRenderer = BiomeMapViewRenderer(
+                worldGenerator: newWorldGenerator,
+                biomeColorPalette: biomeColorPalette
+            )
+            biomeMapRenderer.dimensionKey = currentBiomeDimensionKey
+            biomeMapRenderer.recenter(on: terrainRenderer.currentCameraPosition)
+            self.biomeMapRenderer = biomeMapRenderer
+        }
     }
 
     private func copyTextToClipboard(_ text: String) throws {
@@ -1176,6 +1187,7 @@ final class MineSceneApp {
                 worldGenerator: worldGenerator,
                 biomeColorPalette: biomeColorPalette
             )
+            biomeMapRenderer.dimensionKey = currentBiomeDimensionKey
             biomeMapRenderer.recenter(on: terrainRenderer.currentCameraPosition)
             self.biomeMapRenderer = biomeMapRenderer
         }
@@ -1274,7 +1286,7 @@ final class MineSceneApp {
     private func biomeDimensionKey(for noiseSettingsKey: RegistryKey<NoiseSettings>) -> RegistryKey<DPReader.Dimension> {
         switch noiseSettingsKey.name {
         case "minecraft:nether":
-            return RegistryKey<DPReader.Dimension>(referencing: "minecraft:the_nether")
+            return RegistryKey<DPReader.Dimension>(referencing: "minecraft:nether")
         case "minecraft:end":
             return RegistryKey<DPReader.Dimension>(referencing: "minecraft:the_end")
         default:

@@ -347,8 +347,8 @@ extension TerrainRenderer {
         }
 
         for index in 0..<(path.samples.count - 1) {
-            let start = SIMD3<Float>(path.samples[index].position)
-            let end = SIMD3<Float>(path.samples[index + 1].position)
+            let start = overlayPosition(SIMD3<Float>(path.samples[index].position))
+            let end = overlayPosition(SIMD3<Float>(path.samples[index + 1].position))
             let direction = end - start
             let lengthSquared = simd_length_squared(direction)
             guard lengthSquared > 1e-6 else {
@@ -388,7 +388,7 @@ extension TerrainRenderer {
     }
 
     private func appendKeyframeBillboardVertices(for keyframe: Keyframe, into vertices: inout [VulkanEngine.Vertex3D]) {
-        let center = SIMD3<Float>(keyframe.position)
+        let center = overlayPosition(SIMD3<Float>(keyframe.position))
         let camera = SIMD3<Float>(
             Float(cameraPosition.x),
             Float(cameraPosition.y),
@@ -451,6 +451,21 @@ extension TerrainRenderer {
         return wrapped
     }
 
+    private func overlayPosition(_ position: SIMD3<Float>) -> SIMD3<Float> {
+        let camera = SIMD3<Float>(
+            Float(cameraPosition.x),
+            Float(cameraPosition.y),
+            Float(cameraPosition.z)
+        )
+        let toCamera = camera - position
+        let distanceSquared = simd_length_squared(toCamera)
+        guard distanceSquared > 1e-8 else {
+            return position + viewForward() * keyframeOverlayDepthBias
+        }
+        let depthBias = max(keyframeOverlayDepthBias, sqrt(distanceSquared) * 0.0005)
+        return position + normalizeOrZero(toCamera) * depthBias
+    }
+
     private func appendOverlayQuad(
         _ vertices: inout [VulkanEngine.Vertex3D],
         a: SIMD3<Float>,
@@ -465,5 +480,11 @@ extension TerrainRenderer {
         vertices.append(.init(position: a, color: color))
         vertices.append(.init(position: c, color: color))
         vertices.append(.init(position: d, color: color))
+        vertices.append(.init(position: a, color: color))
+        vertices.append(.init(position: c, color: color))
+        vertices.append(.init(position: b, color: color))
+        vertices.append(.init(position: a, color: color))
+        vertices.append(.init(position: d, color: color))
+        vertices.append(.init(position: c, color: color))
     }
 }

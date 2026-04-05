@@ -30,29 +30,41 @@ final class TerrainRenderer {
     }
 
     private struct CompactSection {
+        let sampleStride: Int
+        let cellSideLength: Int
         let bitmap: [UInt64]
         let biomePalette: [CompactBiomeEntry]
         let biomeIndices: [UInt8]
 
         @inline(__always)
-        func biomeEntry(atBlockIndex blockIndex: Int) -> CompactBiomeEntry {
-            biomePalette[Int(biomeIndices[blockIndex])]
+        func biomeEntry(atLocalX x: Int, y: Int, z: Int) -> CompactBiomeEntry {
+            biomePalette[Int(biomeIndices[cellIndex(atLocalX: x, y: y, z: z)])]
         }
 
         @inline(__always)
-        func isSolid(atBlockIndex blockIndex: Int) -> Bool {
+        func isSolid(atLocalX x: Int, y: Int, z: Int) -> Bool {
+            let blockIndex = cellIndex(atLocalX: x, y: y, z: z)
             let wordIndex = blockIndex >> 6
             let bitIndex = blockIndex & 63
             return (bitmap[wordIndex] & (UInt64(1) << UInt64(bitIndex))) != 0
         }
+
+        var hasAnySolid: Bool {
+            bitmap.contains(where: { $0 != 0 })
+        }
+
+        @inline(__always)
+        private func cellIndex(atLocalX x: Int, y: Int, z: Int) -> Int {
+            let cellX = x / sampleStride
+            let cellY = y / sampleStride
+            let cellZ = z / sampleStride
+            return (cellY * cellSideLength + cellZ) * cellSideLength + cellX
+        }
     }
 
-    private struct CompactChunk {
-        let minY: Int
-        let height: Int
+    private struct CompactChunkLod {
+        let sampleStride: Int
         let sections: [CompactSection]
-
-        var sectionCount: Int { sections.count }
 
         @inline(__always)
         func section(at index: Int) -> CompactSection? {
@@ -61,28 +73,62 @@ final class TerrainRenderer {
             }
             return sections[index]
         }
+    }
+
+    private struct CompactChunk {
+        let minY: Int
+        let height: Int
+        let lods: [CompactChunkLod]
+
+        var sectionCount: Int { lods[0].sections.count }
 
         @inline(__always)
-        func biomeEntry(atLocalX x: Int, y: Int, z: Int) -> CompactBiomeEntry? {
+        func section(at index: Int, sampleStride: Int = 1) -> CompactSection? {
+            lod(forSampleStride: sampleStride).section(at: index)
+        }
+
+        @inline(__always)
+        func biomeEntry(atLocalX x: Int, y: Int, z: Int, sampleStride: Int = 1) -> CompactBiomeEntry? {
             guard x >= 0, x < 16, y >= 0, y < height, z >= 0, z < 16 else {
                 return nil
             }
             let sectionIndex = y >> 4
             let localY = y & 15
-            let blockIndex = (localY << 8) | (z << 4) | x
-            return sections[sectionIndex].biomeEntry(atBlockIndex: blockIndex)
+            return lod(forSampleStride: sampleStride).sections[sectionIndex].biomeEntry(
+                atLocalX: x,
+                y: localY,
+                z: z
+            )
         }
 
         @inline(__always)
-        func isSolid(atLocalX x: Int, y: Int, z: Int) -> Bool {
+        func isSolid(atLocalX x: Int, y: Int, z: Int, sampleStride: Int = 1) -> Bool {
             guard x >= 0, x < 16, y >= 0, y < height, z >= 0, z < 16 else {
                 return false
             }
             let sectionIndex = y >> 4
             let localY = y & 15
-            let blockIndex = (localY << 8) | (z << 4) | x
-            return sections[sectionIndex].isSolid(atBlockIndex: blockIndex)
+            return lod(forSampleStride: sampleStride).sections[sectionIndex].isSolid(
+                atLocalX: x,
+                y: localY,
+                z: z
+            )
         }
+
+        @inline(__always)
+        private func lod(forSampleStride sampleStride: Int) -> CompactChunkLod {
+            let exponent = sampleStride.trailingZeroBitCount
+            precondition(exponent >= 0 && exponent < lods.count, "unsupported sample stride \(sampleStride)")
+            let lod = lods[exponent]
+            precondition(lod.sampleStride == sampleStride, "mismatched sample stride \(sampleStride)")
+            return lod
+        }
+    }
+
+    struct TerrainLodSettings {
+        var nearDistance: Int
+        var stepDistance: Int
+        var maxSampleStride: Int
     }
 
     private struct ChunkMeshSnapshot {
@@ -90,6 +136,7 @@ final class TerrainRenderer {
         let revision: Int
         let chunk: CompactChunk
         let neighbors: [ChunkCoord: CompactChunk]
+        let sampleStrideByChunk: [ChunkCoord: Int]
         let generationSeconds: Double
         let totalTargetChunks: Int
         let availableChunks: Int
@@ -157,6 +204,7 @@ final class TerrainRenderer {
     }
 
     final class Streamer: @unchecked Sendable {
+        private static let supportedSampleStrides = [1, 2, 4, 8, 16]
         private let worldGenerator: WorldGenerator
         private let generationWorkerCount: Int
         private let retargetAroundCameraMovement: Bool
@@ -168,6 +216,7 @@ final class TerrainRenderer {
 
         private var renderRadius: Int
         private var orderedOffsets: [ChunkCoord]
+        private var terrainLodSettings: TerrainLodSettings
         private var targetCenter: ChunkCoord?
         private var targetCameraBlock = SIMD3<Int>(Int.min, Int.min, Int.min)
         private var pinnedChunks: Set<ChunkCoord> = []
@@ -188,13 +237,15 @@ final class TerrainRenderer {
             renderRadius: Int,
             generationWorkerCount: Int,
             retargetAroundCameraMovement: Bool,
-            biomeColorPalette: BiomeColorPalette
+            biomeColorPalette: BiomeColorPalette,
+            terrainLodSettings: TerrainLodSettings
         ) {
             self.worldGenerator = worldGenerator
             self.renderRadius = max(0, renderRadius)
             self.generationWorkerCount = max(1, generationWorkerCount)
             self.retargetAroundCameraMovement = retargetAroundCameraMovement
             self.biomeColorPalette = biomeColorPalette
+            self.terrainLodSettings = terrainLodSettings
             self.orderedOffsets = Self.makeOrderedOffsets(radius: self.renderRadius)
         }
 
@@ -334,6 +385,7 @@ final class TerrainRenderer {
             var generationWorkersToStart = 0
             var meshWorkersToStart = 0
             lock.lock()
+            let previousCenter = targetCenter
             let effectiveCenter: ChunkCoord
             if retargetAroundCameraMovement || targetCenter == nil {
                 effectiveCenter = center
@@ -350,9 +402,13 @@ final class TerrainRenderer {
                 }
             }
             if centerChanged {
-                for coord in chunks.keys {
-                    markChunkDirtyLocked(coord)
-                }
+                let impactedChunks = impactedChunksForSampleStrideChangesLocked(
+                    previousCenter: previousCenter,
+                    previousSettings: terrainLodSettings,
+                    nextCenter: effectiveCenter,
+                    nextSettings: terrainLodSettings
+                )
+                invalidatePendingMeshResultsLocked(for: impactedChunks)
             }
             generationWorkersToStart = startGenerationWorkersLocked()
             meshWorkersToStart = startMeshWorkersLocked()
@@ -438,6 +494,45 @@ final class TerrainRenderer {
                 markChunkDirtyLocked(coord)
             }
             pendingMeshResults.removeAll(keepingCapacity: true)
+            meshWorkersToStart = startMeshWorkersLocked()
+            lock.unlock()
+
+            for _ in 0..<meshWorkersToStart {
+                meshQueue.async { [self] in
+                    meshWorkerLoop()
+                }
+            }
+        }
+
+        func setTerrainLodSettings(
+            nearDistance: Int,
+            stepDistance: Int,
+            maxSampleStride: Int
+        ) {
+            let normalized = TerrainLodSettings(
+                nearDistance: max(0, nearDistance),
+                stepDistance: max(1, stepDistance),
+                maxSampleStride: Self.normalizedSampleStride(maxSampleStride)
+            )
+            var meshWorkersToStart = 0
+
+            lock.lock()
+            guard normalized.nearDistance != terrainLodSettings.nearDistance ||
+                    normalized.stepDistance != terrainLodSettings.stepDistance ||
+                    normalized.maxSampleStride != terrainLodSettings.maxSampleStride else {
+                lock.unlock()
+                return
+            }
+
+            let previousSettings = terrainLodSettings
+            terrainLodSettings = normalized
+            let impactedChunks = impactedChunksForSampleStrideChangesLocked(
+                previousCenter: targetCenter,
+                previousSettings: previousSettings,
+                nextCenter: targetCenter,
+                nextSettings: normalized
+            )
+            invalidatePendingMeshResultsLocked(for: impactedChunks)
             meshWorkersToStart = startMeshWorkersLocked()
             lock.unlock()
 
@@ -573,6 +668,9 @@ final class TerrainRenderer {
                         neighbors[neighbor] = neighborChunk
                     }
                 }
+                let sampleStrideByChunk = neighbors.keys.reduce(into: [ChunkCoord: Int]()) { sampleStrides, neighborCoord in
+                    sampleStrides[neighborCoord] = sampleStrideLocked(for: neighborCoord)
+                }
                 let generationSeconds = generationSecondsByChunk[coord] ?? 0
                 lock.unlock()
 
@@ -581,6 +679,7 @@ final class TerrainRenderer {
                     revision: revision,
                     chunk: chunk,
                     neighbors: neighbors,
+                    sampleStrideByChunk: sampleStrideByChunk,
                     generationSeconds: generationSeconds,
                     totalTargetChunks: orderedOffsets.count,
                     availableChunks: availableChunks
@@ -614,7 +713,12 @@ final class TerrainRenderer {
             )
 
             let meshStart = TerrainRenderer.currentTimeSeconds()
-            let meshBuild = buildGreedyMesh(coord: snapshot.coord, chunk: snapshot.chunk, neighbors: snapshot.neighbors)
+            let meshBuild = buildGreedyMesh(
+                coord: snapshot.coord,
+                chunk: snapshot.chunk,
+                neighbors: snapshot.neighbors,
+                sampleStrideByChunk: snapshot.sampleStrideByChunk
+            )
             profile.meshSeconds = TerrainRenderer.currentTimeSeconds() - meshStart
 
             return ChunkMeshResult(
@@ -629,8 +733,8 @@ final class TerrainRenderer {
         }
 
         private func makeCompactChunk(from protoChunk: ProtoChunk) -> CompactChunk {
-            var sections: [CompactSection] = []
-            sections.reserveCapacity(protoChunk.sectionCount)
+            var fullResolutionSections: [CompactSection] = []
+            fullResolutionSections.reserveCapacity(protoChunk.sectionCount)
 
             for sectionIndex in 0..<protoChunk.sectionCount {
                 guard let section = protoChunk.section(at: sectionIndex) else {
@@ -673,8 +777,10 @@ final class TerrainRenderer {
                     biomeIndices[blockIndex] = UInt8(paletteIndex)
                 }
 
-                sections.append(
+                fullResolutionSections.append(
                     CompactSection(
+                        sampleStride: 1,
+                        cellSideLength: 16,
                         bitmap: bitmap,
                         biomePalette: biomePalette,
                         biomeIndices: biomeIndices
@@ -682,11 +788,74 @@ final class TerrainRenderer {
                 )
             }
 
+            let lods = Self.supportedSampleStrides.map { sampleStride in
+                CompactChunkLod(
+                    sampleStride: sampleStride,
+                    sections: sampleStride == 1
+                        ? fullResolutionSections
+                        : makeLodSections(from: fullResolutionSections, sampleStride: sampleStride)
+                )
+            }
+
             return CompactChunk(
                 minY: Int(protoChunk.minY),
                 height: Int(protoChunk.height),
-                sections: sections
+                lods: lods
             )
+        }
+
+        private func makeLodSections(
+            from fullResolutionSections: [CompactSection],
+            sampleStride: Int
+        ) -> [CompactSection] {
+            precondition(sampleStride > 1 && sampleStride <= ProtoChunk.sideLength, "invalid sample stride \(sampleStride)")
+            let cellSideLength = ProtoChunk.sideLength / sampleStride
+            let cellCount = cellSideLength * cellSideLength * cellSideLength
+            let bitmapWordCount = (cellCount + 63) >> 6
+            let sampleOffset = sampleStride >> 1
+
+            return fullResolutionSections.map { sourceSection in
+                var bitmap = [UInt64](repeating: 0, count: bitmapWordCount)
+                var biomePalette: [CompactBiomeEntry] = []
+                biomePalette.reserveCapacity(8)
+                var paletteIndexByName: [String: Int] = [:]
+                var biomeIndices = [UInt8](repeating: 0, count: cellCount)
+
+                for cellIndex in 0..<cellCount {
+                    let cellX = cellIndex % cellSideLength
+                    let cellZ = (cellIndex / cellSideLength) % cellSideLength
+                    let cellY = cellIndex / (cellSideLength * cellSideLength)
+                    let sampleX = min(ProtoChunk.sideLength - 1, cellX * sampleStride + sampleOffset)
+                    let sampleY = min(ProtoChunk.sectionHeight - 1, cellY * sampleStride + sampleOffset)
+                    let sampleZ = min(ProtoChunk.sideLength - 1, cellZ * sampleStride + sampleOffset)
+
+                    if sourceSection.isSolid(atLocalX: sampleX, y: sampleY, z: sampleZ) {
+                        let wordIndex = cellIndex >> 6
+                        let bitIndex = cellIndex & 63
+                        bitmap[wordIndex] |= UInt64(1) << UInt64(bitIndex)
+                    }
+
+                    let biomeEntry = sourceSection.biomeEntry(atLocalX: sampleX, y: sampleY, z: sampleZ)
+                    let paletteIndex: Int
+                    if let existing = paletteIndexByName[biomeEntry.name] {
+                        paletteIndex = existing
+                    } else {
+                        paletteIndex = biomePalette.count
+                        precondition(paletteIndex < 256, "section biome palette exceeded UInt8 capacity")
+                        paletteIndexByName[biomeEntry.name] = paletteIndex
+                        biomePalette.append(biomeEntry)
+                    }
+                    biomeIndices[cellIndex] = UInt8(paletteIndex)
+                }
+
+                return CompactSection(
+                    sampleStride: sampleStride,
+                    cellSideLength: cellSideLength,
+                    bitmap: bitmap,
+                    biomePalette: biomePalette,
+                    biomeIndices: biomeIndices
+                )
+            }
         }
 
         private func pruneChunksLockedIfNeeded() -> [ChunkCoord] {
@@ -788,16 +957,94 @@ final class TerrainRenderer {
             return result >= 0 ? result : result + divisor
         }
 
+        private func sampleStrideLocked(for coord: ChunkCoord) -> Int {
+            guard let center = targetCenter else {
+                return 1
+            }
+            return sampleStride(for: coord, relativeTo: center, settings: terrainLodSettings)
+        }
+
+        private func sampleStride(
+            for coord: ChunkCoord,
+            relativeTo center: ChunkCoord,
+            settings: TerrainLodSettings
+        ) -> Int {
+            let maxSampleStride = settings.maxSampleStride
+            guard maxSampleStride > 1 else {
+                return 1
+            }
+
+            let distanceChunks = max(abs(coord.x - center.x), abs(coord.z - center.z))
+            let distanceBlocks = distanceChunks * ProtoChunk.sideLength
+            guard distanceBlocks >= settings.nearDistance else {
+                return 1
+            }
+
+            let lodBand = ((distanceBlocks - settings.nearDistance) / settings.stepDistance) + 1
+            var sampleStride = 1
+            for _ in 0..<lodBand where sampleStride < maxSampleStride {
+                sampleStride = min(maxSampleStride, sampleStride << 1)
+            }
+            return sampleStride
+        }
+
+        private func impactedChunksForSampleStrideChangesLocked(
+            previousCenter: ChunkCoord?,
+            previousSettings: TerrainLodSettings,
+            nextCenter: ChunkCoord?,
+            nextSettings: TerrainLodSettings
+        ) -> Set<ChunkCoord> {
+            var impactedChunks: Set<ChunkCoord> = []
+
+            for coord in chunks.keys {
+                let previousStride = previousCenter.map { sampleStride(for: coord, relativeTo: $0, settings: previousSettings) } ?? 1
+                let nextStride = nextCenter.map { sampleStride(for: coord, relativeTo: $0, settings: nextSettings) } ?? 1
+                guard previousStride != nextStride else {
+                    continue
+                }
+
+                impactedChunks.insert(coord)
+                for neighbor in adjacentChunkCoords(to: coord) where chunks[neighbor] != nil {
+                    impactedChunks.insert(neighbor)
+                }
+            }
+
+            for coord in impactedChunks {
+                markChunkDirtyLocked(coord)
+            }
+            return impactedChunks
+        }
+
+        private func invalidatePendingMeshResultsLocked(for impactedChunks: Set<ChunkCoord>) {
+            guard !impactedChunks.isEmpty else {
+                return
+            }
+            for coord in impactedChunks {
+                pendingMeshResults.removeValue(forKey: coord)
+            }
+        }
+
+        static func normalizedSampleStride(_ requestedStride: Int) -> Int {
+            let clamped = max(1, min(ProtoChunk.sideLength, requestedStride))
+            var normalized = 1
+            while (normalized << 1) <= clamped {
+                normalized <<= 1
+            }
+            return normalized
+        }
+
         private func buildGreedyMesh(
             coord: ChunkCoord,
             chunk: CompactChunk,
-            neighbors: [ChunkCoord: CompactChunk]
+            neighbors: [ChunkCoord: CompactChunk],
+            sampleStrideByChunk: [ChunkCoord: Int]
         ) -> (origin: SIMD3<Int>, vertices: [VulkanEngine.Vertex3D]) {
+            let chunkSampleStride = sampleStrideByChunk[coord] ?? 1
             var firstSolidSection = Int.max
             var lastSolidSection = Int.min
             for sectionIndex in 0..<chunk.sectionCount {
-                guard let section = chunk.section(at: sectionIndex),
-                      section.bitmap.contains(where: { $0 != 0 }) else {
+                guard let section = chunk.section(at: sectionIndex, sampleStride: chunkSampleStride),
+                      section.hasAnySolid else {
                     continue
                 }
                 firstSolidSection = min(firstSolidSection, sectionIndex)
@@ -827,7 +1074,12 @@ final class TerrainRenderer {
             @inline(__always)
             func packedBiomeColorForOwnedBlock(_ x: Int, _ y: Int, _ z: Int) -> UInt32 {
                 let absoluteLocalY = firstSolidSection * ProtoChunk.sectionHeight + y
-                return chunk.biomeEntry(atLocalX: x, y: absoluteLocalY, z: z)?.packedColor
+                return chunk.biomeEntry(
+                    atLocalX: x,
+                    y: absoluteLocalY,
+                    z: z,
+                    sampleStride: chunkSampleStride
+                )?.packedColor
                     ?? biomeColorPalette.packedRGBA8(forBiomeID: nil)
             }
 
@@ -840,13 +1092,19 @@ final class TerrainRenderer {
                 guard let queryChunk = neighbors[queryCoord] else {
                     return false
                 }
+                let querySampleStride = sampleStrideByChunk[queryCoord] ?? 1
                 let localX = floorMod(worldX, 16)
                 let localZ = floorMod(worldZ, 16)
                 let localY = worldY - queryChunk.minY
                 guard localY >= 0, localY < queryChunk.height else {
                     return false
                 }
-                return queryChunk.isSolid(atLocalX: localX, y: localY, z: localZ)
+                return queryChunk.isSolid(
+                    atLocalX: localX,
+                    y: localY,
+                    z: localZ,
+                    sampleStride: querySampleStride
+                )
             }
 
             @inline(__always)
@@ -1098,6 +1356,7 @@ final class TerrainRenderer {
     let keyframePathColor = SIMD4<Float>(0.92, 0.16, 0.14, 1.0)
     let keyframeMarkerHalfSize: Float = 0.65
     let keyframePathHalfWidth: Float = 0.08
+    let keyframeOverlayDepthBias: Float = 0.35
     let cinematicPlaybackSpeed: Double = 8.0
     let minimumCinematicSegmentDuration: Double = 0.35
 
@@ -1127,7 +1386,7 @@ final class TerrainRenderer {
         }
     }
     var keyframePlaybackSpeed: Double = 8.0
-    var showsKeyframes = false
+    var showsKeyframes = true
     var isRenderingForExport = false
 
     var keyW = false
@@ -1154,6 +1413,9 @@ final class TerrainRenderer {
         worldGenerator: WorldGenerator,
         biomeColorPalette: BiomeColorPalette,
         renderRadius: Int = 12,
+        terrainLodNearDistance: Int = 128,
+        terrainLodStepDistance: Int = 128,
+        terrainLodMaxScale: Int = 8,
         moveSpeed: Float = 32.0,
         fastMoveMultiplier: Float = 4.0,
         zoomMultiplier: Float = 4.0,
@@ -1169,7 +1431,12 @@ final class TerrainRenderer {
             renderRadius: renderRadius,
             generationWorkerCount: generationWorkerCount,
             retargetAroundCameraMovement: true,
-            biomeColorPalette: biomeColorPalette
+            biomeColorPalette: biomeColorPalette,
+            terrainLodSettings: TerrainLodSettings(
+                nearDistance: max(0, terrainLodNearDistance),
+                stepDistance: max(1, terrainLodStepDistance),
+                maxSampleStride: Streamer.normalizedSampleStride(terrainLodMaxScale)
+            )
         )
     }
 
@@ -1207,7 +1474,7 @@ final class TerrainRenderer {
             fovYRadians: effectiveFovYRadians,
             aspect: aspect,
             nearZ: 0.05,
-            farZ: 2048.0
+            farZ: 8192.0
         )
 
         try engine.updateTransform3D(projection)
@@ -1373,6 +1640,18 @@ final class TerrainRenderer {
 
     func setRenderRadius(_ renderRadius: Int) {
         _ = streamer.setRenderRadius(to: renderRadius)
+    }
+
+    func setTerrainLodSettings(
+        nearDistance: Int,
+        stepDistance: Int,
+        maxSampleStride: Int
+    ) {
+        streamer.setTerrainLodSettings(
+            nearDistance: nearDistance,
+            stepDistance: stepDistance,
+            maxSampleStride: maxSampleStride
+        )
     }
 
     func currentRenderRadius() -> Int {

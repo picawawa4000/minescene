@@ -158,6 +158,9 @@ final class MineSceneApp {
     private var biomeColorPalette = BiomeColorPalette.defaultPalette()
     private let defaultNoiseSettingsKey = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
     private let renderDistanceSetting: Setting<IntSettingValue>
+    private let terrainLodNearDistanceSetting: Setting<IntSettingValue>
+    private let terrainLodStepDistanceSetting: Setting<IntSettingValue>
+    private let terrainLodMaxScaleSetting: Setting<IntSettingValue>
     private let keybindSettings: [KeybindAction: Setting<KeybindSettingValue>]
     private let settingsByName: [String: any SettingProtocol]
     private var dataPacks: [DataPack] = []
@@ -175,6 +178,9 @@ final class MineSceneApp {
         Self.logStartupStep("initializing settings")
         let settings = Self.makeSettings()
         self.renderDistanceSetting = settings.renderDistance
+        self.terrainLodNearDistanceSetting = settings.terrainLodNearDistance
+        self.terrainLodStepDistanceSetting = settings.terrainLodStepDistance
+        self.terrainLodMaxScaleSetting = settings.terrainLodMaxScale
         self.keybindSettings = settings.keybinds
         self.settingsByName = settings.byName
 
@@ -494,6 +500,9 @@ final class MineSceneApp {
 
     private static func makeSettings() -> (
         renderDistance: Setting<IntSettingValue>,
+        terrainLodNearDistance: Setting<IntSettingValue>,
+        terrainLodStepDistance: Setting<IntSettingValue>,
+        terrainLodMaxScale: Setting<IntSettingValue>,
         keybinds: [KeybindAction: Setting<KeybindSettingValue>],
         byName: [String: any SettingProtocol]
     ) {
@@ -503,6 +512,35 @@ final class MineSceneApp {
             defaultValue: IntSettingValue(value: 12),
             validator: { value in
                 value.value >= 0 ? nil : "must be zero or greater"
+            }
+        )
+        let terrainLodNearDistanceSetting = Setting(
+            name: "video.terrainLodNearDistance",
+            summary: "Distance in blocks before terrain starts using coarse sampling.",
+            defaultValue: IntSettingValue(value: 128),
+            validator: { value in
+                value.value >= 0 ? nil : "must be zero or greater"
+            }
+        )
+        let terrainLodStepDistanceSetting = Setting(
+            name: "video.terrainLodStepDistance",
+            summary: "Distance in blocks between each terrain LOD scale increase.",
+            defaultValue: IntSettingValue(value: 128),
+            validator: { value in
+                value.value > 0 ? nil : "must be greater than zero"
+            }
+        )
+        let terrainLodMaxScaleSetting = Setting(
+            name: "video.terrainLodMaxScale",
+            summary: "Maximum terrain LOD block scale. Supported values: 1, 2, 4, 8, 16.",
+            defaultValue: IntSettingValue(value: 8),
+            validator: { value in
+                switch value.value {
+                case 1, 2, 4, 8, 16:
+                    return nil
+                default:
+                    return "must be one of 1, 2, 4, 8, or 16"
+                }
             }
         )
 
@@ -516,7 +554,10 @@ final class MineSceneApp {
         }
 
         var settingsByName: [String: any SettingProtocol] = [
-            renderDistanceSetting.name: renderDistanceSetting
+            renderDistanceSetting.name: renderDistanceSetting,
+            terrainLodNearDistanceSetting.name: terrainLodNearDistanceSetting,
+            terrainLodStepDistanceSetting.name: terrainLodStepDistanceSetting,
+            terrainLodMaxScaleSetting.name: terrainLodMaxScaleSetting
         ]
         for setting in keybindSettings.values {
             settingsByName[setting.name] = setting
@@ -524,6 +565,9 @@ final class MineSceneApp {
 
         return (
             renderDistance: renderDistanceSetting,
+            terrainLodNearDistance: terrainLodNearDistanceSetting,
+            terrainLodStepDistance: terrainLodStepDistanceSetting,
+            terrainLodMaxScale: terrainLodMaxScaleSetting,
             keybinds: keybindSettings,
             byName: settingsByName
         )
@@ -544,7 +588,10 @@ final class MineSceneApp {
         let renderer = TerrainRenderer(
             worldGenerator: worldGenerator,
             biomeColorPalette: biomeColorPalette,
-            renderRadius: renderDistanceSetting.value.value
+            renderRadius: renderDistanceSetting.value.value,
+            terrainLodNearDistance: terrainLodNearDistanceSetting.value.value,
+            terrainLodStepDistance: terrainLodStepDistanceSetting.value.value,
+            terrainLodMaxScale: terrainLodMaxScaleSetting.value.value
         )
         renderer.externalCommandExecutor = { [weak self] commandName, arguments, terrainRenderer in
             guard let self else {
@@ -955,6 +1002,16 @@ final class MineSceneApp {
     private func applyRuntimeSettingIfNeeded(named name: String) {
         if name == renderDistanceSetting.name {
             terrainRenderer?.setRenderRadius(renderDistanceSetting.value.value)
+            return
+        }
+        if name == terrainLodNearDistanceSetting.name ||
+            name == terrainLodStepDistanceSetting.name ||
+            name == terrainLodMaxScaleSetting.name {
+            terrainRenderer?.setTerrainLodSettings(
+                nearDistance: terrainLodNearDistanceSetting.value.value,
+                stepDistance: terrainLodStepDistanceSetting.value.value,
+                maxSampleStride: terrainLodMaxScaleSetting.value.value
+            )
         }
     }
 
@@ -1246,7 +1303,7 @@ final class MineSceneApp {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone.current
-        formatter.dateFormat = "yyyy-MM-dd.HH:mm:ss.SSS"
+        formatter.dateFormat = "yyyy-MM-dd.HH-mm-ss.SSS"
         let fileName = "\(formatter.string(from: Date())).mp4"
         let directoryURL = animationFilesDirectoryURL()
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)

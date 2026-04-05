@@ -124,6 +124,13 @@ final class VulkanEngine {
         let modelOffset: SIMD4<Float>
     }
 
+    struct CapturedFrame {
+        let width: Int
+        let height: Int
+        let bytesPerRow: Int
+        let bgra8Data: Data
+    }
+
     final class VulkanOwnedDescriptorSetLayout {
         let descriptorSetLayout: VkDescriptorSetLayout
         private let device: VkDevice
@@ -653,7 +660,10 @@ final class VulkanEngine {
             imageColorSpace: surfaceFormat.colorSpace,
             imageExtent: swapExtent,
             imageArrayLayers: 1,
-            imageUsage: VkImageUsageFlags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT.rawValue),
+            imageUsage: VkImageUsageFlags(
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT.rawValue |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT.rawValue
+            ),
             imageSharingMode: VK_SHARING_MODE_EXCLUSIVE,
             queueFamilyIndexCount: 0,
             pQueueFamilyIndices: nil,
@@ -1529,8 +1539,9 @@ final class VulkanEngine {
         batches2D: [DrawBatch2D],
         framebufferIndex: Int,
         waitSemaphores: [VkSemaphore],
-        signalSemaphores: [VkSemaphore]
-    ) throws {
+        signalSemaphores: [VkSemaphore],
+        captureFrame: Bool = false
+    ) throws -> CapturedFrame? {
         guard let pipeline3D = mode3D.pipeline else {
             throw Errors.missing3DPipeline
         }
@@ -1575,8 +1586,23 @@ final class VulkanEngine {
         )
 
         commandBuffer.endRenderPass()
+        let capturedFrameResources: (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory)?
+        if captureFrame {
+            capturedFrameResources = try recordSwapchainReadback(framebufferIndex: framebufferIndex)
+        } else {
+            capturedFrameResources = nil
+        }
         try commandBuffer.end()
         try submitRecordedFrame(waitSemaphores: waitSemaphores, signalSemaphores: signalSemaphores)
+        guard let capturedFrameResources else {
+            return nil
+        }
+
+        try device.waitForFences([inFlightFence.fence], waitAll: true, timeout: UInt64.max)
+        return try mapCapturedFrame(
+            buffer: capturedFrameResources.buffer,
+            memory: capturedFrameResources.memory
+        )
     }
 
     func uploadVertices3D(_ vertices: [Vertex3D]) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
@@ -1732,13 +1758,16 @@ final class VulkanEngine {
         return (buffer, memory)
     }
 
-    private func createBufferWithMemory(size bufferSize: VkDeviceSize) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+    private func createBufferWithMemory(
+        size bufferSize: VkDeviceSize,
+        usage: VkBufferUsageFlags = VkBufferUsageFlags(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT.rawValue)
+    ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
         var bufferCreateInfo = VkBufferCreateInfo(
             sType: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             pNext: nil,
             flags: 0,
             size: bufferSize,
-            usage: VkBufferUsageFlags(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT.rawValue),
+            usage: usage,
             sharingMode: VK_SHARING_MODE_EXCLUSIVE,
             queueFamilyIndexCount: 0,
             pQueueFamilyIndices: nil
@@ -1932,6 +1961,130 @@ final class VulkanEngine {
             }
             commandBuffer.draw(vertexCount: batch.vertexCount)
         }
+    }
+
+    private func recordSwapchainReadback(
+        framebufferIndex: Int
+    ) throws -> (buffer: VulkanOwnedBuffer, memory: VulkanOwnedDeviceMemory) {
+        guard framebufferIndex >= 0 && framebufferIndex < swapchainImages.count else {
+            throw Errors.invalidFramebufferIndex
+        }
+
+        let width = Int(swapchainExtent.width)
+        let height = Int(swapchainExtent.height)
+        let bytesPerRow = width * 4
+        let byteCount = VkDeviceSize(bytesPerRow * height)
+        let resources = try createBufferWithMemory(
+            size: byteCount,
+            usage: VkBufferUsageFlags(VK_BUFFER_USAGE_TRANSFER_DST_BIT.rawValue)
+        )
+
+        var toTransferBarrier = VkImageMemoryBarrier(
+            sType: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            pNext: nil,
+            srcAccessMask: VkAccessFlags(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT.rawValue),
+            dstAccessMask: VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT.rawValue),
+            oldLayout: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            newLayout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            image: swapchainImages[framebufferIndex],
+            subresourceRange: VkImageSubresourceRange(
+                aspectMask: VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT.rawValue),
+                baseMipLevel: 0,
+                levelCount: 1,
+                baseArrayLayer: 0,
+                layerCount: 1
+            )
+        )
+        vkCmdPipelineBarrier(
+            commandBuffer.commandBuffer,
+            VkPipelineStageFlags(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue),
+            VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue),
+            0,
+            0,
+            nil,
+            0,
+            nil,
+            1,
+            &toTransferBarrier
+        )
+
+        var imageSubresource = VkImageSubresourceLayers(
+            aspectMask: VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT.rawValue),
+            mipLevel: 0,
+            baseArrayLayer: 0,
+            layerCount: 1
+        )
+        var copyRegion = VkBufferImageCopy(
+            bufferOffset: 0,
+            bufferRowLength: 0,
+            bufferImageHeight: 0,
+            imageSubresource: imageSubresource,
+            imageOffset: VkOffset3D(x: 0, y: 0, z: 0),
+            imageExtent: VkExtent3D(width: swapchainExtent.width, height: swapchainExtent.height, depth: 1)
+        )
+        vkCmdCopyImageToBuffer(
+            commandBuffer.commandBuffer,
+            swapchainImages[framebufferIndex],
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            resources.buffer.buffer,
+            1,
+            &copyRegion
+        )
+
+        var toPresentBarrier = VkImageMemoryBarrier(
+            sType: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            pNext: nil,
+            srcAccessMask: VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT.rawValue),
+            dstAccessMask: 0,
+            oldLayout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            newLayout: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            image: swapchainImages[framebufferIndex],
+            subresourceRange: VkImageSubresourceRange(
+                aspectMask: VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT.rawValue),
+                baseMipLevel: 0,
+                levelCount: 1,
+                baseArrayLayer: 0,
+                layerCount: 1
+            )
+        )
+        vkCmdPipelineBarrier(
+            commandBuffer.commandBuffer,
+            VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT.rawValue),
+            VkPipelineStageFlags(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT.rawValue),
+            0,
+            0,
+            nil,
+            0,
+            nil,
+            1,
+            &toPresentBarrier
+        )
+
+        return resources
+    }
+
+    private func mapCapturedFrame(
+        buffer: VulkanOwnedBuffer,
+        memory: VulkanOwnedDeviceMemory
+    ) throws -> CapturedFrame {
+        let width = Int(swapchainExtent.width)
+        let height = Int(swapchainExtent.height)
+        let bytesPerRow = width * 4
+        let byteCount = bytesPerRow * height
+        let mapped = try device.mapMemory(memory, offset: 0, size: VkDeviceSize(byteCount))
+        let data = Data(bytes: mapped, count: byteCount)
+        device.unmapMemory(memory)
+        _ = buffer
+        return CapturedFrame(
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            bgra8Data: data
+        )
     }
 
     private func submitRecordedFrame(

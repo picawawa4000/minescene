@@ -19,6 +19,10 @@ extension TerrainRenderer {
             return
         }
 
+        if isCinematicActive {
+            return
+        }
+
         switch event.eventType {
         case .keyDown:
             if event.key.repeat {
@@ -26,6 +30,13 @@ extension TerrainRenderer {
             }
             if keyMatches(event.key.key, action: .openCommandPrompt) {
                 openCommandPrompt(window: window)
+                return
+            }
+            if keyMatches(event.key.key, action: .addKeyframe) {
+                let keyframeID = appendCurrentCameraKeyframe()
+                logCommandMessage(
+                    "Added keyframe \(keyframeID) at \(formatCommandPosition(cameraPosition)) with rot=(yaw: \(formatCommandAngle(cameraYaw)) deg, pitch: \(formatCommandAngle(cameraPitch)) deg)."
+                )
                 return
             }
             setKeyState(key: event.key.key, pressed: true)
@@ -105,34 +116,38 @@ extension TerrainRenderer {
             }
         }
 
-        let horizontalForward = normalizeOrZero(SIMD3<Float>(
-            x: cos(cameraYaw),
-            y: 0,
-            z: sin(cameraYaw)
-        ))
-        let horizontalRight = normalizeOrZero(SIMD3<Float>(
-            x: -horizontalForward.z,
-            y: 0,
-            z: horizontalForward.x
-        ))
+        if isCinematicActive {
+            updateCinematicPlaybackIfNeeded()
+        } else {
+            let horizontalForward = normalizeOrZero(SIMD3<Float>(
+                x: cos(cameraYaw),
+                y: 0,
+                z: sin(cameraYaw)
+            ))
+            let horizontalRight = normalizeOrZero(SIMD3<Float>(
+                x: -horizontalForward.z,
+                y: 0,
+                z: horizontalForward.x
+            ))
 
-        var movement = SIMD3<Float>(repeating: 0)
-        if keyW { movement += horizontalForward }
-        if keyS { movement -= horizontalForward }
-        if keyD { movement += horizontalRight }
-        if keyA { movement -= horizontalRight }
-        if keySpace { movement.y += 1 }
-        if keyShift { movement.y -= 1 }
+            var movement = SIMD3<Float>(repeating: 0)
+            if keyW { movement += horizontalForward }
+            if keyS { movement -= horizontalForward }
+            if keyD { movement += horizontalRight }
+            if keyA { movement -= horizontalRight }
+            if keySpace { movement.y += 1 }
+            if keyShift { movement.y -= 1 }
 
-        if simd_length_squared(movement) > 0 {
-            movement = simd_normalize(movement)
-            let currentMoveSpeed = moveSpeed * (keyR ? fastMoveMultiplier : 1)
-            let distance = Double(currentMoveSpeed * max(0, deltaTime))
-            cameraPosition += SIMD3<Double>(
-                Double(movement.x) * distance,
-                Double(movement.y) * distance,
-                Double(movement.z) * distance
-            )
+            if simd_length_squared(movement) > 0 {
+                movement = simd_normalize(movement)
+                let currentMoveSpeed = moveSpeed * (keyR ? fastMoveMultiplier : 1)
+                let distance = Double(currentMoveSpeed * max(0, deltaTime))
+                cameraPosition += SIMD3<Double>(
+                    Double(movement.x) * distance,
+                    Double(movement.y) * distance,
+                    Double(movement.z) * distance
+                )
+            }
         }
 
         let cameraBlock = SIMD3<Int>(

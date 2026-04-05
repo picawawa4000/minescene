@@ -120,6 +120,42 @@ final class TerrainRenderer {
         let totalTargetChunks: Int
     }
 
+    struct CinematicPreparationStatus {
+        let readyChunks: Int
+        let totalChunks: Int
+        let generatingChunks: Int
+        let meshingChunks: Int
+    }
+
+    struct Keyframe: Equatable {
+        let position: SIMD3<Double>
+        let yaw: Float
+        let pitch: Float
+    }
+
+    struct CinematicPathSample {
+        let position: SIMD3<Double>
+        let yaw: Float
+        let pitch: Float
+        let timeFromStart: Double
+    }
+
+    struct CinematicPath {
+        let samples: [CinematicPathSample]
+        let totalDuration: Double
+    }
+
+    enum CinematicPlaybackPhase {
+        case preparing
+        case playing(startTimeSeconds: Double)
+    }
+
+    struct CinematicPlaybackSession {
+        let path: CinematicPath
+        let pinnedChunks: Set<ChunkCoord>
+        var phase: CinematicPlaybackPhase
+    }
+
     final class Streamer: @unchecked Sendable {
         private let worldGenerator: WorldGenerator
         private let generationWorkerCount: Int
@@ -134,6 +170,7 @@ final class TerrainRenderer {
         private var orderedOffsets: [ChunkCoord]
         private var targetCenter: ChunkCoord?
         private var targetCameraBlock = SIMD3<Int>(Int.min, Int.min, Int.min)
+        private var pinnedChunks: Set<ChunkCoord> = []
         private var chunks: [ChunkCoord: CompactChunk] = [:]
         private var inFlightChunks: Set<ChunkCoord> = []
         private var activeGenerationWorkers = 0
@@ -216,6 +253,83 @@ final class TerrainRenderer {
             return currentRenderRadius
         }
 
+        func setPinnedChunks(_ nextPinnedChunks: Set<ChunkCoord>) {
+            var generationWorkersToStart = 0
+            var meshWorkersToStart = 0
+
+            lock.lock()
+            pinnedChunks = nextPinnedChunks
+            let removed = pruneChunksLockedIfNeeded()
+            for removedCoord in removed {
+                markChunkRemovedLocked(removedCoord)
+            }
+            generationWorkersToStart = startGenerationWorkersLocked()
+            meshWorkersToStart = startMeshWorkersLocked()
+            lock.unlock()
+
+            for _ in 0..<generationWorkersToStart {
+                generationQueue.async { [self] in
+                    generationWorkerLoop()
+                }
+            }
+            for _ in 0..<meshWorkersToStart {
+                meshQueue.async { [self] in
+                    meshWorkerLoop()
+                }
+            }
+        }
+
+        func pinnedChunksReady() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+
+            guard !pinnedChunks.isEmpty else {
+                return true
+            }
+
+            for coord in pinnedChunks {
+                if chunks[coord] == nil || inFlightChunks.contains(coord) {
+                    return false
+                }
+                if dirtyMeshChunks.contains(coord) || inFlightMeshChunks.contains(coord) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        func pinnedChunkPreparationStatus() -> CinematicPreparationStatus {
+            lock.lock()
+            defer { lock.unlock() }
+
+            var readyChunks = 0
+            var generatingChunks = 0
+            var meshingChunks = 0
+
+            for coord in pinnedChunks {
+                let isLoaded = chunks[coord] != nil
+                let isGenerating = inFlightChunks.contains(coord)
+                let isMeshing = dirtyMeshChunks.contains(coord) || inFlightMeshChunks.contains(coord)
+
+                if isLoaded && !isGenerating && !isMeshing {
+                    readyChunks += 1
+                }
+                if isGenerating {
+                    generatingChunks += 1
+                }
+                if isMeshing {
+                    meshingChunks += 1
+                }
+            }
+
+            return CinematicPreparationStatus(
+                readyChunks: readyChunks,
+                totalChunks: pinnedChunks.count,
+                generatingChunks: generatingChunks,
+                meshingChunks: meshingChunks
+            )
+        }
+
         func updateTarget(center: ChunkCoord, cameraBlock: SIMD3<Int>) {
             var generationWorkersToStart = 0
             var meshWorkersToStart = 0
@@ -295,24 +409,14 @@ final class TerrainRenderer {
         func debugStatus() -> StreamDebugStatus {
             lock.lock()
             defer { lock.unlock() }
-
-            guard let center = targetCenter else {
-                return StreamDebugStatus(
-                    generatedChunks: 0,
-                    inFlightGenerationChunks: 0,
-                    dirtyMeshChunks: dirtyMeshChunks.count,
-                    inFlightMeshChunks: inFlightMeshChunks.count,
-                    totalTargetChunks: orderedOffsets.count
-                )
-            }
-
-            let generatedChunks = chunks.keys.reduce(into: 0) { count, coord in
-                if shouldKeepChunk(coord, around: center) {
+            let targetChunks = targetChunksLocked()
+            let generatedChunks = targetChunks.reduce(into: 0) { count, coord in
+                if chunks[coord] != nil {
                     count += 1
                 }
             }
-            let inFlightGenerationChunks = inFlightChunks.reduce(into: 0) { count, coord in
-                if shouldKeepChunk(coord, around: center) {
+            let inFlightGenerationChunks = targetChunks.reduce(into: 0) { count, coord in
+                if inFlightChunks.contains(coord) {
                     count += 1
                 }
             }
@@ -322,7 +426,7 @@ final class TerrainRenderer {
                 inFlightGenerationChunks: inFlightGenerationChunks,
                 dirtyMeshChunks: dirtyMeshChunks.count,
                 inFlightMeshChunks: inFlightMeshChunks.count,
-                totalTargetChunks: orderedOffsets.count
+                totalTargetChunks: targetChunks.count
             )
         }
 
@@ -397,11 +501,15 @@ final class TerrainRenderer {
         }
 
         private func nextMissingChunkLocked() -> ChunkCoord? {
-            guard let center = targetCenter else {
-                return nil
+            if let center = targetCenter {
+                for offset in orderedOffsets {
+                    let coord = ChunkCoord(x: center.x + offset.x, z: center.z + offset.z)
+                    if chunks[coord] == nil && !inFlightChunks.contains(coord) {
+                        return coord
+                    }
+                }
             }
-            for offset in orderedOffsets {
-                let coord = ChunkCoord(x: center.x + offset.x, z: center.z + offset.z)
+            for coord in pinnedChunks.sorted(by: isHigherPriorityChunk(_:than:)) {
                 if chunks[coord] == nil && !inFlightChunks.contains(coord) {
                     return coord
                 }
@@ -410,7 +518,7 @@ final class TerrainRenderer {
         }
 
         private func startGenerationWorkersLocked() -> Int {
-            guard targetCenter != nil else {
+            guard targetCenter != nil || !pinnedChunks.isEmpty else {
                 return 0
             }
             var started = 0
@@ -422,16 +530,10 @@ final class TerrainRenderer {
         }
 
         private func nextDirtyChunkLocked() -> ChunkCoord? {
-            guard let center = targetCenter else {
-                return nil
-            }
-            let orderedLoaded = chunks.keys.sorted { lhs, rhs in
-                let lhsDistance = max(abs(lhs.x - center.x), abs(lhs.z - center.z))
-                let rhsDistance = max(abs(rhs.x - center.x), abs(rhs.z - center.z))
-                if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
-                if lhs.z != rhs.z { return lhs.z < rhs.z }
-                return lhs.x < rhs.x
-            }
+            let targetChunks = targetChunksLocked()
+            let orderedLoaded = chunks.keys
+                .filter { targetChunks.contains($0) }
+                .sorted(by: isHigherPriorityChunk(_:than:))
             for coord in orderedLoaded where dirtyMeshChunks.contains(coord) && !inFlightMeshChunks.contains(coord) {
                 return coord
             }
@@ -439,7 +541,7 @@ final class TerrainRenderer {
         }
 
         private func startMeshWorkersLocked() -> Int {
-            guard targetCenter != nil else {
+            guard targetCenter != nil || !pinnedChunks.isEmpty else {
                 return 0
             }
             let meshWorkerLimit = max(1, generationWorkerCount)
@@ -588,12 +690,19 @@ final class TerrainRenderer {
         }
 
         private func pruneChunksLockedIfNeeded() -> [ChunkCoord] {
-            guard let center = targetCenter else {
-                let removed = Array(chunks.keys)
-                chunks.removeAll(keepingCapacity: true)
-                return removed
+            if let center = targetCenter {
+                return pruneChunksLocked(around: center)
             }
-            return pruneChunksLocked(around: center)
+
+            var removed: [ChunkCoord] = []
+            chunks = chunks.filter { coord, _ in
+                let keep = pinnedChunks.contains(coord)
+                if !keep {
+                    removed.append(coord)
+                }
+                return keep
+            }
+            return removed
         }
 
         @discardableResult
@@ -610,7 +719,32 @@ final class TerrainRenderer {
         }
 
         private func shouldKeepChunk(_ coord: ChunkCoord, around center: ChunkCoord, extraMargin: Int = 0) -> Bool {
-            abs(coord.x - center.x) <= renderRadius + extraMargin && abs(coord.z - center.z) <= renderRadius + extraMargin
+            if pinnedChunks.contains(coord) {
+                return true
+            }
+            return abs(coord.x - center.x) <= renderRadius + extraMargin && abs(coord.z - center.z) <= renderRadius + extraMargin
+        }
+
+        private func targetChunksLocked() -> Set<ChunkCoord> {
+            var targets = pinnedChunks
+            if let center = targetCenter {
+                for offset in orderedOffsets {
+                    targets.insert(ChunkCoord(x: center.x + offset.x, z: center.z + offset.z))
+                }
+            }
+            return targets
+        }
+
+        private func isHigherPriorityChunk(_ lhs: ChunkCoord, than rhs: ChunkCoord) -> Bool {
+            let center = targetCenter ?? ChunkCoord(
+                x: floorDiv(targetCameraBlock.x == Int.min ? 0 : targetCameraBlock.x, 16),
+                z: floorDiv(targetCameraBlock.z == Int.min ? 0 : targetCameraBlock.z, 16)
+            )
+            let lhsDistance = max(abs(lhs.x - center.x), abs(lhs.z - center.z))
+            let rhsDistance = max(abs(rhs.x - center.x), abs(rhs.z - center.z))
+            if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
+            if lhs.z != rhs.z { return lhs.z < rhs.z }
+            return lhs.x < rhs.x
         }
 
         private func markChunkDirtyLocked(_ coord: ChunkCoord) {
@@ -960,6 +1094,12 @@ final class TerrainRenderer {
     let commandLogBackgroundColor = SIMD4<Float>(0.0, 0.0, 0.0, 0.72)
     let commandLogSelectedBackgroundColor = SIMD4<Float>(0.20, 0.28, 0.44, 0.92)
     let commandLogErrorColor = SIMD4<Float>(0.92, 0.28, 0.24, 1.0)
+    let keyframeMarkerColor = SIMD4<Float>(0.18, 0.92, 0.28, 1.0)
+    let keyframePathColor = SIMD4<Float>(0.92, 0.16, 0.14, 1.0)
+    let keyframeMarkerHalfSize: Float = 0.65
+    let keyframePathHalfWidth: Float = 0.08
+    let cinematicPlaybackSpeed: Double = 8.0
+    let minimumCinematicSegmentDuration: Double = 0.35
 
     var externalCommandExecutor: ((String, String, TerrainRenderer) throws -> Bool)?
     var keycodeForAction: ((KeybindAction) -> SDL_Keycode)?
@@ -972,11 +1112,23 @@ final class TerrainRenderer {
     var lastHudText = ""
     var lastHudViewport = SIMD2<Int>(repeating: -1)
     var lastHudBiome = ""
+    var keyframeOverlayBuffer: VulkanOwnedBuffer?
+    var keyframeOverlayMemory: VulkanOwnedDeviceMemory?
+    var keyframeOverlayVertexCount: UInt32 = 0
+    var keyframeOverlayVertexCapacity = 0
 
     var cameraPosition = SIMD3<Double>(x: 0.0, y: 160.0, z: 0.0)
     var cameraYaw: Float = -.pi / 4.0
     var cameraPitch: Float = -.pi / 5.5
     var smoothedFps: Float = 0
+    var keyframes: [Keyframe] = [] {
+        didSet {
+            cachedCinematicPath = nil
+        }
+    }
+    var keyframePlaybackSpeed: Double = 8.0
+    var showsKeyframes = false
+    var isRenderingForExport = false
 
     var keyW = false
     var keyA = false
@@ -995,6 +1147,8 @@ final class TerrainRenderer {
     var commandLogEntries: [TerrainRendererCommandLogEntry] = []
     var commandLogScrollOffset = 0
     var activeCommandLogHistoryIndex: Int?
+    var cachedCinematicPath: CinematicPath?
+    var cinematicPlaybackSession: CinematicPlaybackSession?
 
     init(
         worldGenerator: WorldGenerator,
@@ -1024,7 +1178,7 @@ final class TerrainRenderer {
         window: OpaquePointer?,
         imageAvailable: VkSemaphore,
         renderFinishedByImage: [VkSemaphore]
-    ) throws {
+    ) throws -> VulkanEngine.CapturedFrame? {
         try engine.device.waitForFences([engine.inFlightFence.fence], waitAll: true, timeout: UInt64.max)
         try applyCompletedBuildIfAvailable(engine: engine)
 
@@ -1061,7 +1215,16 @@ final class TerrainRenderer {
         try engine.updateView3D(view)
         try engine.updateTransform2D(hudTransform(width: width, height: height))
         engine.setClearColor(SIMD4<Float>(0.63, 0.82, 0.98, 1.0))
-        try updateHudIfNeeded(engine: engine, viewportWidth: Int(width), viewportHeight: Int(height))
+        if isCinematicPlaying || isRenderingForExport {
+            hudVertexCount = 0
+            lastHudText = ""
+            lastHudViewport = SIMD2<Int>(repeating: -1)
+            lastHudBiome = ""
+            keyframeOverlayVertexCount = 0
+        } else {
+            try updateHudIfNeeded(engine: engine, viewportWidth: Int(width), viewportHeight: Int(height))
+            try updateKeyframeOverlayIfNeeded(engine: engine)
+        }
 
         let imageIndex = try engine.device.acquireNextImage(from: engine.swapchain, semaphore: imageAvailable)
         guard Int(imageIndex) < renderFinishedByImage.count else {
@@ -1069,7 +1232,7 @@ final class TerrainRenderer {
         }
         let renderFinished = renderFinishedByImage[Int(imageIndex)]
 
-        let batches: [VulkanEngine.DrawBatch3D] = chunkMeshes.keys.sorted { lhs, rhs in
+        var batches: [VulkanEngine.DrawBatch3D] = chunkMeshes.keys.sorted { lhs, rhs in
             if lhs.z != rhs.z { return lhs.z < rhs.z }
             return lhs.x < rhs.x
         }.compactMap { coord in
@@ -1084,6 +1247,20 @@ final class TerrainRenderer {
             )
             return .init(buffer: mesh.buffer, vertexCount: mesh.vertexCount, modelOffset: modelOffset)
         }
+        if let keyframeOverlayBuffer, keyframeOverlayVertexCount > 0 {
+            batches.append(
+                .init(
+                    buffer: keyframeOverlayBuffer,
+                    vertexCount: keyframeOverlayVertexCount,
+                    modelOffset: SIMD4<Float>(
+                        -Float(cameraPosition.x),
+                        -Float(cameraPosition.y),
+                        -Float(cameraPosition.z),
+                        0
+                    )
+                )
+            )
+        }
         let hudBatches: [VulkanEngine.DrawBatch2D]
         if let hudBuffer, hudVertexCount > 0 {
             hudBatches = [.init(buffer: hudBuffer, vertexCount: hudVertexCount)]
@@ -1091,12 +1268,13 @@ final class TerrainRenderer {
             hudBatches = []
         }
 
-        try engine.drawBatches3DAnd2D(
+        let capturedFrame = try engine.drawBatches3DAnd2D(
             batches3D: batches,
             batches2D: hudBatches,
             framebufferIndex: Int(imageIndex),
             waitSemaphores: [imageAvailable],
-            signalSemaphores: [renderFinished]
+            signalSemaphores: [renderFinished],
+            captureFrame: isRenderingForExport
         )
 
         var swapchainHandle: VkSwapchainKHR? = engine.swapchain.swapchain
@@ -1119,6 +1297,7 @@ final class TerrainRenderer {
                 }
             }
         }
+        return capturedFrame
     }
 
     private func applyCompletedBuildIfAvailable(engine: VulkanEngine) throws {

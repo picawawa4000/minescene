@@ -205,11 +205,21 @@ extension TerrainRenderer {
 
     private func currentDebugHudLines() -> [String] {
         let status = streamer.debugStatus()
-        return [
+        var lines: [String] = []
+        if let preparationStatus = currentCinematicPreparationStatus {
+            lines.append(
+                "CINEMATIC: \(preparationStatus.readyChunks)/\(preparationStatus.totalChunks) READY"
+            )
+            lines.append(
+                "PREP: GEN \(preparationStatus.generatingChunks) MESH \(preparationStatus.meshingChunks)"
+            )
+        }
+        lines.append(contentsOf: [
             "CHUNKS: \(status.generatedChunks)/\(status.totalTargetChunks)",
             "GEN: \(status.inFlightGenerationChunks) MESH: \(status.inFlightMeshChunks)",
             "DIRTY: \(status.dirtyMeshChunks) DRAWN: \(chunkMeshes.count)"
-        ]
+        ])
+        return lines
     }
 
     private func formatBiomeName(_ biomeName: String) -> String {

@@ -55,6 +55,16 @@ final class MineSceneApp {
         set <setting> <value>: set a value immediately.
         help [setting]: list settings, or show one setting's description and default.
         """
+
+        static let keyframe = """
+        Usage: /keyframe <subcommand>
+        list: print all keyframes with ID, position, and rotation.
+        play: move to the first keyframe, preload all needed chunks, and play the animation.
+        remove <id>: remove one keyframe by array index.
+        speed [blocks-per-second]: get or set constant playback speed.
+        export: render the current keyframe path to an mp4 in the animations directory.
+        show|hide: show or hide keyframe markers and the spline path overlay.
+        """
     }
 
     private enum ActiveRenderer {
@@ -80,6 +90,7 @@ final class MineSceneApp {
         case invalidWaypointFile(line: Int, reason: String)
         case colormapFileReadFailed(String)
         case invalidColormapFile(line: Int, reason: String)
+        case exportFailed(String)
 
         var description: String {
             switch self {
@@ -107,6 +118,8 @@ final class MineSceneApp {
                 return "failed to read colormap file '\(name)'"
             case .invalidColormapFile(let line, let reason):
                 return "invalid colormap file at line \(line): \(reason)"
+            case .exportFailed(let reason):
+                return "failed to export animation: \(reason)"
             }
         }
     }
@@ -371,7 +384,10 @@ final class MineSceneApp {
                 case .keyDown:
                     if !event.key.repeat,
                        keyMatches(event.key.key, action: .toggleBiomeMap),
-                       (activeRenderer == .biomeMap || terrainRenderer?.isCommandPromptActive != true) {
+                       (
+                           activeRenderer == .biomeMap ||
+                           (terrainRenderer?.isCommandPromptActive != true && terrainRenderer?.isCinematicActive != true)
+                       ) {
                         toggleRendererMode()
                         continue
                     }
@@ -441,7 +457,7 @@ final class MineSceneApp {
         switch activeRenderer {
         case .terrain:
             guard let terrainRenderer else { return }
-            try terrainRenderer.render(
+            _ = try terrainRenderer.render(
                 engine: engine,
                 window: window?.pointer,
                 imageAvailable: imageAvailable.semaphore,
@@ -565,6 +581,7 @@ final class MineSceneApp {
                     "/seed <subcommand>: view or change the world seed.",
                     "/dimension <subcommand>: view or change the active worldgen noise settings.",
                     "/waypoint <subcommand>: manage saved waypoints.",
+                    "/keyframe <subcommand>: manage cinematic keyframes.",
                     "/colormap <file>: load a biome colormap file.",
                     "/setting <subcommand>: view or change settings."
                 ], renderer: renderer)
@@ -719,6 +736,58 @@ final class MineSceneApp {
                 throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
             }
             return true
+        case "keyframe":
+            var parser = TerrainRendererCommandArgumentParser(arguments)
+            let subcommand = try parser.getNextString()
+            switch subcommand {
+            case "list":
+                try parser.end()
+                if renderer.keyframes.isEmpty {
+                    renderer.logCommandMessage("No keyframes saved.")
+                } else {
+                    for (id, keyframe) in renderer.keyframes.enumerated() {
+                        renderer.logCommandMessage(renderer.formatKeyframeDescription(id: id, keyframe: keyframe))
+                    }
+                }
+            case "play":
+                try parser.end()
+                try renderer.startKeyframePlayback()
+            case "remove":
+                let id = try parser.getNextInt()
+                try parser.end()
+                let removedKeyframe = try renderer.removeKeyframe(id: id)
+                renderer.logCommandMessage(
+                    "Removed keyframe \(id) at \(renderer.formatCommandPosition(removedKeyframe.position))."
+                )
+            case "show":
+                try parser.end()
+                renderer.showsKeyframes = true
+                renderer.logCommandMessage("Showing keyframes and cinematic path.")
+            case "hide":
+                try parser.end()
+                renderer.showsKeyframes = false
+                renderer.logCommandMessage("Hiding keyframes and cinematic path.")
+            case "speed":
+                if parser.remainingCount == 0 {
+                    try parser.end()
+                    renderer.logCommandMessage("Keyframe speed is \(renderer.formatPlaybackSpeed(renderer.keyframePlaybackSpeed)).")
+                } else {
+                    let speed = try parser.getNextDouble()
+                    try parser.end()
+                    guard speed > 0 else {
+                        throw TerrainRendererCommandParseError.invalidArguments("speed must be greater than zero")
+                    }
+                    renderer.setKeyframePlaybackSpeed(speed)
+                    renderer.logCommandMessage("Set keyframe speed to \(renderer.formatPlaybackSpeed(renderer.keyframePlaybackSpeed)).")
+                }
+            case "export":
+                try parser.end()
+                let outputURL = try exportCurrentKeyframeAnimation(renderer: renderer)
+                renderer.logCommandMessage("Exported animation to \(outputURL.path).")
+            default:
+                throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
+            }
+            return true
         case "colormap":
             var parser = TerrainRendererCommandArgumentParser(arguments)
             let filepath = try parser.getNextLocalFilepath()
@@ -784,7 +853,7 @@ final class MineSceneApp {
         currentWorldSeed = seed
         currentNoiseSettingsKey = noiseSettingsKey
         currentBiomeDimensionKey = biomeDimensionKey(for: noiseSettingsKey)
-        replaceTerrainRenderer(worldGenerator: newWorldGenerator)
+        replaceTerrainRenderer(worldGenerator: newWorldGenerator, preserveKeyframes: false)
 
         if activeRenderer == .biomeMap, let terrainRenderer {
             let biomeMapRenderer = BiomeMapViewRenderer(
@@ -851,6 +920,8 @@ final class MineSceneApp {
             return CommandHelp.dimension.split(separator: "\n").map(String.init)
         case "waypoint":
             return CommandHelp.waypoint.split(separator: "\n").map(String.init)
+        case "keyframe":
+            return CommandHelp.keyframe.split(separator: "\n").map(String.init)
         case "colormap":
             return CommandHelp.colormap.split(separator: "\n").map(String.init)
         case "setting":
@@ -889,6 +960,113 @@ final class MineSceneApp {
 
     private func updateRenderDistanceSetting(_ renderDistance: Int) {
         try? renderDistanceSetting.setValue(from: String(renderDistance))
+    }
+
+    private func exportCurrentKeyframeAnimation(renderer: TerrainRenderer) throws -> URL {
+        guard let engine, let imageAvailable, !renderFinishedByImage.isEmpty else {
+            throw CommandError.exportFailed("renderer is not ready")
+        }
+
+        let preparation = try renderer.currentCinematicPreparationPlan()
+        let originalPosition = renderer.cameraPosition
+        let originalYaw = renderer.cameraYaw
+        let originalPitch = renderer.cameraPitch
+        let originalExportState = renderer.isRenderingForExport
+        let originalPlaybackSession = renderer.cinematicPlaybackSession
+
+        renderer.resetMovementKeys()
+        renderer.cameraPosition = preparation.initialKeyframe.position
+        renderer.cameraYaw = preparation.initialKeyframe.yaw
+        renderer.cameraPitch = preparation.initialKeyframe.pitch
+        renderer.cinematicPlaybackSession = nil
+        renderer.isRenderingForExport = false
+        renderer.streamer.setPinnedChunks(preparation.pinnedChunks)
+
+        defer {
+            renderer.streamer.setPinnedChunks(originalPlaybackSession?.pinnedChunks ?? [])
+            renderer.cameraPosition = originalPosition
+            renderer.cameraYaw = originalYaw
+            renderer.cameraPitch = originalPitch
+            renderer.isRenderingForExport = originalExportState
+            renderer.cinematicPlaybackSession = originalPlaybackSession
+        }
+
+        renderer.logCommandMessage(
+            "Preparing animation export across \(preparation.pinnedChunks.count) chunks at \(renderer.formatPlaybackSpeed(renderer.keyframePlaybackSpeed))."
+        )
+        try waitForCinematicPreparation(renderer: renderer)
+        renderer.logCommandMessage("Starting animation export.")
+
+        let outputURL = try animationFileURLForCurrentTime()
+        let frameRate = 60
+        let duration = max(preparation.path.totalDuration, 0)
+        let frameCount = max(1, Int(ceil(duration * Double(frameRate))) + 1)
+
+        waitForGpuToFinishCurrentFrame()
+        renderer.isRenderingForExport = true
+        let firstCapturedFrame = try renderer.render(
+            engine: engine,
+            window: window?.pointer,
+            imageAvailable: imageAvailable.semaphore,
+            renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
+        )
+        guard let firstCapturedFrame else {
+            throw CommandError.exportFailed("failed to capture the first frame")
+        }
+
+        let writer = try AnimationVideoWriter(
+            outputURL: outputURL,
+            width: firstCapturedFrame.width,
+            height: firstCapturedFrame.height,
+            framesPerSecond: frameRate
+        )
+        try writer.appendFrame(firstCapturedFrame, frameIndex: 0)
+
+        if frameCount > 1 {
+            for frameIndex in 1..<frameCount {
+                let time = min(Double(frameIndex) / Double(frameRate), duration)
+                let sample = renderer.samplePlaybackPath(preparation.path, at: time)
+                renderer.cameraPosition = sample.position
+                renderer.cameraYaw = sample.yaw
+                renderer.cameraPitch = sample.pitch
+
+                guard let capturedFrame = try renderer.render(
+                    engine: engine,
+                    window: window?.pointer,
+                    imageAvailable: imageAvailable.semaphore,
+                    renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
+                ) else {
+                    throw CommandError.exportFailed("failed to capture frame \(frameIndex)")
+                }
+                try writer.appendFrame(capturedFrame, frameIndex: frameIndex)
+
+                if frameIndex % frameRate == 0 || frameIndex == frameCount - 1 {
+                    renderer.logCommandMessage("Export progress: \(frameIndex + 1)/\(frameCount) frames.")
+                }
+            }
+        }
+
+        try writer.finish()
+        renderer.isRenderingForExport = false
+        waitForGpuToFinishCurrentFrame()
+        return outputURL
+    }
+
+    private func waitForCinematicPreparation(renderer: TerrainRenderer) throws {
+        var lastReportedReadyCount = -1
+        while true {
+            let status = renderer.streamer.pinnedChunkPreparationStatus()
+            if status.readyChunks == status.totalChunks {
+                return
+            }
+            if status.readyChunks != lastReportedReadyCount {
+                renderer.logCommandMessage(
+                    "Export prep: \(status.readyChunks)/\(status.totalChunks) ready, gen \(status.generatingChunks), mesh \(status.meshingChunks)."
+                )
+                lastReportedReadyCount = status.readyChunks
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
     }
 
     private func sortedWaypoints() -> [(name: String, waypoint: Waypoint)] {
@@ -1020,6 +1198,10 @@ final class MineSceneApp {
         Self.appDataDirectoryURL().appendingPathComponent("colormaps", isDirectory: true)
     }
 
+    private func animationFilesDirectoryURL() -> URL {
+        Self.appDataDirectoryURL().appendingPathComponent("animations", isDirectory: true)
+    }
+
     private func waypointFileURL(for localPath: String) throws -> URL {
         let normalizedPath: String
         if localPath.hasSuffix(".txt") {
@@ -1058,6 +1240,17 @@ final class MineSceneApp {
             normalizedPath = "\(localPath).txt"
         }
         return "\(Self.appDataDirectoryDisplayName())/colormaps/\(normalizedPath)"
+    }
+
+    private func animationFileURLForCurrentTime() throws -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyy-MM-dd.HH:mm:ss.SSS"
+        let fileName = "\(formatter.string(from: Date())).mp4"
+        let directoryURL = animationFilesDirectoryURL()
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        return directoryURL.appendingPathComponent(fileName, isDirectory: false)
     }
 
     private func saveWaypoints(to fileURL: URL, displayName: String) throws {
@@ -1180,7 +1373,7 @@ final class MineSceneApp {
         terrainRenderer?.discardChunkMeshes()
         biomeMapRenderer?.discardData()
         biomeColorPalette = palette
-        replaceTerrainRenderer(worldGenerator: worldGenerator)
+        replaceTerrainRenderer(worldGenerator: worldGenerator, preserveKeyframes: true)
 
         if activeRenderer == .biomeMap, let terrainRenderer {
             let biomeMapRenderer = BiomeMapViewRenderer(
@@ -1193,13 +1386,16 @@ final class MineSceneApp {
         }
     }
 
-    private func replaceTerrainRenderer(worldGenerator: WorldGenerator) {
+    private func replaceTerrainRenderer(worldGenerator: WorldGenerator, preserveKeyframes: Bool) {
         let previousCameraPosition = terrainRenderer?.cameraPosition ?? SIMD3<Double>(x: 0, y: 160, z: 0)
         let previousCameraYaw = terrainRenderer?.cameraYaw ?? -.pi / 4.0
         let previousCameraPitch = terrainRenderer?.cameraPitch ?? -.pi / 5.5
         let previousSmoothedFps = terrainRenderer?.smoothedFps ?? 0
         let previousCommandLogEntries = terrainRenderer?.commandLogEntries ?? []
         let previousCommandPromptHistory = terrainRenderer?.commandPromptHistory ?? []
+        let previousKeyframes = preserveKeyframes ? (terrainRenderer?.keyframes ?? []) : []
+        let previousShowsKeyframes = preserveKeyframes ? (terrainRenderer?.showsKeyframes ?? false) : false
+        let previousKeyframePlaybackSpeed = terrainRenderer?.keyframePlaybackSpeed ?? 8.0
 
         let newTerrainRenderer = makeTerrainRenderer(worldGenerator: worldGenerator)
         newTerrainRenderer.cameraPosition = previousCameraPosition
@@ -1208,6 +1404,9 @@ final class MineSceneApp {
         newTerrainRenderer.smoothedFps = previousSmoothedFps
         newTerrainRenderer.commandLogEntries = previousCommandLogEntries
         newTerrainRenderer.commandPromptHistory = previousCommandPromptHistory
+        newTerrainRenderer.keyframePlaybackSpeed = previousKeyframePlaybackSpeed
+        newTerrainRenderer.keyframes = previousKeyframes
+        newTerrainRenderer.showsKeyframes = previousShowsKeyframes
         terrainRenderer = newTerrainRenderer
     }
 

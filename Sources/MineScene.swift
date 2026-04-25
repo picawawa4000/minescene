@@ -63,6 +63,7 @@ final class MineSceneApp {
         remove <id>: remove one keyframe by array index.
         speed [blocks-per-second]: get or set constant playback speed.
         export: render the current keyframe path to an mp4 in the animations directory.
+        program run <name>: render a .kfp program from the programs directory into one mp4.
         show|hide: show or hide keyframe markers and the spline path overlay.
         """
     }
@@ -75,6 +76,17 @@ final class MineSceneApp {
     private struct Waypoint {
         let position: SIMD3<Double>
         let seed: Int64
+    }
+
+    private struct TerrainRendererStateSnapshot {
+        let cameraPosition: SIMD3<Double>
+        let cameraYaw: Float
+        let cameraPitch: Float
+        let smoothedFps: Float
+        let keyframes: [TerrainRenderer.Keyframe]
+        let showsKeyframes: Bool
+        let keyframePlaybackSpeed: Double
+        let renderDistance: Int
     }
 
     private enum CommandError: Error, CustomStringConvertible {
@@ -831,6 +843,17 @@ final class MineSceneApp {
                 try parser.end()
                 let outputURL = try exportCurrentKeyframeAnimation(renderer: renderer)
                 renderer.logCommandMessage("Exported animation to \(outputURL.path).")
+            case "program":
+                let programSubcommand = try parser.getNextString()
+                switch programSubcommand {
+                case "run":
+                    let programName = try parser.getNextLocalFilepath()
+                    try parser.end()
+                    let outputURL = try runKeyframeProgram(named: programName)
+                    renderer.logCommandMessage("Exported keyframe program to \(outputURL.path).")
+                default:
+                    throw CommandError.unknownSubcommand(command: "keyframe program", subcommand: programSubcommand)
+                }
             default:
                 throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
             }
@@ -1109,6 +1132,119 @@ final class MineSceneApp {
         return outputURL
     }
 
+    private func runKeyframeProgram(named localPath: String) throws -> URL {
+        guard let renderer = terrainRenderer,
+              let engine,
+              let imageAvailable,
+              !renderFinishedByImage.isEmpty else {
+            throw CommandError.exportFailed("renderer is not ready")
+        }
+
+        let fileURL = try keyframeProgramFileURL(for: localPath)
+        let displayName = keyframeProgramFileDisplayName(for: localPath)
+        let program = try KeyframeProgramLoader.load(from: fileURL, displayName: displayName)
+        let compiledProgram = try KeyframeProgramCompiler.compile(program, renderer: renderer)
+
+        let originalSeed = currentWorldSeed
+        let originalNoiseSettingsKey = currentNoiseSettingsKey
+        let originalState = snapshotRendererState(renderer)
+        let outputURL = try keyframeProgramAnimationFileURL(programName: localPath)
+
+        defer {
+            restoreRendererState(
+                originalSeed: originalSeed,
+                originalNoiseSettingsKey: originalNoiseSettingsKey,
+                snapshot: originalState
+            )
+        }
+
+        let frameRate = 60
+        var writer: AnimationVideoWriter?
+        var totalFrameCount = 0
+        var renderedFrameCount = 0
+
+        for scene in compiledProgram.scenes {
+            totalFrameCount += frameCount(for: scene.path, frameRate: frameRate)
+        }
+
+        for scene in compiledProgram.scenes {
+            if currentWorldSeed != scene.seed {
+                try applyWorldGenerationState(seed: scene.seed, noiseSettingsKey: originalNoiseSettingsKey)
+            }
+            guard let sceneRenderer = terrainRenderer else {
+                throw CommandError.exportFailed("renderer is not ready")
+            }
+
+            sceneRenderer.setRenderRadius(scene.settings.renderDistance)
+            sceneRenderer.setTerrainLodSettings(
+                nearDistance: scene.settings.lodNearDistance,
+                stepDistance: scene.settings.lodStepDistance,
+                maxSampleStride: terrainLodMaxScaleSetting.value.value
+            )
+
+            let preparation = try sceneRenderer.cinematicPreparationPlan(for: scene.path)
+            sceneRenderer.resetMovementKeys()
+            sceneRenderer.cameraPosition = preparation.initialSample.position
+            sceneRenderer.cameraYaw = preparation.initialSample.yaw
+            sceneRenderer.cameraPitch = preparation.initialSample.pitch
+            sceneRenderer.cinematicPlaybackSession = nil
+            sceneRenderer.isRenderingForExport = false
+            sceneRenderer.streamer.setPinnedChunks(preparation.pinnedChunks)
+
+            sceneRenderer.logCommandMessage(
+                "Preparing scene \(scene.index) on seed \(scene.seed) across \(preparation.pinnedChunks.count) chunks."
+            )
+            try waitForCinematicPreparation(renderer: sceneRenderer)
+            sceneRenderer.logCommandMessage("Rendering scene \(scene.index).")
+
+            let frameCount = frameCount(for: scene.path, frameRate: frameRate)
+
+            waitForGpuToFinishCurrentFrame()
+            sceneRenderer.isRenderingForExport = true
+            for frameIndex in 0..<frameCount {
+                let time = min(Double(frameIndex) / Double(frameRate), scene.path.totalDuration)
+                let sample = sceneRenderer.samplePlaybackPath(scene.path, at: time)
+                sceneRenderer.cameraPosition = sample.position
+                sceneRenderer.cameraYaw = sample.yaw
+                sceneRenderer.cameraPitch = sample.pitch
+
+                guard let capturedFrame = try sceneRenderer.render(
+                    engine: engine,
+                    window: window?.pointer,
+                    imageAvailable: imageAvailable.semaphore,
+                    renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
+                ) else {
+                    throw CommandError.exportFailed("failed to capture frame \(frameIndex) for scene \(scene.index)")
+                }
+
+                if writer == nil {
+                    writer = try AnimationVideoWriter(
+                        outputURL: outputURL,
+                        width: capturedFrame.width,
+                        height: capturedFrame.height,
+                        framesPerSecond: frameRate
+                    )
+                }
+                try writer?.appendFrame(capturedFrame, frameIndex: renderedFrameCount)
+                renderedFrameCount += 1
+
+                if renderedFrameCount % frameRate == 0 || renderedFrameCount == totalFrameCount {
+                    sceneRenderer.logCommandMessage("Program export progress: \(renderedFrameCount)/\(totalFrameCount) frames.")
+                }
+            }
+
+            sceneRenderer.isRenderingForExport = false
+            sceneRenderer.streamer.setPinnedChunks([])
+            waitForGpuToFinishCurrentFrame()
+        }
+
+        guard let writer else {
+            throw CommandError.exportFailed("program did not produce any frames")
+        }
+        try writer.finish()
+        return outputURL
+    }
+
     private func waitForCinematicPreparation(renderer: TerrainRenderer) throws {
         var lastReportedReadyCount = -1
         while true {
@@ -1251,6 +1387,10 @@ final class MineSceneApp {
         Self.appDataDirectoryURL().appendingPathComponent("waypoints", isDirectory: true)
     }
 
+    private func keyframeProgramFilesDirectoryURL() -> URL {
+        Self.appDataDirectoryURL().appendingPathComponent("programs", isDirectory: true)
+    }
+
     private func colormapFilesDirectoryURL() -> URL {
         Self.appDataDirectoryURL().appendingPathComponent("colormaps", isDirectory: true)
     }
@@ -1277,6 +1417,26 @@ final class MineSceneApp {
             normalizedPath = "\(localPath).txt"
         }
         return "\(Self.appDataDirectoryDisplayName())/waypoints/\(normalizedPath)"
+    }
+
+    private func keyframeProgramFileURL(for localPath: String) throws -> URL {
+        let normalizedPath: String
+        if localPath.hasSuffix(".kfp") {
+            normalizedPath = localPath
+        } else {
+            normalizedPath = "\(localPath).kfp"
+        }
+        return keyframeProgramFilesDirectoryURL().appendingPathComponent(normalizedPath, isDirectory: false)
+    }
+
+    private func keyframeProgramFileDisplayName(for localPath: String) -> String {
+        let normalizedPath: String
+        if localPath.hasSuffix(".kfp") {
+            normalizedPath = localPath
+        } else {
+            normalizedPath = "\(localPath).kfp"
+        }
+        return "\(Self.appDataDirectoryDisplayName())/programs/\(normalizedPath)"
     }
 
     private func colormapFileURL(for localPath: String) throws -> URL {
@@ -1308,6 +1468,70 @@ final class MineSceneApp {
         let directoryURL = animationFilesDirectoryURL()
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         return directoryURL.appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private func keyframeProgramAnimationFileURL(programName: String) throws -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyy-MM-dd.HH-mm-ss.SSS"
+        let sanitizedProgramName = programName.replacingOccurrences(of: "/", with: "-")
+        let fileName = "\(sanitizedProgramName).\(formatter.string(from: Date())).mp4"
+        let directoryURL = animationFilesDirectoryURL()
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        return directoryURL.appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private func snapshotRendererState(_ renderer: TerrainRenderer) -> TerrainRendererStateSnapshot {
+        TerrainRendererStateSnapshot(
+            cameraPosition: renderer.cameraPosition,
+            cameraYaw: renderer.cameraYaw,
+            cameraPitch: renderer.cameraPitch,
+            smoothedFps: renderer.smoothedFps,
+            keyframes: renderer.keyframes,
+            showsKeyframes: renderer.showsKeyframes,
+            keyframePlaybackSpeed: renderer.keyframePlaybackSpeed,
+            renderDistance: renderer.currentRenderRadius()
+        )
+    }
+
+    private func restoreRendererState(
+        originalSeed: Int64,
+        originalNoiseSettingsKey: RegistryKey<NoiseSettings>,
+        snapshot: TerrainRendererStateSnapshot
+    ) {
+        do {
+            if currentWorldSeed != originalSeed || currentNoiseSettingsKey != originalNoiseSettingsKey {
+                try applyWorldGenerationState(seed: originalSeed, noiseSettingsKey: originalNoiseSettingsKey)
+            }
+
+            guard let renderer = terrainRenderer else {
+                return
+            }
+            renderer.cameraPosition = snapshot.cameraPosition
+            renderer.cameraYaw = snapshot.cameraYaw
+            renderer.cameraPitch = snapshot.cameraPitch
+            renderer.smoothedFps = snapshot.smoothedFps
+            renderer.keyframes = snapshot.keyframes
+            renderer.showsKeyframes = snapshot.showsKeyframes
+            renderer.keyframePlaybackSpeed = snapshot.keyframePlaybackSpeed
+            renderer.cinematicPlaybackSession = nil
+            renderer.isRenderingForExport = false
+            renderer.streamer.setPinnedChunks([])
+            renderer.setRenderRadius(snapshot.renderDistance)
+            renderer.setTerrainLodSettings(
+                nearDistance: terrainLodNearDistanceSetting.value.value,
+                stepDistance: terrainLodStepDistanceSetting.value.value,
+                maxSampleStride: terrainLodMaxScaleSetting.value.value
+            )
+        } catch {
+            terrainRenderer?.logCommandMessage("Failed to restore renderer state after keyframe program run: \(error)", isError: true)
+        }
+    }
+
+    private func frameCount(for path: TerrainRenderer.CinematicPath, frameRate: Int) -> Int {
+        let duration = max(path.totalDuration, 0)
+        return max(1, Int(ceil(duration * Double(frameRate))) + 1)
     }
 
     private func saveWaypoints(to fileURL: URL, displayName: String) throws {

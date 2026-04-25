@@ -64,7 +64,7 @@ extension TerrainRenderer {
         guard keyframes.count >= 2 else {
             return nil
         }
-        let path = buildCinematicPath(from: keyframes)
+        let path = buildCinematicPath(from: keyframes, playbackSpeed: keyframePlaybackSpeed)
         cachedCinematicPath = path
         return path
     }
@@ -106,6 +106,21 @@ extension TerrainRenderer {
             path: path,
             pinnedChunks: requiredPinnedChunks(for: path),
             initialKeyframe: keyframes[0]
+        )
+    }
+
+    func cinematicPreparationPlan(for path: CinematicPath) throws -> (
+        path: CinematicPath,
+        pinnedChunks: Set<ChunkCoord>,
+        initialSample: CinematicPathSample
+    ) {
+        guard let initialSample = path.samples.first else {
+            throw TerrainRendererKeyframeError.notEnoughKeyframes
+        }
+        return (
+            path: path,
+            pinnedChunks: requiredPinnedChunks(for: path),
+            initialSample: initialSample
         )
     }
 
@@ -239,7 +254,7 @@ extension TerrainRenderer {
         )
     }
 
-    private func buildCinematicPath(from keyframes: [Keyframe]) -> CinematicPath {
+    func buildCinematicPath(from keyframes: [Keyframe], playbackSpeed: Double) -> CinematicPath {
         let tangents = keyframeTangents(for: keyframes)
         var samples: [CinematicPathSample] = []
         var totalDistance = 0.0
@@ -248,7 +263,7 @@ extension TerrainRenderer {
             let startKeyframe = keyframes[segmentIndex]
             let endKeyframe = keyframes[segmentIndex + 1]
             let chordLength = simd_length(endKeyframe.position - startKeyframe.position)
-            let nominalSegmentDuration = max(chordLength / keyframePlaybackSpeed, minimumCinematicSegmentDuration)
+            let nominalSegmentDuration = max(chordLength / playbackSpeed, minimumCinematicSegmentDuration)
             let sampleCount = max(24, Int(ceil(max(chordLength / 1.5, nominalSegmentDuration * 60.0))))
             let firstStep = segmentIndex == 0 ? 0 : 1
 
@@ -269,7 +284,7 @@ extension TerrainRenderer {
                         position: position,
                         yaw: interpolateAngle(startKeyframe.yaw, endKeyframe.yaw, t: Float(t)),
                         pitch: startKeyframe.pitch + (endKeyframe.pitch - startKeyframe.pitch) * Float(t),
-                        timeFromStart: totalDistance / keyframePlaybackSpeed
+                        timeFromStart: totalDistance / playbackSpeed
                     )
                 )
             }
@@ -277,7 +292,7 @@ extension TerrainRenderer {
 
         return CinematicPath(
             samples: samples,
-            totalDuration: totalDistance / keyframePlaybackSpeed
+            totalDuration: totalDistance / playbackSpeed
         )
     }
 

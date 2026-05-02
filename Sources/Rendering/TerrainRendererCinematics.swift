@@ -82,18 +82,19 @@ extension TerrainRenderer {
         commandPromptActive = false
         cinematicPlaybackSession = CinematicPlaybackSession(
             path: preparation.path,
-            pinnedChunks: preparation.pinnedChunks,
+            pinnedChunkSquares: preparation.pinnedChunkSquares,
             phase: .preparing
         )
-        streamer.setPinnedChunks(preparation.pinnedChunks)
+        streamer.setPinnedChunkSquares(preparation.pinnedChunkSquares)
         logCommandMessage(
-            "Preparing keyframe animation with \(keyframes.count) keyframes across \(preparation.pinnedChunks.count) chunks at \(formatPlaybackSpeed(keyframePlaybackSpeed))."
+            "Preparing keyframe animation with \(keyframes.count) keyframes across \(preparation.totalPinnedChunks) chunks at \(formatPlaybackSpeed(keyframePlaybackSpeed))."
         )
     }
 
     func currentCinematicPreparationPlan() throws -> (
         path: CinematicPath,
-        pinnedChunks: Set<ChunkCoord>,
+        pinnedChunkSquares: [PinnedChunkSquare],
+        totalPinnedChunks: Int,
         initialKeyframe: Keyframe
     ) {
         guard keyframes.count >= 2 else {
@@ -102,24 +103,35 @@ extension TerrainRenderer {
         guard let path = currentCinematicPath() else {
             throw TerrainRendererKeyframeError.notEnoughKeyframes
         }
+        let pinnedChunkSquares = requiredPinnedChunkSquares(
+            for: path,
+            renderDistance: currentRenderRadius()
+        )
         return (
             path: path,
-            pinnedChunks: requiredPinnedChunks(for: path),
+            pinnedChunkSquares: pinnedChunkSquares,
+            totalPinnedChunks: TerrainRenderer.countChunkCoords(in: pinnedChunkSquares),
             initialKeyframe: keyframes[0]
         )
     }
 
-    func cinematicPreparationPlan(for path: CinematicPath) throws -> (
+    func cinematicPreparationPlan(for path: CinematicPath, renderDistance: Int) throws -> (
         path: CinematicPath,
-        pinnedChunks: Set<ChunkCoord>,
+        pinnedChunkSquares: [PinnedChunkSquare],
+        totalPinnedChunks: Int,
         initialSample: CinematicPathSample
     ) {
         guard let initialSample = path.samples.first else {
             throw TerrainRendererKeyframeError.notEnoughKeyframes
         }
+        let pinnedChunkSquares = requiredPinnedChunkSquares(
+            for: path,
+            renderDistance: renderDistance
+        )
         return (
             path: path,
-            pinnedChunks: requiredPinnedChunks(for: path),
+            pinnedChunkSquares: pinnedChunkSquares,
+            totalPinnedChunks: TerrainRenderer.countChunkCoords(in: pinnedChunkSquares),
             initialSample: initialSample
         )
     }
@@ -210,7 +222,7 @@ extension TerrainRenderer {
 
     private func finishCinematicPlayback() {
         cinematicPlaybackSession = nil
-        streamer.setPinnedChunks([])
+        streamer.setPinnedChunkSquares([])
         logCommandMessage("Finished keyframe animation.")
     }
 
@@ -292,7 +304,8 @@ extension TerrainRenderer {
 
         return CinematicPath(
             samples: samples,
-            totalDuration: totalDistance / playbackSpeed
+            totalDuration: totalDistance / playbackSpeed,
+            preloadPositions: keyframes.map(\.position)
         )
     }
 
@@ -332,28 +345,31 @@ extension TerrainRenderer {
         return start * h00 + startTangent * h10 + end * h01 + endTangent * h11
     }
 
-    private func requiredPinnedChunks(for path: CinematicPath) -> Set<ChunkCoord> {
-        let preloadRadius = max(0, currentRenderRadius() + 1)
-        var chunks: Set<ChunkCoord> = []
+    private func requiredPinnedChunkSquares(for path: CinematicPath, renderDistance: Int) -> [PinnedChunkSquare] {
+        let preloadRadius = max(0, renderDistance + 1)
+        var squares: [PinnedChunkSquare] = []
+        squares.reserveCapacity(path.preloadPositions.count)
+        var seenSquares: Set<PinnedChunkSquare> = []
+        seenSquares.reserveCapacity(path.preloadPositions.count)
 
-        for sample in path.samples {
+        for preloadPosition in path.preloadPositions {
             let sampleBlock = SIMD3<Int>(
-                Int(floor(sample.position.x)),
-                Int(floor(sample.position.y)),
-                Int(floor(sample.position.z))
+                Int(floor(preloadPosition.x)),
+                Int(floor(preloadPosition.y)),
+                Int(floor(preloadPosition.z))
             )
-            let centerChunk = ChunkCoord(
-                x: floorDiv(sampleBlock.x, 16),
-                z: floorDiv(sampleBlock.z, 16)
+            let square = PinnedChunkSquare(
+                center: ChunkCoord(
+                    x: floorDiv(sampleBlock.x, 16),
+                    z: floorDiv(sampleBlock.z, 16)
+                ),
+                radius: preloadRadius
             )
-            for deltaZ in -preloadRadius...preloadRadius {
-                for deltaX in -preloadRadius...preloadRadius {
-                    chunks.insert(ChunkCoord(x: centerChunk.x + deltaX, z: centerChunk.z + deltaZ))
-                }
+            if seenSquares.insert(square).inserted {
+                squares.append(square)
             }
         }
-
-        return chunks
+        return squares
     }
 
     private func appendCinematicPathVertices(_ path: CinematicPath, into vertices: inout [VulkanEngine.Vertex3D]) {

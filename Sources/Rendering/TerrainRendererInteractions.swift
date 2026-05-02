@@ -159,7 +159,9 @@ extension TerrainRenderer {
             x: floorDiv(cameraBlock.x, 16),
             z: floorDiv(cameraBlock.z, 16)
         )
-        streamer.updateTarget(center: cameraChunk, cameraBlock: cameraBlock)
+        if !suspendStreamingUpdates {
+            streamer.updateTarget(center: cameraChunk, cameraBlock: cameraBlock)
+        }
     }
 
     func viewForward() -> SIMD3<Float> {

@@ -10,6 +10,7 @@ struct KeyframeProgram {
         var lodStepDistance: Int?
         var motionSpeed: Double?
         var spinSpeed: Double?
+        var surfaceOnly: Bool?
 
         fileprivate mutating func apply(_ attribute: Attribute, in scope: String, line: Int) throws {
             switch attribute.name {
@@ -58,6 +59,15 @@ struct KeyframeProgram {
                     )
                 }
                 spinSpeed = try attribute.requirePositiveDouble(line: line)
+            case .surfaceOnly:
+                guard surfaceOnly == nil else {
+                    throw KeyframeProgramError.duplicateAttribute(
+                        scope: scope,
+                        attribute: attribute.name.rawValue,
+                        line: line
+                    )
+                }
+                surfaceOnly = try attribute.requireBoolean(line: line)
             }
         }
 
@@ -85,7 +95,8 @@ struct KeyframeProgram {
                 lodNearDistance: lodNearDistance,
                 lodStepDistance: lodStepDistance,
                 motionSpeed: motionSpeed ?? base.motionSpeed ?? 1.0,
-                spinSpeed: spinSpeed ?? base.spinSpeed ?? 10.0
+                spinSpeed: spinSpeed ?? base.spinSpeed ?? 10.0,
+                surfaceOnly: surfaceOnly ?? base.surfaceOnly ?? false
             )
         }
     }
@@ -96,12 +107,17 @@ struct KeyframeProgram {
         let lodStepDistance: Int
         let motionSpeed: Double
         let spinSpeed: Double
+        let surfaceOnly: Bool
     }
 
     struct Scene {
+        enum Location {
+            case absolute(seed: Int64, anchor: SIMD3<Double>)
+            case waypoint(name: String, offset: SIMD3<Double>)
+        }
+
         let index: Int
-        let seed: Int64
-        let anchor: SIMD3<Double>
+        let location: Location
         let attributes: Attributes
         let keyframes: [Statement]
         let line: Int
@@ -179,6 +195,7 @@ enum KeyframeProgramError: Error, CustomStringConvertible {
     case emptyTemplate(name: String, line: Int)
     case missingRequiredAttribute(attribute: String, line: Int)
     case unknownTemplate(String, line: Int)
+    case unknownWaypoint(String, line: Int)
     case templateCycle([String], line: Int)
     case missingInitialRotation(line: Int)
     case missingInitialPosition(line: Int)
@@ -214,6 +231,8 @@ enum KeyframeProgramError: Error, CustomStringConvertible {
             return "missing required attribute '\(attribute)' for scene starting on line \(line)"
         case .unknownTemplate(let name, let line):
             return "unknown template '\(name)' referenced on line \(line)"
+        case .unknownWaypoint(let name, let line):
+            return "unknown waypoint '\(name)' referenced on line \(line)"
         case .templateCycle(let names, let line):
             return "template cycle detected on line \(line): \(names.joined(separator: " -> "))"
         case .missingInitialRotation(let line):
@@ -232,6 +251,7 @@ private enum AttributeName: String {
     case lodStepDistance = "LOD-STEP-DISTANCE"
     case motionSpeed = "MOTION-SPEED"
     case spinSpeed = "SPIN-SPEED"
+    case surfaceOnly = "SURFACE-ONLY"
 }
 
 private struct Attribute {
@@ -277,6 +297,22 @@ private struct Attribute {
         }
         return value
     }
+
+    func requireBoolean(line: Int) throws -> Bool {
+        switch rawValue.lowercased() {
+        case "true":
+            return true;
+        case "false":
+            return false;
+        default:
+            throw KeyframeProgramError.invalidAttributeValue(
+                attribute: name.rawValue,
+                value: rawValue,
+                line: line,
+                reason: "value must be true or false"
+            )
+        }
+    }
 }
 
 private struct ParsedLine {
@@ -287,8 +323,7 @@ private struct ParsedLine {
 private enum KeyframeProgramBlock {
     case scene(
         index: Int,
-        seed: Int64,
-        anchor: SIMD3<Double>,
+        location: KeyframeProgram.Scene.Location,
         attributes: KeyframeProgram.Attributes,
         line: Int,
         keyframes: [KeyframeProgram.Statement]
@@ -301,7 +336,17 @@ struct CompiledKeyframeProgram {
         let index: Int
         let seed: Int64
         let settings: KeyframeProgram.ResolvedAttributes
-        let path: TerrainRenderer.CinematicPath
+        let anchor: SIMD3<Double>
+        fileprivate let statements: [KeyframeProgram.Statement]
+
+        func makePath(renderer: TerrainRenderer) throws -> TerrainRenderer.CinematicPath {
+            try KeyframeProgramCompiler.compileScenePath(
+                statements: statements,
+                anchor: anchor,
+                settings: settings,
+                renderer: renderer
+            )
+        }
     }
 
     let scenes: [Scene]
@@ -436,7 +481,7 @@ enum KeyframeProgramLoader {
 
         func finish(block: KeyframeProgramBlock) throws {
             switch block {
-            case .scene(let index, let seed, let anchor, let attributes, let line, let keyframes):
+            case .scene(let index, let location, let attributes, let line, let keyframes):
                 guard !keyframes.isEmpty else {
                     throw KeyframeProgramError.emptyScene(index: index, line: line)
                 }
@@ -446,8 +491,7 @@ enum KeyframeProgramLoader {
                 scenes.append(
                     KeyframeProgram.Scene(
                         index: index,
-                        seed: seed,
-                        anchor: anchor,
+                        location: location,
                         attributes: attributes,
                         keyframes: keyframes,
                         line: line
@@ -509,12 +553,11 @@ enum KeyframeProgramLoader {
             }
             let statement = try parseStatement(tokens: tokens, line: parsedLine.lineNumber)
             switch block {
-            case .scene(let index, let seed, let anchor, let attributes, let line, var keyframes):
+            case .scene(let index, let location, let attributes, let line, var keyframes):
                 keyframes.append(statement)
                 currentBlock = .scene(
                     index: index,
-                    seed: seed,
-                    anchor: anchor,
+                    location: location,
                     attributes: attributes,
                     line: line,
                     keyframes: keyframes
@@ -546,50 +589,79 @@ enum KeyframeProgramLoader {
                 reason: "PROGRAM header must be 'PROGRAM [WITH <attribute> <value>] ...'"
             )
         }
-        guard tokens.count > 1 else {
-            return KeyframeProgram.Attributes()
-        }
-        guard tokens[1] == "WITH", tokens.count >= 4 else {
-            throw KeyframeProgramError.invalidSyntax(
-                line: line,
-                reason: "PROGRAM header must be 'PROGRAM [WITH <attribute> <value>] ...'"
-            )
-        }
-        return try parseAttributes(tokens: Array(tokens[2...]), scope: "program", line: line)
+        return try parseHeaderAttributes(tokens: Array(tokens.dropFirst()), scope: "program", line: line)
     }
 
     private static func parseSceneHeader(tokens: [String], line: Int) throws -> KeyframeProgramBlock {
-        guard tokens.count >= 8 else {
+        guard tokens.count >= 4 else {
             throw KeyframeProgramError.invalidSyntax(
                 line: line,
                 reason: "SCENE header is incomplete"
             )
         }
-        guard tokens[2] == "SEED", tokens[4] == "AT-POSITION" else {
-            throw KeyframeProgramError.invalidSyntax(
-                line: line,
-                reason: "SCENE header must be 'SCENE <index> SEED <seed> AT-POSITION <x> <y> <z> [WITH ...]'"
-            )
-        }
         let index = try parseNonNegativeInt(tokens[1], line: line, label: "scene index")
-        let seed = try parseSeed(tokens[3], line: line)
-        let anchor = try parseVector3(tokens[5], tokens[6], tokens[7], line: line, label: "scene anchor")
-        let attributes: KeyframeProgram.Attributes
-        if tokens.count == 8 {
-            attributes = KeyframeProgram.Attributes()
-        } else {
-            guard tokens[8] == "WITH", tokens.count >= 11 else {
+        let location: KeyframeProgram.Scene.Location
+        let attributesStartIndex: Int
+
+        if tokens[2] == "SEED" {
+            guard tokens.count >= 8, tokens[4] == "AT-POSITION" else {
                 throw KeyframeProgramError.invalidSyntax(
                     line: line,
-                    reason: "SCENE header must be 'SCENE <index> SEED <seed> AT-POSITION <x> <y> <z> [WITH ...]'"
+                    reason: "SCENE header must be 'SCENE <index> SEED <seed> AT-POSITION <x> <y> <z> [WITH ...]' or 'SCENE <index> WAYPOINT <waypoint> [OFFSET <dx> <dy> <dz>] [WITH ...]'"
                 )
             }
-            attributes = try parseAttributes(tokens: Array(tokens[9...]), scope: "scene \(index)", line: line)
+            let seed = try parseSeed(tokens[3], line: line)
+            let anchor = try parseVector3(tokens[5], tokens[6], tokens[7], line: line, label: "scene anchor")
+            location = .absolute(seed: seed, anchor: anchor)
+            attributesStartIndex = 8
+        } else if tokens[2] == "WAYPOINT" {
+            guard tokens.count >= 4 else {
+                throw KeyframeProgramError.invalidSyntax(
+                    line: line,
+                    reason: "SCENE waypoint header is incomplete"
+                )
+            }
+            let waypointName = tokens[3]
+            var offset = SIMD3<Double>(repeating: 0)
+            var indexAfterLocation = 4
+            if tokens.count > indexAfterLocation, tokens[indexAfterLocation] == "OFFSET" {
+                guard tokens.count >= indexAfterLocation + 4 else {
+                    throw KeyframeProgramError.invalidSyntax(
+                        line: line,
+                        reason: "OFFSET must be 'OFFSET <delta-x> <delta-y> <delta-z>'"
+                    )
+                }
+                offset = try parseVector3(
+                    tokens[indexAfterLocation + 1],
+                    tokens[indexAfterLocation + 2],
+                    tokens[indexAfterLocation + 3],
+                    line: line,
+                    label: "scene waypoint offset"
+                )
+                indexAfterLocation += 4
+            }
+            location = .waypoint(name: waypointName, offset: offset)
+            attributesStartIndex = indexAfterLocation
+        } else {
+            throw KeyframeProgramError.invalidSyntax(
+                line: line,
+                reason: "SCENE header must be 'SCENE <index> SEED <seed> AT-POSITION <x> <y> <z> [WITH ...]' or 'SCENE <index> WAYPOINT <waypoint> [OFFSET <dx> <dy> <dz>] [WITH ...]'"
+            )
+        }
+
+        let attributes: KeyframeProgram.Attributes
+        if tokens.count == attributesStartIndex {
+            attributes = KeyframeProgram.Attributes()
+        } else {
+            attributes = try parseHeaderAttributes(
+                tokens: Array(tokens[attributesStartIndex...]),
+                scope: "scene \(index)",
+                line: line
+            )
         }
         return .scene(
             index: index,
-            seed: seed,
-            anchor: anchor,
+            location: location,
             attributes: attributes,
             line: line,
             keyframes: []
@@ -629,6 +701,41 @@ enum KeyframeProgramLoader {
             )
         }
         return attributes
+    }
+
+    private static func parseHeaderAttributes(tokens: [String], scope: String, line: Int) throws -> KeyframeProgram.Attributes {
+        guard !tokens.isEmpty else {
+            return KeyframeProgram.Attributes()
+        }
+
+        var normalizedTokens: [String] = []
+        normalizedTokens.reserveCapacity(tokens.count)
+
+        var index = 0
+        while index < tokens.count {
+            if tokens[index] == "WITH" {
+                index += 1
+                guard index < tokens.count else {
+                    throw KeyframeProgramError.invalidSyntax(
+                        line: line,
+                        reason: "WITH must be followed by <attribute> <value>"
+                    )
+                }
+            }
+
+            guard index + 1 < tokens.count else {
+                throw KeyframeProgramError.invalidSyntax(
+                    line: line,
+                    reason: "attribute list must contain <attribute> <value> pairs"
+                )
+            }
+
+            normalizedTokens.append(tokens[index])
+            normalizedTokens.append(tokens[index + 1])
+            index += 2
+        }
+
+        return try parseAttributes(tokens: normalizedTokens, scope: scope, line: line)
     }
 
     private static func parseStatement(tokens: [String], line: Int) throws -> KeyframeProgram.Statement {
@@ -801,7 +908,21 @@ enum KeyframeProgramLoader {
 enum KeyframeProgramCompiler {
     private static let spinInterpolationLimitRadians = Double.pi / 2.0
 
-    static func compile(_ program: KeyframeProgram, renderer: TerrainRenderer) throws -> CompiledKeyframeProgram {
+    static func compile(_ program: KeyframeProgram) throws -> CompiledKeyframeProgram {
+        try compile(program) { scene in
+            switch scene.location {
+            case .absolute(let seed, let anchor):
+                return (seed, anchor)
+            case .waypoint(let name, _):
+                throw KeyframeProgramError.unknownWaypoint(name, line: scene.line)
+            }
+        }
+    }
+
+    static func compile(
+        _ program: KeyframeProgram,
+        resolveSceneLocation: (KeyframeProgram.Scene) throws -> (seed: Int64, anchor: SIMD3<Double>)
+    ) throws -> CompiledKeyframeProgram {
         var compiledScenes: [CompiledKeyframeProgram.Scene] = []
         let sortedScenes = program.scenes.sorted { lhs, rhs in
             if lhs.index == rhs.index {
@@ -811,23 +932,19 @@ enum KeyframeProgramCompiler {
         }
 
         for scene in sortedScenes {
+            let resolvedLocation = try resolveSceneLocation(scene)
             let settings = try scene.attributes.resolved(overriding: program.attributes, line: scene.line)
             let expanded = try expandStatements(
                 in: scene,
                 templates: program.templates
             )
-            let path = try compileScenePath(
-                statements: expanded,
-                anchor: scene.anchor,
-                settings: settings,
-                renderer: renderer
-            )
             compiledScenes.append(
                 .init(
                     index: scene.index,
-                    seed: scene.seed,
+                    seed: resolvedLocation.seed,
                     settings: settings,
-                    path: path
+                    anchor: resolvedLocation.anchor,
+                    statements: expanded
                 )
             )
         }
@@ -872,13 +989,14 @@ enum KeyframeProgramCompiler {
         return expanded
     }
 
-    private static func compileScenePath(
+    fileprivate static func compileScenePath(
         statements: [KeyframeProgram.Statement],
         anchor: SIMD3<Double>,
         settings: KeyframeProgram.ResolvedAttributes,
         renderer: TerrainRenderer
     ) throws -> TerrainRenderer.CinematicPath {
         var samples: [TerrainRenderer.CinematicPathSample] = []
+        var preloadPositions: [SIMD3<Double>] = []
         var currentTime = 0.0
         var currentPose: TerrainRenderer.Keyframe?
         var pendingPositionKeyframes: [TerrainRenderer.Keyframe] = []
@@ -963,6 +1081,7 @@ enum KeyframeProgramCompiler {
                     pendingPositionStartPose = currentPose
                 }
                 pendingPositionKeyframes.append(absoluteKeyframe)
+                preloadPositions.append(absoluteKeyframe.position)
                 pendingPositionLine = pendingPositionLine ?? keyframe.line
                 currentPose = absoluteKeyframe
             case .spin(let keyframe):
@@ -986,6 +1105,7 @@ enum KeyframeProgramCompiler {
                         pitchDegrees: 0
                     )
                 }
+                preloadPositions.append(startPosition)
 
                 let startYawRadians = Double(startRotation.yawRadians)
                 let startPitchRadians = Double(startRotation.pitchRadians)
@@ -1056,7 +1176,8 @@ enum KeyframeProgramCompiler {
 
         return TerrainRenderer.CinematicPath(
             samples: samples,
-            totalDuration: samples.last?.timeFromStart ?? 0
+            totalDuration: samples.last?.timeFromStart ?? 0,
+            preloadPositions: preloadPositions
         )
     }
 }

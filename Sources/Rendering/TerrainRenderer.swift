@@ -35,6 +35,7 @@ final class TerrainRenderer {
         let bitmap: [UInt64]
         let biomePalette: [CompactBiomeEntry]
         let biomeIndices: [UInt8]
+        let hasAnySolid: Bool
 
         @inline(__always)
         func biomeEntry(atLocalX x: Int, y: Int, z: Int) -> CompactBiomeEntry {
@@ -49,10 +50,6 @@ final class TerrainRenderer {
             return (bitmap[wordIndex] & (UInt64(1) << UInt64(bitIndex))) != 0
         }
 
-        var hasAnySolid: Bool {
-            bitmap.contains(where: { $0 != 0 })
-        }
-
         @inline(__always)
         private func cellIndex(atLocalX x: Int, y: Int, z: Int) -> Int {
             let cellX = x / sampleStride
@@ -62,40 +59,55 @@ final class TerrainRenderer {
         }
     }
 
-    private struct CompactChunkLod {
+    private struct CompactChunk {
+        let minY: Int
+        let height: Int
         let sampleStride: Int
-        let sections: [CompactSection]
+        let sections: [CompactSection]?
+        let firstSolidSection: Int?
+        let lastSolidSection: Int?
+        let surfaceHeights: [Int32]?
+        let surfaceCellSizes: [UInt16]?
+        let surfaceCellOriginXs: [Int16]?
+        let surfaceCellOriginZs: [Int16]?
+        let surfaceBiomePalette: [CompactBiomeEntry]?
+        let surfaceBiomeIndices: [UInt8]?
+
+        var minimumAvailableSampleStride: Int { sampleStride }
+        var sectionCount: Int { sections?.count ?? 0 }
+        var isSurfaceOnly: Bool { surfaceHeights != nil }
 
         @inline(__always)
         func section(at index: Int) -> CompactSection? {
-            guard index >= 0, index < sections.count else {
+            guard let sections,
+                  index >= 0,
+                  index < sections.count else {
                 return nil
             }
             return sections[index]
         }
-    }
-
-    private struct CompactChunk {
-        let minY: Int
-        let height: Int
-        let lods: [CompactChunkLod]
-
-        var minimumAvailableSampleStride: Int { lods.first?.sampleStride ?? 1 }
-        var sectionCount: Int { lods[0].sections.count }
 
         @inline(__always)
-        func section(at index: Int, sampleStride: Int = 1) -> CompactSection? {
-            lod(forSampleStride: sampleStride).section(at: index)
-        }
-
-        @inline(__always)
-        func biomeEntry(atLocalX x: Int, y: Int, z: Int, sampleStride: Int = 1) -> CompactBiomeEntry? {
-            guard x >= 0, x < 16, y >= 0, y < height, z >= 0, z < 16 else {
+        func biomeEntry(atLocalX x: Int, y: Int, z: Int) -> CompactBiomeEntry? {
+            guard x >= 0, x < 16, z >= 0, z < 16 else {
+                return nil
+            }
+            if let surfaceHeights, let surfaceBiomePalette, let surfaceBiomeIndices {
+                let index = z * 16 + x
+                guard surfaceHeights[index] != Int32.min else {
+                    return nil
+                }
+                return surfaceBiomePalette[Int(surfaceBiomeIndices[index])]
+            }
+            guard y >= 0, y < height else {
                 return nil
             }
             let sectionIndex = y >> 4
             let localY = y & 15
-            return lod(forSampleStride: sampleStride).sections[sectionIndex].biomeEntry(
+            guard let sections else {
+                return nil
+            }
+            return sections[sectionIndex].biomeEntry(
                 atLocalX: x,
                 y: localY,
                 z: z
@@ -103,13 +115,29 @@ final class TerrainRenderer {
         }
 
         @inline(__always)
-        func isSolid(atLocalX x: Int, y: Int, z: Int, sampleStride: Int = 1) -> Bool {
-            guard x >= 0, x < 16, y >= 0, y < height, z >= 0, z < 16 else {
+        func isSolid(atLocalX x: Int, y: Int, z: Int) -> Bool {
+            guard x >= 0, x < 16, z >= 0, z < 16 else {
+                return false
+            }
+            if let surfaceHeights {
+                guard y >= 0, y < height else {
+                    return false
+                }
+                let surfaceY = surfaceHeights[z * 16 + x]
+                guard surfaceY != Int32.min else {
+                    return false
+                }
+                return Int32(minY + y) <= surfaceY
+            }
+            guard y >= 0, y < height else {
                 return false
             }
             let sectionIndex = y >> 4
             let localY = y & 15
-            return lod(forSampleStride: sampleStride).sections[sectionIndex].isSolid(
+            guard let sections else {
+                return false
+            }
+            return sections[sectionIndex].isSolid(
                 atLocalX: x,
                 y: localY,
                 z: z
@@ -117,17 +145,60 @@ final class TerrainRenderer {
         }
 
         @inline(__always)
-        private func lod(forSampleStride sampleStride: Int) -> CompactChunkLod {
-            if let exact = lods.first(where: { $0.sampleStride == sampleStride }) {
-                return exact
+        func surfaceHeight(atLocalX x: Int, z: Int) -> Int32? {
+            guard let surfaceHeights,
+                  x >= 0, x < 16,
+                  z >= 0, z < 16 else {
+                return nil
             }
-            if let nextHigher = lods.first(where: { $0.sampleStride > sampleStride }) {
-                return nextHigher
+            let value = surfaceHeights[z * 16 + x]
+            return value == Int32.min ? nil : value
+        }
+
+        @inline(__always)
+        func surfaceCellSize(atLocalX x: Int, z: Int) -> Int? {
+            guard let surfaceHeights,
+                  let surfaceCellSizes,
+                  x >= 0, x < 16,
+                  z >= 0, z < 16 else {
+                return nil
             }
-            guard let coarsest = lods.last else {
-                preconditionFailure("compact chunk has no LODs")
+            let index = z * 16 + x
+            guard surfaceHeights[index] != Int32.min else {
+                return nil
             }
-            return coarsest
+            let size = Int(surfaceCellSizes[index])
+            return size > 0 ? size : nil
+        }
+
+        @inline(__always)
+        func surfaceCellOriginX(atLocalX x: Int, z: Int) -> Int? {
+            guard let surfaceHeights,
+                  let surfaceCellOriginXs,
+                  x >= 0, x < 16,
+                  z >= 0, z < 16 else {
+                return nil
+            }
+            let index = z * 16 + x
+            guard surfaceHeights[index] != Int32.min else {
+                return nil
+            }
+            return Int(surfaceCellOriginXs[index])
+        }
+
+        @inline(__always)
+        func surfaceCellOriginZ(atLocalX x: Int, z: Int) -> Int? {
+            guard let surfaceHeights,
+                  let surfaceCellOriginZs,
+                  x >= 0, x < 16,
+                  z >= 0, z < 16 else {
+                return nil
+            }
+            let index = z * 16 + x
+            guard surfaceHeights[index] != Int32.min else {
+                return nil
+            }
+            return Int(surfaceCellOriginZs[index])
         }
     }
 
@@ -142,7 +213,6 @@ final class TerrainRenderer {
         let revision: Int
         let chunk: CompactChunk
         let neighbors: [ChunkCoord: CompactChunk]
-        let sampleStrideByChunk: [ChunkCoord: Int]
         let generationSeconds: Double
         let totalTargetChunks: Int
         let availableChunks: Int
@@ -168,16 +238,102 @@ final class TerrainRenderer {
     struct StreamDebugStatus {
         let generatedChunks: Int
         let inFlightGenerationChunks: Int
+        let inFlightLodBuildChunks: Int
         let dirtyMeshChunks: Int
         let inFlightMeshChunks: Int
         let totalTargetChunks: Int
+        let lodCompletedChunks: Int?
+        let lodTotalChunks: Int?
+        let lodCompletedSamples: Int?
+        let lodTotalSamples: Int?
     }
 
     struct CinematicPreparationStatus {
         let readyChunks: Int
         let totalChunks: Int
         let generatingChunks: Int
+        let lodBuildingChunks: Int
         let meshingChunks: Int
+        let lodCompletedChunks: Int?
+        let lodTotalChunks: Int?
+        let lodCompletedSamples: Int?
+        let lodTotalSamples: Int?
+    }
+
+    struct ProgramScenePreparationStatus {
+        let sceneIndex: Int
+        let preparation: CinematicPreparationStatus
+    }
+
+    struct PinnedChunkSquare: Hashable {
+        let center: ChunkCoord
+        let radius: Int
+    }
+
+    @discardableResult
+    static func forEachChunkCoord(
+        in squares: [PinnedChunkSquare],
+        _ body: (ChunkCoord) -> Bool
+    ) -> Bool {
+        guard let minZ = squares.map({ $0.center.z - $0.radius }).min(),
+              let maxZ = squares.map({ $0.center.z + $0.radius }).max() else {
+            return true
+        }
+
+        for z in minZ...maxZ {
+            var intervals: [(start: Int, end: Int)] = []
+            intervals.reserveCapacity(squares.count)
+
+            for square in squares {
+                guard abs(z - square.center.z) <= square.radius else {
+                    continue
+                }
+                intervals.append(
+                    (start: square.center.x - square.radius, end: square.center.x + square.radius)
+                )
+            }
+
+            guard !intervals.isEmpty else {
+                continue
+            }
+
+            intervals.sort {
+                if $0.start != $1.start { return $0.start < $1.start }
+                return $0.end < $1.end
+            }
+
+            var currentInterval = intervals[0]
+            for interval in intervals.dropFirst() {
+                if interval.start <= currentInterval.end + 1 {
+                    currentInterval.end = max(currentInterval.end, interval.end)
+                    continue
+                }
+
+                for x in currentInterval.start...currentInterval.end {
+                    if !body(ChunkCoord(x: x, z: z)) {
+                        return false
+                    }
+                }
+                currentInterval = interval
+            }
+
+            for x in currentInterval.start...currentInterval.end {
+                if !body(ChunkCoord(x: x, z: z)) {
+                    return false
+                }
+            }
+        }
+
+        return true
+    }
+
+    static func countChunkCoords(in squares: [PinnedChunkSquare]) -> Int {
+        var count = 0
+        forEachChunkCoord(in: squares) { _ in
+            count += 1
+            return true
+        }
+        return count
     }
 
     struct Keyframe: Equatable {
@@ -196,6 +352,7 @@ final class TerrainRenderer {
     struct CinematicPath {
         let samples: [CinematicPathSample]
         let totalDuration: Double
+        let preloadPositions: [SIMD3<Double>]
     }
 
     enum CinematicPlaybackPhase {
@@ -205,43 +362,36 @@ final class TerrainRenderer {
 
     struct CinematicPlaybackSession {
         let path: CinematicPath
-        let pinnedChunks: Set<ChunkCoord>
+        let pinnedChunkSquares: [PinnedChunkSquare]
         var phase: CinematicPlaybackPhase
     }
 
     final class Streamer: @unchecked Sendable {
         private static let supportedSampleStrides = [1, 2, 4, 8, 16]
-        private struct LODSnapshotKey: Equatable {
-            let center: ChunkCoord
-            let renderRadius: Int
-            let nearDistance: Int
-            let stepDistance: Int
-            let maxSampleStride: Int
-        }
 
         private struct LODSnapshotRequest {
-            let key: LODSnapshotKey
             let origin: PosInt3D
             let radius: Int32
+            let nearDistance: Int
+            let stepDistance: Int
             let maxCellSizePower: Int
+            let targetChunkSampleStrides: [ChunkCoord: Int]
         }
 
-        private final class LODSnapshot {
-            let result: TerrainLODResult
-
-            init(result: TerrainLODResult) {
-                self.result = result
-            }
+        private enum ChunkGenerationMode {
+            case full
+            case lod
         }
 
         private let worldGenerator: WorldGenerator
         private let generationWorkerCount: Int
         private let retargetAroundCameraMovement: Bool
         private let biomeColorPalette: BiomeColorPalette
-        private let sampleLodLock = NSLock()
+        private let surfaceOnly: Bool
+        private let baseLodCellSizeLock = NSLock()
         private var cachedBaseLodCellSize: Int?
-        private var lodSnapshotKey: LODSnapshotKey?
-        private var lodSnapshot: LODSnapshot?
+        private var lodProgress: TerrainLODProgress?
+        private var surfaceLodProgress: TerrainLODProgress?
 
         private let lock = NSLock()
         private let generationQueue = DispatchQueue(label: "TerrainRenderer.Generation", qos: .userInitiated, attributes: .concurrent)
@@ -252,10 +402,19 @@ final class TerrainRenderer {
         private var terrainLodSettings: TerrainLodSettings
         private var targetCenter: ChunkCoord?
         private var targetCameraBlock = SIMD3<Int>(Int.min, Int.min, Int.min)
-        private var pinnedChunks: Set<ChunkCoord> = []
+        private var pinnedChunkSquares: [PinnedChunkSquare] = []
+        private var pinnedChunkCoords: [ChunkCoord] = []
+        private var pinnedChunkCoordSet: Set<ChunkCoord> = []
+        private var pinnedGenerationSelectionCount = 0
+        private var pinnedMeshSelectionCount = 0
+        private var isShutDown = false
         private var chunks: [ChunkCoord: CompactChunk] = [:]
-        private var inFlightChunks: Set<ChunkCoord> = []
+        private var availableSampleStrideByChunk: [ChunkCoord: Int] = [:]
+        private var inFlightChunks: [ChunkCoord: ChunkGenerationMode] = [:]
+        private var activeLodBatchTargets: Set<ChunkCoord> = []
         private var activeGenerationWorkers = 0
+        private var activeWorkEpoch = 0
+        private var staleChunksNeedingRegeneration: Set<ChunkCoord> = []
 
         private var dirtyMeshChunks: Set<ChunkCoord> = []
         private var inFlightMeshChunks: Set<ChunkCoord> = []
@@ -271,7 +430,8 @@ final class TerrainRenderer {
             generationWorkerCount: Int,
             retargetAroundCameraMovement: Bool,
             biomeColorPalette: BiomeColorPalette,
-            terrainLodSettings: TerrainLodSettings
+            terrainLodSettings: TerrainLodSettings,
+            surfaceOnly: Bool
         ) {
             self.worldGenerator = worldGenerator
             self.renderRadius = max(0, renderRadius)
@@ -279,6 +439,7 @@ final class TerrainRenderer {
             self.retargetAroundCameraMovement = retargetAroundCameraMovement
             self.biomeColorPalette = biomeColorPalette
             self.terrainLodSettings = terrainLodSettings
+            self.surfaceOnly = surfaceOnly
             self.orderedOffsets = Self.makeOrderedOffsets(radius: self.renderRadius)
         }
 
@@ -290,6 +451,7 @@ final class TerrainRenderer {
             var generationWorkersToStart = 0
             var meshWorkersToStart = 0
             var currentRenderRadius = 0
+            var workEpoch = 0
 
             lock.lock()
             let nextRadius = max(0, requestedRadius)
@@ -316,18 +478,11 @@ final class TerrainRenderer {
 
             generationWorkersToStart = startGenerationWorkersLocked()
             meshWorkersToStart = startMeshWorkersLocked()
+            workEpoch = activeWorkEpoch
             lock.unlock()
 
-            for _ in 0..<generationWorkersToStart {
-                generationQueue.async { [self] in
-                    generationWorkerLoop()
-                }
-            }
-            for _ in 0..<meshWorkersToStart {
-                meshQueue.async { [self] in
-                    meshWorkerLoop()
-                }
-            }
+            startGenerationWorkers(generationWorkersToStart, epoch: workEpoch)
+            startMeshWorkers(meshWorkersToStart, epoch: workEpoch)
             return currentRenderRadius
         }
 
@@ -338,45 +493,49 @@ final class TerrainRenderer {
             return currentRenderRadius
         }
 
-        func setPinnedChunks(_ nextPinnedChunks: Set<ChunkCoord>) {
+        func setPinnedChunkSquares(_ nextPinnedChunkSquares: [PinnedChunkSquare]) {
             var generationWorkersToStart = 0
             var meshWorkersToStart = 0
+            var workEpoch = 0
 
             lock.lock()
-            pinnedChunks = nextPinnedChunks
+            let pinnedChanged = pinnedChunkSquares != nextPinnedChunkSquares
+            pinnedChunkSquares = nextPinnedChunkSquares
+            if pinnedChanged {
+                rebuildPinnedChunkCacheLocked()
+                invalidateLodSnapshotLocked()
+                pinnedGenerationSelectionCount = 0
+                pinnedMeshSelectionCount = 0
+            }
             let removed = pruneChunksLockedIfNeeded()
             for removedCoord in removed {
                 markChunkRemovedLocked(removedCoord)
             }
             generationWorkersToStart = startGenerationWorkersLocked()
             meshWorkersToStart = startMeshWorkersLocked()
+            workEpoch = activeWorkEpoch
             lock.unlock()
 
-            for _ in 0..<generationWorkersToStart {
-                generationQueue.async { [self] in
-                    generationWorkerLoop()
-                }
-            }
-            for _ in 0..<meshWorkersToStart {
-                meshQueue.async { [self] in
-                    meshWorkerLoop()
-                }
-            }
+            startGenerationWorkers(generationWorkersToStart, epoch: workEpoch)
+            startMeshWorkers(meshWorkersToStart, epoch: workEpoch)
         }
 
         func pinnedChunksReady() -> Bool {
             lock.lock()
             defer { lock.unlock() }
 
-            guard !pinnedChunks.isEmpty else {
+            guard !pinnedChunkSquares.isEmpty else {
                 return true
             }
 
-            for coord in pinnedChunks {
-                if chunks[coord] == nil || inFlightChunks.contains(coord) {
+            for coord in pinnedChunkCoords {
+                if availableSampleStrideByChunk[coord] == nil || inFlightChunks[coord] != nil {
                     return false
                 }
-                if dirtyMeshChunks.contains(coord) || inFlightMeshChunks.contains(coord) {
+                if dirtyMeshChunks.contains(coord)
+                    || inFlightMeshChunks.contains(coord)
+                    || pendingMeshResults[coord] != nil
+                    || staleChunksNeedingRegeneration.contains(coord) {
                     return false
                 }
             }
@@ -389,36 +548,55 @@ final class TerrainRenderer {
 
             var readyChunks = 0
             var generatingChunks = 0
+            var lodBuildingChunks = 0
             var meshingChunks = 0
 
-            for coord in pinnedChunks {
-                let isLoaded = chunks[coord] != nil
-                let isGenerating = inFlightChunks.contains(coord)
-                let isMeshing = dirtyMeshChunks.contains(coord) || inFlightMeshChunks.contains(coord)
+            let totalChunks = pinnedChunkCountLocked()
+            for coord in pinnedChunkCoords {
+                let isLoaded = availableSampleStrideByChunk[coord] != nil
+                let generationMode = inFlightChunks[coord]
+                let isGenerating = generationMode != nil
+                let isMeshing =
+                    dirtyMeshChunks.contains(coord)
+                    || inFlightMeshChunks.contains(coord)
+                    || pendingMeshResults[coord] != nil
+                    || staleChunksNeedingRegeneration.contains(coord)
 
                 if isLoaded && !isGenerating && !isMeshing {
                     readyChunks += 1
                 }
-                if isGenerating {
+                if generationMode == .full {
                     generatingChunks += 1
+                }
+                if generationMode == .lod {
+                    lodBuildingChunks += 1
                 }
                 if isMeshing {
                     meshingChunks += 1
                 }
             }
 
+            let activeProgress = surfaceOnly ? surfaceLodProgress : lodProgress
+
             return CinematicPreparationStatus(
                 readyChunks: readyChunks,
-                totalChunks: pinnedChunks.count,
+                totalChunks: totalChunks,
                 generatingChunks: generatingChunks,
-                meshingChunks: meshingChunks
+                lodBuildingChunks: lodBuildingChunks,
+                meshingChunks: meshingChunks,
+                lodCompletedChunks: activeProgress?.completedChunkCount,
+                lodTotalChunks: activeProgress?.totalChunkCount,
+                lodCompletedSamples: activeProgress?.completedSampleCount,
+                lodTotalSamples: activeProgress?.totalSampleCount
             )
         }
 
         func updateTarget(center: ChunkCoord, cameraBlock: SIMD3<Int>) {
             var generationWorkersToStart = 0
             var meshWorkersToStart = 0
+            var workEpoch = 0
             lock.lock()
+            let hasPinnedChunks = !pinnedChunkSquares.isEmpty
             let previousCenter = targetCenter
             let effectiveCenter: ChunkCoord
             if retargetAroundCameraMovement || targetCenter == nil {
@@ -429,14 +607,14 @@ final class TerrainRenderer {
             let centerChanged = targetCenter != effectiveCenter
             targetCenter = effectiveCenter
             targetCameraBlock = cameraBlock
-            if centerChanged {
+            if centerChanged && !hasPinnedChunks {
                 invalidateLodSnapshotLocked()
                 let removed = pruneChunksLocked(around: effectiveCenter)
                 for removedCoord in removed {
                     markChunkRemovedLocked(removedCoord)
                 }
             }
-            if centerChanged {
+            if centerChanged && !hasPinnedChunks {
                 let impactedChunks = impactedChunksForSampleStrideChangesLocked(
                     previousCenter: previousCenter,
                     previousSettings: terrainLodSettings,
@@ -447,18 +625,18 @@ final class TerrainRenderer {
             }
             generationWorkersToStart = startGenerationWorkersLocked()
             meshWorkersToStart = startMeshWorkersLocked()
+            workEpoch = activeWorkEpoch
             lock.unlock()
 
-            for _ in 0..<generationWorkersToStart {
-                generationQueue.async { [self] in
-                    generationWorkerLoop()
-                }
-            }
-            for _ in 0..<meshWorkersToStart {
-                meshQueue.async { [self] in
-                    meshWorkerLoop()
-                }
-            }
+            startGenerationWorkers(generationWorkersToStart, epoch: workEpoch)
+            startMeshWorkers(meshWorkersToStart, epoch: workEpoch)
+        }
+
+        func primeTarget(center: ChunkCoord, cameraBlock: SIMD3<Int>) {
+            lock.lock()
+            targetCenter = center
+            targetCameraBlock = cameraBlock
+            lock.unlock()
         }
 
         func takeCompletedResults() -> (results: [ChunkMeshResult], removals: [ChunkCoord]) {
@@ -500,43 +678,107 @@ final class TerrainRenderer {
         func debugStatus() -> StreamDebugStatus {
             lock.lock()
             defer { lock.unlock() }
-            let targetChunks = targetChunksLocked()
-            let generatedChunks = targetChunks.reduce(into: 0) { count, coord in
-                if chunks[coord] != nil {
+            let generatedChunks = availableSampleStrideByChunk.keys.reduce(into: 0) { count, coord in
+                if isTargetChunkLocked(coord) {
                     count += 1
                 }
             }
-            let inFlightGenerationChunks = targetChunks.reduce(into: 0) { count, coord in
-                if inFlightChunks.contains(coord) {
+            let inFlightGenerationChunks = inFlightChunks.reduce(into: 0) { count, entry in
+                let (coord, mode) = entry
+                if isTargetChunkLocked(coord), mode == .full {
                     count += 1
                 }
             }
+            let inFlightLodBuildChunks = inFlightChunks.reduce(into: 0) { count, entry in
+                let (coord, mode) = entry
+                if isTargetChunkLocked(coord), mode == .lod {
+                    count += 1
+                }
+            }
+            let activeProgress = surfaceOnly ? surfaceLodProgress : lodProgress
 
             return StreamDebugStatus(
                 generatedChunks: generatedChunks,
                 inFlightGenerationChunks: inFlightGenerationChunks,
+                inFlightLodBuildChunks: inFlightLodBuildChunks,
                 dirtyMeshChunks: dirtyMeshChunks.count,
                 inFlightMeshChunks: inFlightMeshChunks.count,
-                totalTargetChunks: targetChunks.count
+                totalTargetChunks: targetChunkCountLocked(),
+                lodCompletedChunks: activeProgress?.completedChunkCount,
+                lodTotalChunks: activeProgress?.totalChunkCount,
+                lodCompletedSamples: activeProgress?.completedSampleCount,
+                lodTotalSamples: activeProgress?.totalSampleCount
             )
         }
 
         func requestMeshRebuild() {
+            var generationWorkersToStart = 0
             var meshWorkersToStart = 0
+            var workEpoch = 0
 
             lock.lock()
             for coord in chunks.keys {
                 markChunkDirtyLocked(coord)
             }
+            for coord in availableSampleStrideByChunk.keys where chunks[coord] == nil {
+                staleChunksNeedingRegeneration.insert(coord)
+            }
             pendingMeshResults.removeAll(keepingCapacity: true)
+            invalidateLodSnapshotLocked()
+            generationWorkersToStart = startGenerationWorkersLocked()
             meshWorkersToStart = startMeshWorkersLocked()
+            workEpoch = activeWorkEpoch
             lock.unlock()
 
-            for _ in 0..<meshWorkersToStart {
-                meshQueue.async { [self] in
-                    meshWorkerLoop()
-                }
-            }
+            startGenerationWorkers(generationWorkersToStart, epoch: workEpoch)
+            startMeshWorkers(meshWorkersToStart, epoch: workEpoch)
+        }
+
+        func discardChunkStateKeepingMeshes() {
+            lock.lock()
+            activeWorkEpoch &+= 1
+            chunks.removeAll(keepingCapacity: false)
+            availableSampleStrideByChunk.removeAll(keepingCapacity: false)
+            inFlightChunks.removeAll(keepingCapacity: false)
+            activeLodBatchTargets.removeAll(keepingCapacity: false)
+            activeGenerationWorkers = 0
+            staleChunksNeedingRegeneration.removeAll(keepingCapacity: false)
+            dirtyMeshChunks.removeAll(keepingCapacity: false)
+            inFlightMeshChunks.removeAll(keepingCapacity: false)
+            activeMeshWorkers = 0
+            chunkMeshRevision.removeAll(keepingCapacity: false)
+            pendingMeshResults.removeAll(keepingCapacity: false)
+            pendingRemovedChunks.removeAll(keepingCapacity: false)
+            generationSecondsByChunk.removeAll(keepingCapacity: false)
+            lodProgress = nil
+            surfaceLodProgress = nil
+            lock.unlock()
+        }
+
+        func shutdown() {
+            lock.lock()
+            isShutDown = true
+            activeWorkEpoch &+= 1
+            targetCenter = nil
+            targetCameraBlock = SIMD3<Int>(Int.min, Int.min, Int.min)
+            pinnedChunkSquares.removeAll(keepingCapacity: false)
+            rebuildPinnedChunkCacheLocked()
+            chunks.removeAll(keepingCapacity: false)
+            availableSampleStrideByChunk.removeAll(keepingCapacity: false)
+            inFlightChunks.removeAll(keepingCapacity: false)
+            activeLodBatchTargets.removeAll(keepingCapacity: false)
+            activeGenerationWorkers = 0
+            staleChunksNeedingRegeneration.removeAll(keepingCapacity: false)
+            dirtyMeshChunks.removeAll(keepingCapacity: false)
+            inFlightMeshChunks.removeAll(keepingCapacity: false)
+            activeMeshWorkers = 0
+            chunkMeshRevision.removeAll(keepingCapacity: false)
+            pendingMeshResults.removeAll(keepingCapacity: false)
+            pendingRemovedChunks.removeAll(keepingCapacity: false)
+            generationSecondsByChunk.removeAll(keepingCapacity: false)
+            lodProgress = nil
+            surfaceLodProgress = nil
+            lock.unlock()
         }
 
         func setTerrainLodSettings(
@@ -550,6 +792,7 @@ final class TerrainRenderer {
                 maxSampleStride: Self.normalizedSampleStride(maxSampleStride)
             )
             var meshWorkersToStart = 0
+            var workEpoch = 0
 
             lock.lock()
             guard normalized.nearDistance != terrainLodSettings.nearDistance ||
@@ -570,50 +813,96 @@ final class TerrainRenderer {
             )
             invalidatePendingMeshResultsLocked(for: impactedChunks)
             meshWorkersToStart = startMeshWorkersLocked()
+            workEpoch = activeWorkEpoch
             lock.unlock()
 
-            for _ in 0..<meshWorkersToStart {
-                meshQueue.async { [self] in
-                    meshWorkerLoop()
-                }
-            }
+            startMeshWorkers(meshWorkersToStart, epoch: workEpoch)
         }
 
-        private func generationWorkerLoop() {
+        private func generationWorkerLoop(epoch: Int) {
             while true {
                 let chunkCoord: ChunkCoord
                 let desiredSampleStride: Int
                 let lodSnapshotRequest: LODSnapshotRequest?
+                let lodBatchTargetChunkSampleStrides: [ChunkCoord: Int]
+                let totalTargetChunks: Int
                 lock.lock()
+                guard epoch == activeWorkEpoch else {
+                    lock.unlock()
+                    return
+                }
                 guard let nextChunk = nextMissingChunkLocked() else {
                     activeGenerationWorkers = max(0, activeGenerationWorkers - 1)
                     lock.unlock()
                     return
                 }
-                inFlightChunks.insert(nextChunk)
                 chunkCoord = nextChunk
                 desiredSampleStride = desiredGenerationSampleStrideLocked(for: nextChunk)
-                lodSnapshotRequest = desiredSampleStride > 1 ? makeLodSnapshotRequestLocked() : nil
+                let generationMode = generationModeLocked(desiredSampleStride: desiredSampleStride)
+                totalTargetChunks = targetChunkCountLocked()
+                if generationMode == .lod {
+                    let targetChunkSampleStrides = desiredLodTargetChunkSampleStridesLocked()
+                    lodBatchTargetChunkSampleStrides = targetChunkSampleStrides
+                    lodSnapshotRequest = makeLodSnapshotRequestLocked(
+                        targetChunkSampleStrides: targetChunkSampleStrides
+                    )
+                    activeLodBatchTargets.formUnion(targetChunkSampleStrides.keys)
+                    for coord in targetChunkSampleStrides.keys {
+                        inFlightChunks[coord] = .lod
+                    }
+                } else {
+                    lodBatchTargetChunkSampleStrides = [:]
+                    lodSnapshotRequest = nil
+                    inFlightChunks[nextChunk] = .full
+                }
                 lock.unlock()
 
                 let generationStart = TerrainRenderer.currentTimeSeconds()
-                let compactChunk = makeCompactChunk(
-                    at: chunkCoord,
-                    desiredSampleStride: desiredSampleStride,
-                    lodSnapshotRequest: lodSnapshotRequest
-                )
+                let compactChunk: CompactChunk?
+                let unfinishedLodTargets: Set<ChunkCoord>
+                if generationMode == .lod {
+                    if let lodSnapshotRequest, !lodBatchTargetChunkSampleStrides.isEmpty {
+                        unfinishedLodTargets = streamLodBatch(
+                            request: lodSnapshotRequest,
+                            totalTargetChunks: totalTargetChunks,
+                            generationStart: generationStart,
+                            epoch: epoch
+                        )
+                    } else {
+                        clearLodProgress(surfaceOnly: surfaceOnly)
+                        unfinishedLodTargets = Set(lodBatchTargetChunkSampleStrides.keys)
+                    }
+                    compactChunk = nil
+                } else {
+                    unfinishedLodTargets = []
+                    compactChunk = makeCompactChunk(at: chunkCoord)
+                }
                 let generationSeconds = TerrainRenderer.currentTimeSeconds() - generationStart
 
                 var generationWorkersToStart = 0
                 var meshWorkersToStart = 0
+                var workEpoch = 0
                 lock.lock()
-                inFlightChunks.remove(chunkCoord)
-                if let compactChunk, let center = targetCenter, shouldKeepChunk(chunkCoord, around: center) {
-                    chunks[chunkCoord] = compactChunk
-                    generationSecondsByChunk[chunkCoord] = generationSeconds
-                    markChunkDirtyLocked(chunkCoord)
-                    for neighbor in adjacentChunkCoords(to: chunkCoord) where chunks[neighbor] != nil {
-                        markChunkDirtyLocked(neighbor)
+                guard epoch == activeWorkEpoch else {
+                    lock.unlock()
+                    return
+                }
+                if generationMode == .lod {
+                    activeLodBatchTargets.subtract(unfinishedLodTargets)
+                    for coord in unfinishedLodTargets {
+                        inFlightChunks.removeValue(forKey: coord)
+                    }
+                } else {
+                    inFlightChunks.removeValue(forKey: chunkCoord)
+                    if let compactChunk, shouldKeepChunkLocked(chunkCoord) {
+                        chunks[chunkCoord] = compactChunk
+                        availableSampleStrideByChunk[chunkCoord] = compactChunk.minimumAvailableSampleStride
+                        staleChunksNeedingRegeneration.remove(chunkCoord)
+                        generationSecondsByChunk[chunkCoord] = generationSeconds
+                        markChunkDirtyLocked(chunkCoord)
+                        for neighbor in adjacentChunkCoords(to: chunkCoord) where chunks[neighbor] != nil {
+                            markChunkDirtyLocked(neighbor)
+                        }
                     }
                 }
                 let removed = pruneChunksLockedIfNeeded()
@@ -622,22 +911,128 @@ final class TerrainRenderer {
                 }
                 generationWorkersToStart = startGenerationWorkersLocked()
                 meshWorkersToStart = startMeshWorkersLocked()
+                workEpoch = activeWorkEpoch
                 lock.unlock()
 
-                for _ in 0..<generationWorkersToStart {
-                    generationQueue.async { [self] in
-                        generationWorkerLoop()
-                    }
-                }
-                for _ in 0..<meshWorkersToStart {
-                    meshQueue.async { [self] in
-                        meshWorkerLoop()
-                    }
-                }
+                startGenerationWorkers(generationWorkersToStart, epoch: workEpoch)
+                startMeshWorkers(meshWorkersToStart, epoch: workEpoch)
             }
         }
 
+        private func desiredLodTargetChunkSampleStridesLocked() -> [ChunkCoord: Int] {
+            var targetChunkSampleStrides: [ChunkCoord: Int] = [:]
+            var seen: Set<ChunkCoord> = []
+
+            if let center = targetCenter {
+                for offset in orderedOffsets {
+                    let coord = ChunkCoord(x: center.x + offset.x, z: center.z + offset.z)
+                    guard seen.insert(coord).inserted else {
+                        continue
+                    }
+                    guard shouldGenerateChunkLocked(coord) else {
+                        continue
+                    }
+                    if surfaceOnly {
+                        targetChunkSampleStrides[coord] = 1
+                    } else {
+                        let desiredSampleStride = desiredGenerationSampleStrideLocked(for: coord)
+                        if desiredSampleStride > 1 {
+                            targetChunkSampleStrides[coord] = desiredSampleStride
+                        }
+                    }
+                }
+            }
+
+            _ = forEachPinnedChunkCoordLocked { coord in
+                guard seen.insert(coord).inserted else {
+                    return true
+                }
+                guard shouldGenerateChunkLocked(coord) else {
+                    return true
+                }
+                if surfaceOnly {
+                    targetChunkSampleStrides[coord] = 1
+                } else {
+                    let desiredSampleStride = desiredGenerationSampleStrideLocked(for: coord)
+                    if desiredSampleStride > 1 {
+                        targetChunkSampleStrides[coord] = desiredSampleStride
+                    }
+                }
+                return true
+            }
+
+            return targetChunkSampleStrides
+        }
+
+        private func makeLodSnapshotRequestLocked(
+            targetChunkSampleStrides: [ChunkCoord: Int]
+        ) -> LODSnapshotRequest? {
+            guard !targetChunkSampleStrides.isEmpty else {
+                return nil
+            }
+
+            let targetCoords = Array(targetChunkSampleStrides.keys)
+            guard let minTargetChunkX = targetCoords.map(\.x).min(),
+                  let maxTargetChunkX = targetCoords.map(\.x).max(),
+                  let minTargetChunkZ = targetCoords.map(\.z).min(),
+                  let maxTargetChunkZ = targetCoords.map(\.z).max() else {
+                return nil
+            }
+
+            let minChunkX = minTargetChunkX - 2
+            let maxChunkX = maxTargetChunkX + 1
+            let minChunkZ = minTargetChunkZ - 2
+            let maxChunkZ = maxTargetChunkZ + 1
+            let minBlockX = minChunkX * ProtoChunk.sideLength
+            let maxBlockX = (maxChunkX + 1) * ProtoChunk.sideLength - 1
+            let minBlockZ = minChunkZ * ProtoChunk.sideLength
+            let maxBlockZ = (maxChunkZ + 1) * ProtoChunk.sideLength - 1
+
+            let originX: Int32
+            let originZ: Int32
+            if let targetCenter {
+                originX = Int32(targetCenter.x * ProtoChunk.sideLength + ProtoChunk.sideLength / 2)
+                originZ = Int32(targetCenter.z * ProtoChunk.sideLength + ProtoChunk.sideLength / 2)
+            } else if targetCameraBlock.x != Int.min, targetCameraBlock.z != Int.min {
+                originX = Int32(targetCameraBlock.x)
+                originZ = Int32(targetCameraBlock.z)
+            } else {
+                originX = Int32((minBlockX + maxBlockX) / 2)
+                originZ = Int32((minBlockZ + maxBlockZ) / 2)
+            }
+
+            let radius = Int32(
+                max(
+                    abs(minBlockX - Int(originX)),
+                    abs(maxBlockX - Int(originX)),
+                    abs(minBlockZ - Int(originZ)),
+                    abs(maxBlockZ - Int(originZ))
+                ) + terrainLodSettings.maxSampleStride
+            )
+            let origin = PosInt3D(x: Int32(originX), y: 0, z: Int32(originZ))
+            let baseCellSize = baseLodCellSizeLocked()
+            let maxCellSizePower = terrainLodSettings.maxSampleStride <= 1 || terrainLodSettings.maxSampleStride <= baseCellSize
+                ? 0
+                : max(0, terrainLodSettings.maxSampleStride.trailingZeroBitCount - baseCellSize.trailingZeroBitCount)
+
+            return LODSnapshotRequest(
+                origin: origin,
+                radius: radius,
+                nearDistance: terrainLodSettings.nearDistance,
+                stepDistance: terrainLodSettings.stepDistance,
+                maxCellSizePower: maxCellSizePower,
+                targetChunkSampleStrides: targetChunkSampleStrides
+            )
+        }
         private func nextMissingChunkLocked() -> ChunkCoord? {
+            if !pinnedChunkSquares.isEmpty {
+                defer { pinnedGenerationSelectionCount &+= 1 }
+                if pinnedGenerationSelectionCount % 4 == 3,
+                   let farthest = lowestPriorityPinnedChunkLocked(where: shouldGenerateChunkLocked) {
+                    return farthest
+                }
+                return highestPriorityPinnedChunkLocked(where: shouldGenerateChunkLocked)
+            }
             if let center = targetCenter {
                 for offset in orderedOffsets {
                     let coord = ChunkCoord(x: center.x + offset.x, z: center.z + offset.z)
@@ -646,61 +1041,45 @@ final class TerrainRenderer {
                     }
                 }
             }
-            for coord in pinnedChunks.sorted(by: isHigherPriorityChunk(_:than:)) {
-                if shouldGenerateChunkLocked(coord) {
-                    return coord
-                }
-            }
-            return nil
+            return firstPinnedChunkCoordLocked(where: shouldGenerateChunkLocked)
         }
 
         private func shouldGenerateChunkLocked(_ coord: ChunkCoord) -> Bool {
-            guard !inFlightChunks.contains(coord) else {
+            guard inFlightChunks[coord] == nil,
+                  !activeLodBatchTargets.contains(coord) else {
                 return false
             }
+            if staleChunksNeedingRegeneration.contains(coord) {
+                return true
+            }
+            if surfaceOnly {
+                return availableSampleStrideByChunk[coord] == nil
+            }
             guard let chunk = chunks[coord] else {
+                if let availableSampleStride = availableSampleStrideByChunk[coord] {
+                    return availableSampleStride > desiredGenerationSampleStrideLocked(for: coord)
+                }
                 return true
             }
             return chunk.minimumAvailableSampleStride > desiredGenerationSampleStrideLocked(for: coord)
         }
 
         private func desiredGenerationSampleStrideLocked(for coord: ChunkCoord) -> Int {
-            if pinnedChunks.contains(coord) {
+            if isPinnedChunkLocked(coord) {
                 return 1
             }
             return sampleStrideLocked(for: coord)
         }
 
-        private func makeLodSnapshotRequestLocked() -> LODSnapshotRequest? {
-            guard let center = targetCenter else {
-                return nil
+        private func generationModeLocked(desiredSampleStride: Int) -> ChunkGenerationMode {
+            if surfaceOnly || desiredSampleStride > 1 {
+                return .lod
             }
-
-            let originX = center.x * ProtoChunk.sideLength + (ProtoChunk.sideLength / 2)
-            let originZ = center.z * ProtoChunk.sideLength + (ProtoChunk.sideLength / 2)
-            let origin = PosInt3D(x: Int32(originX), y: 0, z: Int32(originZ))
-            let farthestBlockDistance = renderRadius * ProtoChunk.sideLength + (ProtoChunk.sideLength - 1) + terrainLodSettings.maxSampleStride
-            let baseCellSize = baseLodCellSizeLocked()
-            let maxCellSizePower = terrainLodSettings.maxSampleStride <= 1 || terrainLodSettings.maxSampleStride <= baseCellSize
-                ? 0
-                : max(0, terrainLodSettings.maxSampleStride.trailingZeroBitCount - baseCellSize.trailingZeroBitCount)
-
-            return LODSnapshotRequest(
-                key: LODSnapshotKey(
-                    center: center,
-                    renderRadius: renderRadius,
-                    nearDistance: terrainLodSettings.nearDistance,
-                    stepDistance: terrainLodSettings.stepDistance,
-                    maxSampleStride: terrainLodSettings.maxSampleStride
-                ),
-                origin: origin,
-                radius: Int32(farthestBlockDistance),
-                maxCellSizePower: maxCellSizePower
-            )
+            return .full
         }
 
         private func startGenerationWorkersLocked() -> Int {
-            guard targetCenter != nil || !pinnedChunks.isEmpty else {
+            guard !isShutDown, targetCenter != nil || !pinnedChunkSquares.isEmpty else {
                 return 0
             }
             var started = 0
@@ -712,9 +1091,21 @@ final class TerrainRenderer {
         }
 
         private func nextDirtyChunkLocked() -> ChunkCoord? {
-            let targetChunks = targetChunksLocked()
+            if !pinnedChunkSquares.isEmpty {
+                let predicate: (ChunkCoord) -> Bool = { coord in
+                    self.dirtyMeshChunks.contains(coord)
+                        && !self.inFlightMeshChunks.contains(coord)
+                        && self.chunks[coord] != nil
+                }
+                defer { pinnedMeshSelectionCount &+= 1 }
+                if pinnedMeshSelectionCount % 4 == 3,
+                   let farthest = lowestPriorityPinnedChunkLocked(where: predicate) {
+                    return farthest
+                }
+                return highestPriorityPinnedChunkLocked(where: predicate)
+            }
             let orderedLoaded = chunks.keys
-                .filter { targetChunks.contains($0) }
+                .filter(isTargetChunkLocked)
                 .sorted(by: isHigherPriorityChunk(_:than:))
             for coord in orderedLoaded where dirtyMeshChunks.contains(coord) && !inFlightMeshChunks.contains(coord) {
                 return coord
@@ -723,7 +1114,7 @@ final class TerrainRenderer {
         }
 
         private func startMeshWorkersLocked() -> Int {
-            guard targetCenter != nil || !pinnedChunks.isEmpty else {
+            guard !isShutDown, targetCenter != nil || !pinnedChunkSquares.isEmpty else {
                 return 0
             }
             let meshWorkerLimit = max(1, generationWorkerCount)
@@ -735,10 +1126,14 @@ final class TerrainRenderer {
             return started
         }
 
-        private func meshWorkerLoop() {
+        private func meshWorkerLoop(epoch: Int) {
             while true {
                 let snapshot: ChunkMeshSnapshot
                 lock.lock()
+                guard epoch == activeWorkEpoch else {
+                    lock.unlock()
+                    return
+                }
                 guard let coord = nextDirtyChunkLocked(),
                       let chunk = chunks[coord] else {
                     activeMeshWorkers = max(0, activeMeshWorkers - 1)
@@ -748,17 +1143,15 @@ final class TerrainRenderer {
                 dirtyMeshChunks.remove(coord)
                 inFlightMeshChunks.insert(coord)
                 let revision = chunkMeshRevision[coord] ?? 0
-                let availableChunks = chunks.count
+                let availableChunks = availableChunkCountLocked()
                 var neighbors: [ChunkCoord: CompactChunk] = [coord: chunk]
                 for neighbor in adjacentChunkCoords(to: coord) {
                     if let neighborChunk = chunks[neighbor] {
                         neighbors[neighbor] = neighborChunk
                     }
                 }
-                let sampleStrideByChunk = neighbors.keys.reduce(into: [ChunkCoord: Int]()) { sampleStrides, neighborCoord in
-                    sampleStrides[neighborCoord] = sampleStrideLocked(for: neighborCoord)
-                }
                 let generationSeconds = generationSecondsByChunk[coord] ?? 0
+                let totalTargetChunks = targetChunkCountLocked()
                 lock.unlock()
 
                 snapshot = ChunkMeshSnapshot(
@@ -766,29 +1159,30 @@ final class TerrainRenderer {
                     revision: revision,
                     chunk: chunk,
                     neighbors: neighbors,
-                    sampleStrideByChunk: sampleStrideByChunk,
                     generationSeconds: generationSeconds,
-                    totalTargetChunks: orderedOffsets.count,
+                    totalTargetChunks: totalTargetChunks,
                     availableChunks: availableChunks
                 )
 
                 let result = buildChunkMesh(snapshot: snapshot)
 
                 var meshWorkersToStart = 0
+                var workEpoch = 0
                 lock.lock()
+                guard epoch == activeWorkEpoch else {
+                    lock.unlock()
+                    return
+                }
                 inFlightMeshChunks.remove(coord)
                 if chunks[coord] != nil, (chunkMeshRevision[coord] ?? 0) == result.revision {
                     pendingMeshResults[coord] = result
                     generationSecondsByChunk[coord] = 0
                 }
                 meshWorkersToStart = startMeshWorkersLocked()
+                workEpoch = activeWorkEpoch
                 lock.unlock()
 
-                for _ in 0..<meshWorkersToStart {
-                    meshQueue.async { [self] in
-                        meshWorkerLoop()
-                    }
-                }
+                startMeshWorkers(meshWorkersToStart, epoch: workEpoch)
             }
         }
 
@@ -803,8 +1197,7 @@ final class TerrainRenderer {
             let meshBuild = buildGreedyMesh(
                 coord: snapshot.coord,
                 chunk: snapshot.chunk,
-                neighbors: snapshot.neighbors,
-                sampleStrideByChunk: snapshot.sampleStrideByChunk
+                neighbors: snapshot.neighbors
             )
             profile.meshSeconds = TerrainRenderer.currentTimeSeconds() - meshStart
 
@@ -819,20 +1212,7 @@ final class TerrainRenderer {
             )
         }
 
-        private func makeCompactChunk(
-            at chunkCoord: ChunkCoord,
-            desiredSampleStride: Int,
-            lodSnapshotRequest: LODSnapshotRequest?
-        ) -> CompactChunk? {
-            if desiredSampleStride > 1,
-               let coarseChunk = makeCompactChunkUsingSampleLOD(
-                    at: chunkCoord,
-                    desiredSampleStride: desiredSampleStride,
-                    request: lodSnapshotRequest
-               ) {
-                return coarseChunk
-            }
-
+        private func makeCompactChunk(at chunkCoord: ChunkCoord) -> CompactChunk? {
             let protoChunk = ProtoChunk()
             let generationSucceeded = (try? worldGenerator.generateInto(
                 protoChunk,
@@ -892,39 +1272,695 @@ final class TerrainRenderer {
                         cellSideLength: 16,
                         bitmap: bitmap,
                         biomePalette: biomePalette,
-                        biomeIndices: biomeIndices
+                        biomeIndices: biomeIndices,
+                        hasAnySolid: bitmap.contains(where: { $0 != 0 })
                     )
                 )
             }
 
-            let lods = Self.supportedSampleStrides.map { sampleStride in
-                CompactChunkLod(
-                    sampleStride: sampleStride,
-                    sections: sampleStride == 1
-                        ? fullResolutionSections
-                        : makeLodSections(from: fullResolutionSections, sampleStride: sampleStride)
+            return makeCompactChunk(
+                minY: Int(protoChunk.minY),
+                height: Int(protoChunk.height),
+                sampleStride: 1,
+                sections: fullResolutionSections
+            )
+        }
+        private static func sourceChunkKeysNeededForMeshingStatic(_ targetChunkCoord: ChunkCoord) -> [TerrainLODChunkKey] {
+            var keys: [TerrainLODChunkKey] = []
+            keys.reserveCapacity(16)
+            for sourceChunkZ in (targetChunkCoord.z - 2)...(targetChunkCoord.z + 1) {
+                for sourceChunkX in (targetChunkCoord.x - 2)...(targetChunkCoord.x + 1) {
+                    keys.append(TerrainLODChunkKey(x: Int32(sourceChunkX), z: Int32(sourceChunkZ)))
+                }
+            }
+            return keys
+        }
+
+        private func sourceChunkKeysNeededForMeshing(_ targetChunkCoord: ChunkCoord) -> [TerrainLODChunkKey] {
+            Self.sourceChunkKeysNeededForMeshingStatic(targetChunkCoord)
+        }
+
+        private func relevantLodColumns(
+            for chunkCoord: ChunkCoord,
+            in sourceChunksByKey: [TerrainLODChunkKey: TerrainLODChunk]
+        ) -> [TerrainLODColumn] {
+            let chunkMinX = chunkCoord.x * ProtoChunk.sideLength
+            let chunkMaxXExclusive = chunkMinX + ProtoChunk.sideLength
+            let chunkMinZ = chunkCoord.z * ProtoChunk.sideLength
+            let chunkMaxZExclusive = chunkMinZ + ProtoChunk.sideLength
+            var relevant: [TerrainLODColumn] = []
+
+            for sourceChunk in sourceChunksByKey.values {
+                for column in sourceChunk.columns {
+                    let cellSize = max(1, Int(column.cellSize))
+                    let columnMaxXExclusive = Int(column.x) + cellSize
+                    let columnMaxZExclusive = Int(column.z) + cellSize
+                    guard Int(column.x) < chunkMaxXExclusive,
+                          columnMaxXExclusive > chunkMinX,
+                          Int(column.z) < chunkMaxZExclusive,
+                          columnMaxZExclusive > chunkMinZ else {
+                        continue
+                    }
+                    relevant.append(column)
+                }
+            }
+
+            return relevant
+        }
+
+        private func relevantSurfaceCells(
+            for chunkCoord: ChunkCoord,
+            in sourceChunksByKey: [TerrainLODChunkKey: TerrainSurfaceLODChunk]
+        ) -> [TerrainSurfaceLODCell] {
+            let chunkMinX = chunkCoord.x * ProtoChunk.sideLength
+            let chunkMaxXExclusive = chunkMinX + ProtoChunk.sideLength
+            let chunkMinZ = chunkCoord.z * ProtoChunk.sideLength
+            let chunkMaxZExclusive = chunkMinZ + ProtoChunk.sideLength
+            var relevant: [TerrainSurfaceLODCell] = []
+
+            for sourceChunk in sourceChunksByKey.values {
+                for cell in sourceChunk.cells {
+                    let cellMaxXExclusive = Int(cell.x + cell.cellSize)
+                    let cellMaxZExclusive = Int(cell.z + cell.cellSize)
+                    guard Int(cell.x) < chunkMaxXExclusive,
+                          cellMaxXExclusive > chunkMinX,
+                          Int(cell.z) < chunkMaxZExclusive,
+                          cellMaxZExclusive > chunkMinZ else {
+                        continue
+                    }
+                    relevant.append(cell)
+                }
+            }
+
+            return relevant
+        }
+
+        private struct GeneratedLodMesh {
+            let origin: SIMD3<Int>
+            let vertices: [VulkanEngine.Vertex3D]
+            let availableSampleStride: Int
+            let meshSeconds: Double
+        }
+
+        private final class StreamingLodMeshAccumulator: @unchecked Sendable {
+            private struct PendingBuild: @unchecked Sendable {
+                let targetChunkCoord: ChunkCoord
+                let sourceChunksByKey: [TerrainLODChunkKey: TerrainLODChunk]
+            }
+
+            private let lock = NSLock()
+            private let desiredSampleStrideByChunk: [ChunkCoord: Int]
+            private let sourceKeysByTargetChunk: [ChunkCoord: [TerrainLODChunkKey]]
+            private let targetChunksBySourceKey: [TerrainLODChunkKey: [ChunkCoord]]
+            private var remainingConsumersBySourceChunk: [TerrainLODChunkKey: Int]
+            private var sourceChunksByKey: [TerrainLODChunkKey: TerrainLODChunk] = [:]
+            private var completedTargets: Set<ChunkCoord> = []
+            private let scheduleBuild: (@escaping @Sendable () -> Void) -> Void
+            private let build: @Sendable (ChunkCoord, [TerrainLODChunkKey: TerrainLODChunk], Int, Int, Int) -> GeneratedLodMesh?
+            private let emit: @Sendable (ChunkCoord, GeneratedLodMesh) -> Void
+
+            init(
+                desiredSampleStrideByChunk: [ChunkCoord: Int],
+                scheduleBuild: @escaping (@escaping @Sendable () -> Void) -> Void,
+                build: @escaping @Sendable (ChunkCoord, [TerrainLODChunkKey: TerrainLODChunk], Int, Int, Int) -> GeneratedLodMesh?,
+                emit: @escaping @Sendable (ChunkCoord, GeneratedLodMesh) -> Void
+            ) {
+                self.desiredSampleStrideByChunk = desiredSampleStrideByChunk
+                var resolvedSourceKeysByTargetChunk: [ChunkCoord: [TerrainLODChunkKey]] = [:]
+                resolvedSourceKeysByTargetChunk.reserveCapacity(desiredSampleStrideByChunk.count)
+                var targetChunksBySourceKey: [TerrainLODChunkKey: [ChunkCoord]] = [:]
+                var remainingConsumersBySourceChunk: [TerrainLODChunkKey: Int] = [:]
+
+                for targetChunkCoord in desiredSampleStrideByChunk.keys {
+                    let sourceKeys = Streamer.sourceChunkKeysNeededForMeshingStatic(targetChunkCoord)
+                    resolvedSourceKeysByTargetChunk[targetChunkCoord] = sourceKeys
+                    for sourceKey in sourceKeys {
+                        targetChunksBySourceKey[sourceKey, default: []].append(targetChunkCoord)
+                        remainingConsumersBySourceChunk[sourceKey, default: 0] += 1
+                    }
+                }
+
+                self.sourceKeysByTargetChunk = resolvedSourceKeysByTargetChunk
+                self.targetChunksBySourceKey = targetChunksBySourceKey
+                self.remainingConsumersBySourceChunk = remainingConsumersBySourceChunk
+                self.scheduleBuild = scheduleBuild
+                self.build = build
+                self.emit = emit
+            }
+
+            func accept(chunk: TerrainLODChunk, minY: Int, maxYExclusive: Int) {
+                var pendingBuilds: [PendingBuild] = []
+
+                lock.lock()
+                sourceChunksByKey[chunk.key] = chunk
+                let candidateTargets = Set(targetChunksBySourceKey[chunk.key] ?? [])
+                for targetChunkCoord in candidateTargets {
+                    guard !completedTargets.contains(targetChunkCoord),
+                          let sourceKeys = sourceKeysByTargetChunk[targetChunkCoord],
+                          sourceKeys.allSatisfy({ sourceChunksByKey[$0] != nil }) else {
+                        continue
+                    }
+
+                    completedTargets.insert(targetChunkCoord)
+                    let neededSourceChunks = Dictionary(
+                        uniqueKeysWithValues: sourceKeys.compactMap { sourceKey in
+                            sourceChunksByKey[sourceKey].map { (sourceKey, $0) }
+                        }
+                    )
+                    pendingBuilds.append(
+                        PendingBuild(
+                            targetChunkCoord: targetChunkCoord,
+                            sourceChunksByKey: neededSourceChunks
+                        )
+                    )
+
+                    for sourceKey in sourceKeys {
+                        guard let remainingConsumers = remainingConsumersBySourceChunk[sourceKey] else {
+                            continue
+                        }
+                        if remainingConsumers <= 1 {
+                            remainingConsumersBySourceChunk.removeValue(forKey: sourceKey)
+                            sourceChunksByKey.removeValue(forKey: sourceKey)
+                        } else {
+                            remainingConsumersBySourceChunk[sourceKey] = remainingConsumers - 1
+                        }
+                    }
+                }
+                lock.unlock()
+
+                for pendingBuild in pendingBuilds {
+                    guard let desiredSampleStride = desiredSampleStrideByChunk[pendingBuild.targetChunkCoord] else {
+                        continue
+                    }
+                    let build = build
+                    let emit = emit
+                    scheduleBuild {
+                        guard let mesh = build(
+                            pendingBuild.targetChunkCoord,
+                            pendingBuild.sourceChunksByKey,
+                            desiredSampleStride,
+                            minY,
+                            maxYExclusive
+                        ) else {
+                            return
+                        }
+                        emit(pendingBuild.targetChunkCoord, mesh)
+                    }
+                }
+            }
+
+            func unfinishedTargets() -> Set<ChunkCoord> {
+                lock.lock()
+                let unfinished = Set(desiredSampleStrideByChunk.keys).subtracting(completedTargets)
+                lock.unlock()
+                return unfinished
+            }
+        }
+
+        private final class StreamingSurfaceLodMeshAccumulator: @unchecked Sendable {
+            private struct PendingBuild: @unchecked Sendable {
+                let targetChunkCoord: ChunkCoord
+                let sourceChunksByKey: [TerrainLODChunkKey: TerrainSurfaceLODChunk]
+            }
+
+            private let lock = NSLock()
+            private let sourceKeysByTargetChunk: [ChunkCoord: [TerrainLODChunkKey]]
+            private let targetChunksBySourceKey: [TerrainLODChunkKey: [ChunkCoord]]
+            private var remainingConsumersBySourceChunk: [TerrainLODChunkKey: Int]
+            private var sourceChunksByKey: [TerrainLODChunkKey: TerrainSurfaceLODChunk] = [:]
+            private var completedTargets: Set<ChunkCoord> = []
+            private let scheduleBuild: (@escaping @Sendable () -> Void) -> Void
+            private let build: @Sendable (ChunkCoord, [TerrainLODChunkKey: TerrainSurfaceLODChunk], Int, Int) -> GeneratedLodMesh?
+            private let emit: @Sendable (ChunkCoord, GeneratedLodMesh) -> Void
+
+            init(
+                targetChunkCoords: Set<ChunkCoord>,
+                scheduleBuild: @escaping (@escaping @Sendable () -> Void) -> Void,
+                build: @escaping @Sendable (ChunkCoord, [TerrainLODChunkKey: TerrainSurfaceLODChunk], Int, Int) -> GeneratedLodMesh?,
+                emit: @escaping @Sendable (ChunkCoord, GeneratedLodMesh) -> Void
+            ) {
+                var resolvedSourceKeysByTargetChunk: [ChunkCoord: [TerrainLODChunkKey]] = [:]
+                resolvedSourceKeysByTargetChunk.reserveCapacity(targetChunkCoords.count)
+                var targetChunksBySourceKey: [TerrainLODChunkKey: [ChunkCoord]] = [:]
+                var remainingConsumersBySourceChunk: [TerrainLODChunkKey: Int] = [:]
+
+                for targetChunkCoord in targetChunkCoords {
+                    let sourceKeys = Streamer.sourceChunkKeysNeededForMeshingStatic(targetChunkCoord)
+                    resolvedSourceKeysByTargetChunk[targetChunkCoord] = sourceKeys
+                    for sourceKey in sourceKeys {
+                        targetChunksBySourceKey[sourceKey, default: []].append(targetChunkCoord)
+                        remainingConsumersBySourceChunk[sourceKey, default: 0] += 1
+                    }
+                }
+
+                self.sourceKeysByTargetChunk = resolvedSourceKeysByTargetChunk
+                self.targetChunksBySourceKey = targetChunksBySourceKey
+                self.remainingConsumersBySourceChunk = remainingConsumersBySourceChunk
+                self.scheduleBuild = scheduleBuild
+                self.build = build
+                self.emit = emit
+            }
+
+            func accept(chunk: TerrainSurfaceLODChunk, minY: Int, maxYExclusive: Int) {
+                var pendingBuilds: [PendingBuild] = []
+
+                lock.lock()
+                sourceChunksByKey[chunk.key] = chunk
+                let candidateTargets = Set(targetChunksBySourceKey[chunk.key] ?? [])
+                for targetChunkCoord in candidateTargets {
+                    guard !completedTargets.contains(targetChunkCoord),
+                          let sourceKeys = sourceKeysByTargetChunk[targetChunkCoord],
+                          sourceKeys.allSatisfy({ sourceChunksByKey[$0] != nil }) else {
+                        continue
+                    }
+
+                    completedTargets.insert(targetChunkCoord)
+                    let neededSourceChunks = Dictionary(
+                        uniqueKeysWithValues: sourceKeys.compactMap { sourceKey in
+                            sourceChunksByKey[sourceKey].map { (sourceKey, $0) }
+                        }
+                    )
+                    pendingBuilds.append(
+                        PendingBuild(
+                            targetChunkCoord: targetChunkCoord,
+                            sourceChunksByKey: neededSourceChunks
+                        )
+                    )
+
+                    for sourceKey in sourceKeys {
+                        guard let remainingConsumers = remainingConsumersBySourceChunk[sourceKey] else {
+                            continue
+                        }
+                        if remainingConsumers <= 1 {
+                            remainingConsumersBySourceChunk.removeValue(forKey: sourceKey)
+                            sourceChunksByKey.removeValue(forKey: sourceKey)
+                        } else {
+                            remainingConsumersBySourceChunk[sourceKey] = remainingConsumers - 1
+                        }
+                    }
+                }
+                lock.unlock()
+
+                for pendingBuild in pendingBuilds {
+                    let build = build
+                    let emit = emit
+                    scheduleBuild {
+                        guard let mesh = build(
+                            pendingBuild.targetChunkCoord,
+                            pendingBuild.sourceChunksByKey,
+                            minY,
+                            maxYExclusive
+                        ) else {
+                            return
+                        }
+                        emit(pendingBuild.targetChunkCoord, mesh)
+                    }
+                }
+            }
+
+            func unfinishedTargets() -> Set<ChunkCoord> {
+                lock.lock()
+                let unfinished = Set(sourceKeysByTargetChunk.keys).subtracting(completedTargets)
+                lock.unlock()
+                return unfinished
+            }
+        }
+
+        private func buildDirectLodMeshResult(
+            at chunkCoord: ChunkCoord,
+            desiredSampleStride: Int,
+            retainedNeighborChunks: [ChunkCoord: CompactChunk],
+            neighborDesiredSampleStrides: [ChunkCoord: Int],
+            sourceChunksByKey: [TerrainLODChunkKey: TerrainLODChunk],
+            minY: Int,
+            maxYExclusive: Int
+        ) -> GeneratedLodMesh? {
+            var neighbors = retainedNeighborChunks
+            neighbors.reserveCapacity(5)
+            for coord in [chunkCoord] + adjacentChunkCoords(to: chunkCoord) where neighbors[coord] == nil {
+                if let compactChunk = makeCompactChunkUsingSampleLOD(
+                    at: coord,
+                    desiredSampleStride: neighborDesiredSampleStrides[coord] ?? desiredSampleStride,
+                    in: sourceChunksByKey,
+                    minY: minY,
+                    maxYExclusive: maxYExclusive
+                ) {
+                    neighbors[coord] = compactChunk
+                }
+            }
+
+            guard let chunk = neighbors[chunkCoord] else {
+                return nil
+            }
+
+            let meshStart = TerrainRenderer.currentTimeSeconds()
+            let meshBuild = buildGreedyMesh(
+                coord: chunkCoord,
+                chunk: chunk,
+                neighbors: neighbors
+            )
+            return GeneratedLodMesh(
+                origin: meshBuild.origin,
+                vertices: meshBuild.vertices,
+                availableSampleStride: chunk.minimumAvailableSampleStride,
+                meshSeconds: TerrainRenderer.currentTimeSeconds() - meshStart
+            )
+        }
+
+        private func buildDirectSurfaceLodMeshResult(
+            at chunkCoord: ChunkCoord,
+            retainedNeighborChunks: [ChunkCoord: CompactChunk],
+            sourceChunksByKey: [TerrainLODChunkKey: TerrainSurfaceLODChunk],
+            minY: Int,
+            maxYExclusive: Int
+        ) -> GeneratedLodMesh? {
+            var neighbors = retainedNeighborChunks
+            neighbors.reserveCapacity(5)
+            for coord in [chunkCoord] + adjacentChunkCoords(to: chunkCoord) where neighbors[coord] == nil {
+                if let compactChunk = makeSurfaceCompactChunk(
+                    at: coord,
+                    in: sourceChunksByKey,
+                    minY: minY,
+                    maxYExclusive: maxYExclusive
+                ) {
+                    neighbors[coord] = compactChunk
+                }
+            }
+
+            guard let chunk = neighbors[chunkCoord] else {
+                return nil
+            }
+
+            let meshStart = TerrainRenderer.currentTimeSeconds()
+            let meshBuild = buildGreedyMesh(
+                coord: chunkCoord,
+                chunk: chunk,
+                neighbors: neighbors
+            )
+            return GeneratedLodMesh(
+                origin: meshBuild.origin,
+                vertices: meshBuild.vertices,
+                availableSampleStride: chunk.minimumAvailableSampleStride,
+                meshSeconds: TerrainRenderer.currentTimeSeconds() - meshStart
+            )
+        }
+
+        private func retainedNeighborChunks(for chunkCoord: ChunkCoord) -> [ChunkCoord: CompactChunk] {
+            lock.lock()
+            var retainedNeighbors: [ChunkCoord: CompactChunk] = [:]
+            let coordsNeededForMeshing = [chunkCoord] + adjacentChunkCoords(to: chunkCoord)
+            retainedNeighbors.reserveCapacity(coordsNeededForMeshing.count)
+            for coord in coordsNeededForMeshing {
+                if let chunk = chunks[coord] {
+                    retainedNeighbors[coord] = chunk
+                }
+            }
+            lock.unlock()
+            return retainedNeighbors
+        }
+
+        private func desiredNeighborSampleStrides(for chunkCoord: ChunkCoord) -> [ChunkCoord: Int] {
+            lock.lock()
+            var desiredNeighborSampleStrides: [ChunkCoord: Int] = [:]
+            let coordsNeededForMeshing = [chunkCoord] + adjacentChunkCoords(to: chunkCoord)
+            desiredNeighborSampleStrides.reserveCapacity(coordsNeededForMeshing.count)
+            for coord in coordsNeededForMeshing {
+                desiredNeighborSampleStrides[coord] = desiredGenerationSampleStrideLocked(for: coord)
+            }
+            lock.unlock()
+            return desiredNeighborSampleStrides
+        }
+
+        private func recordGeneratedLodMesh(
+            _ generatedLodMesh: GeneratedLodMesh,
+            for chunkCoord: ChunkCoord,
+            generationSeconds: Double,
+            totalTargetChunks: Int,
+            epoch: Int
+        ) {
+            lock.lock()
+            defer { lock.unlock() }
+
+            guard epoch == activeWorkEpoch else {
+                return
+            }
+
+            inFlightChunks.removeValue(forKey: chunkCoord)
+            activeLodBatchTargets.remove(chunkCoord)
+            guard shouldKeepChunkLocked(chunkCoord) else {
+                generationSecondsByChunk.removeValue(forKey: chunkCoord)
+                return
+            }
+
+            availableSampleStrideByChunk[chunkCoord] = generatedLodMesh.availableSampleStride
+            staleChunksNeedingRegeneration.remove(chunkCoord)
+            generationSecondsByChunk.removeValue(forKey: chunkCoord)
+            pendingMeshResults[chunkCoord] = ChunkMeshResult(
+                coord: chunkCoord,
+                revision: 0,
+                origin: generatedLodMesh.origin,
+                vertices: generatedLodMesh.vertices,
+                profile: MeshProfile(
+                    generationSeconds: generationSeconds,
+                    meshSeconds: generatedLodMesh.meshSeconds,
+                    uploadSeconds: 0
+                ),
+                availableChunks: availableChunkCountLocked(),
+                totalTargetChunks: totalTargetChunks
+            )
+        }
+
+        private func streamLodBatch(
+            request: LODSnapshotRequest,
+            totalTargetChunks: Int,
+            generationStart: Double,
+            epoch: Int
+        ) -> Set<ChunkCoord> {
+            if surfaceOnly {
+                let accumulator = StreamingSurfaceLodMeshAccumulator(
+                    targetChunkCoords: Set(request.targetChunkSampleStrides.keys),
+                    scheduleBuild: { [weak self] work in
+                        self?.meshQueue.async(execute: work)
+                    },
+                    build: { [weak self] chunkCoord, sourceChunksByKey, minY, maxYExclusive in
+                        guard let self else {
+                            return nil
+                        }
+                        return self.buildDirectSurfaceLodMeshResult(
+                            at: chunkCoord,
+                            retainedNeighborChunks: self.retainedNeighborChunks(for: chunkCoord),
+                            sourceChunksByKey: sourceChunksByKey,
+                            minY: minY,
+                            maxYExclusive: maxYExclusive
+                        )
+                    },
+                    emit: { [weak self] chunkCoord, generatedLodMesh in
+                        self?.recordGeneratedLodMesh(
+                            generatedLodMesh,
+                            for: chunkCoord,
+                            generationSeconds: TerrainRenderer.currentTimeSeconds() - generationStart,
+                            totalTargetChunks: totalTargetChunks,
+                            epoch: epoch
+                        )
+                    }
                 )
+
+                guard (try? worldGenerator.streamSurfaceLOD(
+                    from: request.origin,
+                    radius: request.radius,
+                    startingRadius: Int32(request.nearDistance),
+                    radiusStep: Int32(request.stepDistance),
+                    maxCellSizePower: request.maxCellSizePower,
+                    threadCount: generationWorkerCount,
+                    progressHandler: { [weak self] progress in
+                        self?.recordLodProgress(progress, surfaceOnly: true)
+                    },
+                    streamer: { chunk, minY, maxYExclusive in
+                        accumulator.accept(
+                            chunk: chunk,
+                            minY: Int(minY),
+                            maxYExclusive: Int(maxYExclusive)
+                        )
+                    }
+                )) != nil else {
+                    clearLodProgress(surfaceOnly: true)
+                    return Set(request.targetChunkSampleStrides.keys)
+                }
+
+                return accumulator.unfinishedTargets()
+            }
+
+            let accumulator = StreamingLodMeshAccumulator(
+                desiredSampleStrideByChunk: request.targetChunkSampleStrides,
+                scheduleBuild: { [weak self] work in
+                    self?.meshQueue.async(execute: work)
+                },
+                build: { [weak self] chunkCoord, sourceChunksByKey, desiredSampleStride, minY, maxYExclusive in
+                    guard let self else {
+                        return nil
+                    }
+                    return self.buildDirectLodMeshResult(
+                        at: chunkCoord,
+                        desiredSampleStride: desiredSampleStride,
+                        retainedNeighborChunks: self.retainedNeighborChunks(for: chunkCoord),
+                        neighborDesiredSampleStrides: self.desiredNeighborSampleStrides(for: chunkCoord),
+                        sourceChunksByKey: sourceChunksByKey,
+                        minY: minY,
+                        maxYExclusive: maxYExclusive
+                    )
+                },
+                emit: { [weak self] chunkCoord, generatedLodMesh in
+                    self?.recordGeneratedLodMesh(
+                        generatedLodMesh,
+                        for: chunkCoord,
+                        generationSeconds: TerrainRenderer.currentTimeSeconds() - generationStart,
+                        totalTargetChunks: totalTargetChunks,
+                        epoch: epoch
+                    )
+                }
+            )
+
+            guard (try? worldGenerator.streamLOD(
+                from: request.origin,
+                radius: request.radius,
+                startingRadius: Int32(request.nearDistance),
+                radiusStep: Int32(request.stepDistance),
+                maxCellSizePower: request.maxCellSizePower,
+                threadCount: generationWorkerCount,
+                payloads: [.biome],
+                progressHandler: { [weak self] progress in
+                    self?.recordLodProgress(progress, surfaceOnly: false)
+                },
+                streamer: { chunk, minY, maxYExclusive in
+                    accumulator.accept(
+                        chunk: chunk,
+                        minY: Int(minY),
+                        maxYExclusive: Int(maxYExclusive)
+                    )
+                }
+            )) != nil else {
+                clearLodProgress(surfaceOnly: false)
+                return Set(request.targetChunkSampleStrides.keys)
+            }
+
+            return accumulator.unfinishedTargets()
+        }
+
+        private func makeSurfaceCompactChunk(
+            at chunkCoord: ChunkCoord,
+            in sourceChunksByKey: [TerrainLODChunkKey: TerrainSurfaceLODChunk],
+            minY: Int,
+            maxYExclusive: Int
+        ) -> CompactChunk? {
+            let relevantCells = relevantSurfaceCells(for: chunkCoord, in: sourceChunksByKey)
+            guard !relevantCells.isEmpty else {
+                return nil
+            }
+
+            let chunkMinX = chunkCoord.x * ProtoChunk.sideLength
+            let chunkMinZ = chunkCoord.z * ProtoChunk.sideLength
+            let chunkMaxXExclusive = chunkMinX + ProtoChunk.sideLength
+            let chunkMaxZExclusive = chunkMinZ + ProtoChunk.sideLength
+            let unknownBiome = CompactBiomeEntry(
+                name: "unknown",
+                packedColor: biomeColorPalette.packedRGBA8(forBiomeID: nil)
+            )
+            var biomePalette = [unknownBiome]
+            var paletteIndexByName = [unknownBiome.name: 0]
+            var surfaceHeights = [Int32](repeating: Int32.min, count: ProtoChunk.sideLength * ProtoChunk.sideLength)
+            var surfaceCellSizes = [UInt16](repeating: 0, count: ProtoChunk.sideLength * ProtoChunk.sideLength)
+            var surfaceCellOriginXs = [Int16](repeating: 0, count: ProtoChunk.sideLength * ProtoChunk.sideLength)
+            var surfaceCellOriginZs = [Int16](repeating: 0, count: ProtoChunk.sideLength * ProtoChunk.sideLength)
+            var surfaceBiomeIndices = [UInt8](repeating: 0, count: ProtoChunk.sideLength * ProtoChunk.sideLength)
+            var minimumCellSize = Int.max
+
+            for cell in relevantCells {
+                minimumCellSize = min(minimumCellSize, Int(cell.cellSize))
+                let localStartX = max(0, Int(cell.x) - chunkMinX)
+                let localStartZ = max(0, Int(cell.z) - chunkMinZ)
+                let localEndX = min(chunkMaxXExclusive - chunkMinX, Int(cell.x + cell.cellSize) - chunkMinX)
+                let localEndZ = min(chunkMaxZExclusive - chunkMinZ, Int(cell.z + cell.cellSize) - chunkMinZ)
+                guard localStartX < localEndX, localStartZ < localEndZ else {
+                    continue
+                }
+
+                let biomeName = cell.surfaceBiome?.name ?? "unknown"
+                let paletteIndex: Int
+                if let existing = paletteIndexByName[biomeName] {
+                    paletteIndex = existing
+                } else {
+                    paletteIndex = biomePalette.count
+                    precondition(paletteIndex < 256, "surface biome palette exceeded UInt8 capacity")
+                    paletteIndexByName[biomeName] = paletteIndex
+                    biomePalette.append(
+                        CompactBiomeEntry(
+                            name: biomeName,
+                            packedColor: biomeColorPalette.packedRGBA8(forBiomeID: biomeName)
+                        )
+                    )
+                }
+
+                for localZ in localStartZ..<localEndZ {
+                    for localX in localStartX..<localEndX {
+                        let index = localZ * ProtoChunk.sideLength + localX
+                        let newCellSize = UInt16(clamping: Int(cell.cellSize))
+                        let existingCellSize = surfaceCellSizes[index]
+                        let existingHasSurface = surfaceHeights[index] != Int32.min
+                        let newHasSurface = cell.surfaceY != nil
+                        let shouldReplace =
+                            existingCellSize == 0
+                            || (
+                                newHasSurface != existingHasSurface
+                                && newHasSurface
+                            )
+                            || (
+                                newHasSurface == existingHasSurface
+                                && (
+                                    newCellSize < existingCellSize
+                                    || (
+                                        newCellSize == existingCellSize
+                                        && !existingHasSurface
+                                        && newHasSurface
+                                    )
+                                )
+                            )
+                        guard shouldReplace else {
+                            continue
+                        }
+
+                        surfaceHeights[index] = cell.surfaceY ?? Int32.min
+                        surfaceCellSizes[index] = newCellSize
+                        surfaceCellOriginXs[index] = Int16(clamping: Int(cell.x) - chunkMinX)
+                        surfaceCellOriginZs[index] = Int16(clamping: Int(cell.z) - chunkMinZ)
+                        surfaceBiomeIndices[index] = UInt8(paletteIndex)
+                    }
+                }
             }
 
             return CompactChunk(
-                minY: Int(protoChunk.minY),
-                height: Int(protoChunk.height),
-                lods: lods
+                minY: minY,
+                height: maxYExclusive - minY,
+                sampleStride: minimumCellSize == Int.max ? 1 : minimumCellSize,
+                sections: nil,
+                firstSolidSection: nil,
+                lastSolidSection: nil,
+                surfaceHeights: surfaceHeights,
+                surfaceCellSizes: surfaceCellSizes,
+                surfaceCellOriginXs: surfaceCellOriginXs,
+                surfaceCellOriginZs: surfaceCellOriginZs,
+                surfaceBiomePalette: biomePalette,
+                surfaceBiomeIndices: surfaceBiomeIndices
             )
         }
 
         private func makeCompactChunkUsingSampleLOD(
             at chunkCoord: ChunkCoord,
             desiredSampleStride: Int,
-            request: LODSnapshotRequest?
+            in sourceChunksByKey: [TerrainLODChunkKey: TerrainLODChunk],
+            minY: Int,
+            maxYExclusive: Int
         ) -> CompactChunk? {
-            guard let request,
-                  let snapshot = lodSnapshot(for: request),
-                  !snapshot.result.chunks.isEmpty else {
-                return nil
-            }
-
-            let relevantColumns = relevantLodColumns(for: chunkCoord, in: snapshot.result)
+            let relevantColumns = relevantLodColumns(for: chunkCoord, in: sourceChunksByKey)
             guard !relevantColumns.isEmpty else {
                 return nil
             }
@@ -933,13 +1969,11 @@ final class TerrainRenderer {
             let chunkMinZ = chunkCoord.z * ProtoChunk.sideLength
             let baseSampleStride = relevantColumns.reduce(desiredSampleStride) { min($0, Int($1.cellSize)) }
             guard Self.supportedSampleStrides.contains(baseSampleStride),
-                  desiredSampleStride >= baseSampleStride,
                   ProtoChunk.sideLength % baseSampleStride == 0 else {
                 return nil
             }
 
-            let minY = Int(snapshot.result.minY)
-            let height = Int(snapshot.result.maxYExclusive - snapshot.result.minY)
+            let height = maxYExclusive - minY
             guard height > 0, height % ProtoChunk.sectionHeight == 0 else {
                 return nil
             }
@@ -969,36 +2003,60 @@ final class TerrainRenderer {
                 )
             }
 
+            let chunkMaxXExclusive = chunkMinX + ProtoChunk.sideLength
+            let chunkMaxZExclusive = chunkMinZ + ProtoChunk.sideLength
+            let heightInCells = height / baseSampleStride
+
+            @inline(__always)
+            func ceilDivPositive(_ value: Int, by divisor: Int) -> Int {
+                (value + divisor - 1) / divisor
+            }
+
             for column in relevantColumns {
-                let localX = Int(column.x) - chunkMinX
-                let localZ = Int(column.z) - chunkMinZ
-                let localCellX = max(0, min(cellSideLength - 1, localX / baseSampleStride))
-                let localCellZ = max(0, min(cellSideLength - 1, localZ / baseSampleStride))
                 let columnCellSize = max(baseSampleStride, Int(column.cellSize))
-                let span = max(1, columnCellSize / baseSampleStride)
+                let columnMinX = Int(column.x)
+                let columnMaxXExclusive = columnMinX + columnCellSize
+                let columnMinZ = Int(column.z)
+                let columnMaxZExclusive = columnMinZ + columnCellSize
+                let overlapStartX = max(chunkMinX, columnMinX)
+                let overlapEndX = min(chunkMaxXExclusive, columnMaxXExclusive)
+                let overlapStartZ = max(chunkMinZ, columnMinZ)
+                let overlapEndZ = min(chunkMaxZExclusive, columnMaxZExclusive)
+                guard overlapStartX < overlapEndX, overlapStartZ < overlapEndZ else {
+                    continue
+                }
+                let localStartCellX = max(0, min(cellSideLength, (overlapStartX - chunkMinX) / baseSampleStride))
+                let localEndCellX = max(localStartCellX, min(cellSideLength, ceilDivPositive(overlapEndX - chunkMinX, by: baseSampleStride)))
+                let localStartCellZ = max(0, min(cellSideLength, (overlapStartZ - chunkMinZ) / baseSampleStride))
+                let localEndCellZ = max(localStartCellZ, min(cellSideLength, ceilDivPositive(overlapEndZ - chunkMinZ, by: baseSampleStride)))
+                guard localStartCellX < localEndCellX, localStartCellZ < localEndCellZ else {
+                    continue
+                }
 
                 for (sampleIndex, isSolid) in column.samples.enumerated() {
                     guard isSolid else {
                         continue
                     }
 
-                    let sampleY = minY + sampleIndex * columnCellSize
-                    guard sampleY >= minY, sampleY < minY + height else {
+                    let sampleMinY = minY + sampleIndex * columnCellSize
+                    let sampleMaxYExclusive = sampleMinY + columnCellSize
+                    let overlapStartY = max(minY, sampleMinY)
+                    let overlapEndY = min(minY + height, sampleMaxYExclusive)
+                    guard overlapStartY < overlapEndY else {
                         continue
                     }
-                    let localCellY = max(0, min((height / baseSampleStride) - 1, (sampleY - minY) / baseSampleStride))
-                    let ySpan = max(1, columnCellSize / baseSampleStride)
+                    let localStartCellY = max(0, min(heightInCells, (overlapStartY - minY) / baseSampleStride))
+                    let localEndCellY = max(localStartCellY, min(heightInCells, ceilDivPositive(overlapEndY - minY, by: baseSampleStride)))
+                    guard localStartCellY < localEndCellY else {
+                        continue
+                    }
                     let biomeName = column.samplePayloads?[sampleIndex].biome?.name
                     let biomeEntry = CompactBiomeEntry(
                         name: biomeName ?? "unknown",
                         packedColor: biomeColorPalette.packedRGBA8(forBiomeID: biomeName)
                     )
 
-                    for dy in 0..<ySpan {
-                        let filledCellY = localCellY + dy
-                        guard filledCellY < height / baseSampleStride else {
-                            break
-                        }
+                    for filledCellY in localStartCellY..<localEndCellY {
                         let sectionIndex = filledCellY / (ProtoChunk.sectionHeight / baseSampleStride)
                         let localSectionCellY = filledCellY % (ProtoChunk.sectionHeight / baseSampleStride)
                         let paletteIndex: Int
@@ -1010,16 +2068,8 @@ final class TerrainRenderer {
                             sectionBuilders[sectionIndex].paletteIndexByName[biomeEntry.name] = paletteIndex
                             sectionBuilders[sectionIndex].biomePalette.append(biomeEntry)
                         }
-                        for dz in 0..<span {
-                            let filledCellZ = localCellZ + dz
-                            guard filledCellZ < cellSideLength else {
-                                break
-                            }
-                            for dx in 0..<span {
-                                let filledCellX = localCellX + dx
-                                guard filledCellX < cellSideLength else {
-                                    break
-                                }
+                        for filledCellZ in localStartCellZ..<localEndCellZ {
+                            for filledCellX in localStartCellX..<localEndCellX {
                                 let cellIndex = (localSectionCellY * cellSideLength + filledCellZ) * cellSideLength + filledCellX
                                 let wordIndex = cellIndex >> 6
                                 let bitIndex = cellIndex & 63
@@ -1037,152 +2087,69 @@ final class TerrainRenderer {
                     cellSideLength: cellSideLength,
                     bitmap: builder.bitmap,
                     biomePalette: builder.biomePalette,
-                    biomeIndices: builder.biomeIndices
+                    biomeIndices: builder.biomeIndices,
+                    hasAnySolid: builder.bitmap.contains(where: { $0 != 0 })
                 )
             }
-            let lods = Self.supportedSampleStrides
-                .filter { $0 >= baseSampleStride }
-                .map { sampleStride in
-                    CompactChunkLod(
-                        sampleStride: sampleStride,
-                        sections: sampleStride == baseSampleStride
-                            ? baseSections
-                            : makeLodSections(from: baseSections, sampleStride: sampleStride)
-                    )
+            return makeCompactChunk(
+                minY: minY,
+                height: height,
+                sampleStride: baseSampleStride,
+                sections: baseSections
+            )
+        }
+
+        private func makeCompactChunk(
+            minY: Int,
+            height: Int,
+            sampleStride: Int,
+            sections: [CompactSection]
+        ) -> CompactChunk {
+            var firstSolidSection: Int?
+            var lastSolidSection: Int?
+            for (index, section) in sections.enumerated() where section.hasAnySolid {
+                if firstSolidSection == nil {
+                    firstSolidSection = index
                 }
+                lastSolidSection = index
+            }
 
             return CompactChunk(
                 minY: minY,
                 height: height,
-                lods: lods
+                sampleStride: sampleStride,
+                sections: sections,
+                firstSolidSection: firstSolidSection,
+                lastSolidSection: lastSolidSection,
+                surfaceHeights: nil,
+                surfaceCellSizes: nil,
+                surfaceCellOriginXs: nil,
+                surfaceCellOriginZs: nil,
+                surfaceBiomePalette: nil,
+                surfaceBiomeIndices: nil
             )
         }
 
-        private func lodSnapshot(for request: LODSnapshotRequest) -> LODSnapshot? {
-            sampleLodLock.lock()
-            defer { sampleLodLock.unlock() }
-
-            if lodSnapshotKey == request.key, let lodSnapshot {
-                return lodSnapshot
-            }
-
-            guard let result = try? worldGenerator.sampleLOD(
-                from: request.origin,
-                radius: request.radius,
-                startingRadius: Int32(request.key.nearDistance),
-                radiusStep: Int32(request.key.stepDistance),
-                maxCellSizePower: request.maxCellSizePower,
-                threadCount: generationWorkerCount,
-                payloads: [.biome]
-            ) else {
-                return nil
-            }
-
-            cachedBaseLodCellSize = max(1, Int(result.baseCellSize))
-            let snapshot = LODSnapshot(result: result)
-            lodSnapshotKey = request.key
-            lodSnapshot = snapshot
-            return snapshot
-        }
-
-        private func relevantLodColumns(for chunkCoord: ChunkCoord, in result: TerrainLODResult) -> [TerrainLODColumn] {
-            let chunkMinX = chunkCoord.x * ProtoChunk.sideLength
-            let chunkMaxXExclusive = chunkMinX + ProtoChunk.sideLength
-            let chunkMinZ = chunkCoord.z * ProtoChunk.sideLength
-            let chunkMaxZExclusive = chunkMinZ + ProtoChunk.sideLength
-            var relevant: [TerrainLODColumn] = []
-
-            for sourceChunkZ in (chunkCoord.z - 1)...chunkCoord.z {
-                for sourceChunkX in (chunkCoord.x - 1)...chunkCoord.x {
-                    let key = TerrainLODChunkKey(x: Int32(sourceChunkX), z: Int32(sourceChunkZ))
-                    guard let chunkIndex = result.chunkIndex[key] else {
-                        continue
-                    }
-
-                    for column in result.chunks[chunkIndex].columns {
-                        let cellSize = max(1, Int(column.cellSize))
-                        let columnMaxXExclusive = Int(column.x) + cellSize
-                        let columnMaxZExclusive = Int(column.z) + cellSize
-                        guard Int(column.x) < chunkMaxXExclusive,
-                              columnMaxXExclusive > chunkMinX,
-                              Int(column.z) < chunkMaxZExclusive,
-                              columnMaxZExclusive > chunkMinZ else {
-                            continue
-                        }
-                        relevant.append(column)
-                    }
-                }
-            }
-
-            return relevant
-        }
-
-        private func makeLodSections(
-            from fullResolutionSections: [CompactSection],
-            sampleStride: Int
-        ) -> [CompactSection] {
-            precondition(sampleStride > 1 && sampleStride <= ProtoChunk.sideLength, "invalid sample stride \(sampleStride)")
-            let cellSideLength = ProtoChunk.sideLength / sampleStride
-            let cellCount = cellSideLength * cellSideLength * cellSideLength
-            let bitmapWordCount = (cellCount + 63) >> 6
-            let sampleOffset = sampleStride >> 1
-
-            return fullResolutionSections.map { sourceSection in
-                var bitmap = [UInt64](repeating: 0, count: bitmapWordCount)
-                var biomePalette: [CompactBiomeEntry] = []
-                biomePalette.reserveCapacity(8)
-                var paletteIndexByName: [String: Int] = [:]
-                var biomeIndices = [UInt8](repeating: 0, count: cellCount)
-
-                for cellIndex in 0..<cellCount {
-                    let cellX = cellIndex % cellSideLength
-                    let cellZ = (cellIndex / cellSideLength) % cellSideLength
-                    let cellY = cellIndex / (cellSideLength * cellSideLength)
-                    let sampleX = min(ProtoChunk.sideLength - 1, cellX * sampleStride + sampleOffset)
-                    let sampleY = min(ProtoChunk.sectionHeight - 1, cellY * sampleStride + sampleOffset)
-                    let sampleZ = min(ProtoChunk.sideLength - 1, cellZ * sampleStride + sampleOffset)
-
-                    if sourceSection.isSolid(atLocalX: sampleX, y: sampleY, z: sampleZ) {
-                        let wordIndex = cellIndex >> 6
-                        let bitIndex = cellIndex & 63
-                        bitmap[wordIndex] |= UInt64(1) << UInt64(bitIndex)
-                    }
-
-                    let biomeEntry = sourceSection.biomeEntry(atLocalX: sampleX, y: sampleY, z: sampleZ)
-                    let paletteIndex: Int
-                    if let existing = paletteIndexByName[biomeEntry.name] {
-                        paletteIndex = existing
-                    } else {
-                        paletteIndex = biomePalette.count
-                        precondition(paletteIndex < 256, "section biome palette exceeded UInt8 capacity")
-                        paletteIndexByName[biomeEntry.name] = paletteIndex
-                        biomePalette.append(biomeEntry)
-                    }
-                    biomeIndices[cellIndex] = UInt8(paletteIndex)
-                }
-
-                return CompactSection(
-                    sampleStride: sampleStride,
-                    cellSideLength: cellSideLength,
-                    bitmap: bitmap,
-                    biomePalette: biomePalette,
-                    biomeIndices: biomeIndices
-                )
-            }
-        }
-
         private func pruneChunksLockedIfNeeded() -> [ChunkCoord] {
+            if !pinnedChunkSquares.isEmpty {
+                var removed: [ChunkCoord] = []
+                for coord in availableSampleStrideByChunk.keys {
+                    if !isPinnedChunkLocked(coord) {
+                        removed.append(coord)
+                    }
+                }
+                return removed
+            }
             if let center = targetCenter {
                 return pruneChunksLocked(around: center)
             }
 
             var removed: [ChunkCoord] = []
-            chunks = chunks.filter { coord, _ in
-                let keep = pinnedChunks.contains(coord)
+            for coord in availableSampleStrideByChunk.keys {
+                let keep = isPinnedChunkLocked(coord)
                 if !keep {
                     removed.append(coord)
                 }
-                return keep
             }
             return removed
         }
@@ -1190,31 +2157,125 @@ final class TerrainRenderer {
         @discardableResult
         private func pruneChunksLocked(around center: ChunkCoord) -> [ChunkCoord] {
             var removed: [ChunkCoord] = []
-            chunks = chunks.filter { coord, _ in
+            for coord in availableSampleStrideByChunk.keys {
                 let keep = shouldKeepChunk(coord, around: center, extraMargin: 1)
                 if !keep {
                     removed.append(coord)
                 }
-                return keep
             }
             return removed
         }
 
         private func shouldKeepChunk(_ coord: ChunkCoord, around center: ChunkCoord, extraMargin: Int = 0) -> Bool {
-            if pinnedChunks.contains(coord) {
+            if isPinnedChunkLocked(coord) {
                 return true
             }
             return abs(coord.x - center.x) <= renderRadius + extraMargin && abs(coord.z - center.z) <= renderRadius + extraMargin
         }
 
-        private func targetChunksLocked() -> Set<ChunkCoord> {
-            var targets = pinnedChunks
+        private func shouldKeepChunkLocked(_ coord: ChunkCoord) -> Bool {
+            if !pinnedChunkSquares.isEmpty {
+                return isPinnedChunkLocked(coord)
+            }
             if let center = targetCenter {
-                for offset in orderedOffsets {
-                    targets.insert(ChunkCoord(x: center.x + offset.x, z: center.z + offset.z))
+                return shouldKeepChunk(coord, around: center)
+            }
+            return isPinnedChunkLocked(coord)
+        }
+
+        private func isTargetChunkLocked(_ coord: ChunkCoord) -> Bool {
+            if !pinnedChunkSquares.isEmpty {
+                return isPinnedChunkLocked(coord)
+            }
+            if let center = targetCenter,
+               abs(coord.x - center.x) <= renderRadius,
+               abs(coord.z - center.z) <= renderRadius {
+                return true
+            }
+            return isPinnedChunkLocked(coord)
+        }
+
+        private func isPinnedChunkLocked(_ coord: ChunkCoord) -> Bool {
+            pinnedChunkCoordSet.contains(coord)
+        }
+
+        private func firstPinnedChunkCoordLocked(where predicate: (ChunkCoord) -> Bool) -> ChunkCoord? {
+            var match: ChunkCoord?
+            _ = forEachPinnedChunkCoordLocked { coord in
+                if predicate(coord) {
+                    match = coord
+                    return false
+                }
+                return true
+            }
+            return match
+        }
+
+        private func highestPriorityPinnedChunkLocked(where predicate: (ChunkCoord) -> Bool) -> ChunkCoord? {
+            var best: ChunkCoord?
+            _ = forEachPinnedChunkCoordLocked { coord in
+                guard predicate(coord) else {
+                    return true
+                }
+                if let currentBest = best {
+                    if isHigherPriorityChunk(coord, than: currentBest) {
+                        best = coord
+                    }
+                } else {
+                    best = coord
+                }
+                return true
+            }
+            return best
+        }
+
+        private func lowestPriorityPinnedChunkLocked(where predicate: (ChunkCoord) -> Bool) -> ChunkCoord? {
+            var worst: ChunkCoord?
+            _ = forEachPinnedChunkCoordLocked { coord in
+                guard predicate(coord) else {
+                    return true
+                }
+                if let currentWorst = worst {
+                    if isHigherPriorityChunk(currentWorst, than: coord) {
+                        worst = coord
+                    }
+                } else {
+                    worst = coord
+                }
+                return true
+            }
+            return worst
+        }
+
+        @discardableResult
+        private func forEachPinnedChunkCoordLocked(_ body: (ChunkCoord) -> Bool) -> Bool {
+            for coord in pinnedChunkCoords {
+                if !body(coord) {
+                    return false
                 }
             }
-            return targets
+            return true
+        }
+
+        private func pinnedChunkCountLocked() -> Int {
+            pinnedChunkCoords.count
+        }
+
+        private func targetChunkCountLocked() -> Int {
+            if !pinnedChunkSquares.isEmpty {
+                return pinnedChunkCountLocked()
+            }
+            var count = targetCenter == nil ? 0 : orderedOffsets.count
+            forEachPinnedChunkCoordLocked { coord in
+                if let center = targetCenter,
+                   abs(coord.x - center.x) <= renderRadius,
+                   abs(coord.z - center.z) <= renderRadius {
+                    return true
+                }
+                count += 1
+                return true
+            }
+            return count
         }
 
         private func isHigherPriorityChunk(_ lhs: ChunkCoord, than rhs: ChunkCoord) -> Bool {
@@ -1238,6 +2299,9 @@ final class TerrainRenderer {
         }
 
         private func markChunkRemovedLocked(_ coord: ChunkCoord) {
+            chunks.removeValue(forKey: coord)
+            availableSampleStrideByChunk.removeValue(forKey: coord)
+            staleChunksNeedingRegeneration.remove(coord)
             dirtyMeshChunks.remove(coord)
             inFlightMeshChunks.remove(coord)
             chunkMeshRevision[coord, default: 0] += 1
@@ -1247,6 +2311,10 @@ final class TerrainRenderer {
             for neighbor in adjacentChunkCoords(to: coord) where chunks[neighbor] != nil {
                 markChunkDirtyLocked(neighbor)
             }
+        }
+
+        private func availableChunkCountLocked() -> Int {
+            availableSampleStrideByChunk.count
         }
 
         private func adjacentChunkCoords(to coord: ChunkCoord) -> [ChunkCoord] {
@@ -1313,7 +2381,7 @@ final class TerrainRenderer {
             let previousBaseLodCellSize = baseLodCellSizeLocked()
             let nextBaseLodCellSize = previousBaseLodCellSize
 
-            for coord in chunks.keys {
+            for coord in availableSampleStrideByChunk.keys {
                 let previousStride = previousCenter.map {
                     sampleStride(for: coord, relativeTo: $0, settings: previousSettings, baseLodCellSize: previousBaseLodCellSize)
                 } ?? 1
@@ -1331,7 +2399,11 @@ final class TerrainRenderer {
             }
 
             for coord in impactedChunks {
-                markChunkDirtyLocked(coord)
+                if chunks[coord] != nil {
+                    markChunkDirtyLocked(coord)
+                } else {
+                    staleChunksNeedingRegeneration.insert(coord)
+                }
             }
             return impactedChunks
         }
@@ -1341,8 +2413,8 @@ final class TerrainRenderer {
                 return cachedBaseLodCellSize
             }
 
-            sampleLodLock.lock()
-            defer { sampleLodLock.unlock() }
+            baseLodCellSizeLock.lock()
+            defer { baseLodCellSizeLock.unlock() }
             if let cachedBaseLodCellSize {
                 return cachedBaseLodCellSize
             }
@@ -1376,8 +2448,67 @@ final class TerrainRenderer {
         }
 
         private func invalidateLodSnapshotLocked() {
-            lodSnapshotKey = nil
-            lodSnapshot = nil
+            lodProgress = nil
+            surfaceLodProgress = nil
+        }
+
+        private func rebuildPinnedChunkCacheLocked() {
+            guard !pinnedChunkSquares.isEmpty else {
+                pinnedChunkCoords.removeAll(keepingCapacity: false)
+                pinnedChunkCoordSet.removeAll(keepingCapacity: false)
+                return
+            }
+
+            var coords: [ChunkCoord] = []
+            coords.reserveCapacity(TerrainRenderer.countChunkCoords(in: pinnedChunkSquares))
+            TerrainRenderer.forEachChunkCoord(in: pinnedChunkSquares) { coord in
+                coords.append(coord)
+                return true
+            }
+            pinnedChunkCoords = coords
+            pinnedChunkCoordSet = Set(coords)
+        }
+
+        private func startGenerationWorkers(_ count: Int, epoch: Int) {
+            guard count > 0 else {
+                return
+            }
+            for _ in 0..<count {
+                generationQueue.async { [self] in
+                    generationWorkerLoop(epoch: epoch)
+                }
+            }
+        }
+
+        private func startMeshWorkers(_ count: Int, epoch: Int) {
+            guard count > 0 else {
+                return
+            }
+            for _ in 0..<count {
+                meshQueue.async { [self] in
+                    meshWorkerLoop(epoch: epoch)
+                }
+            }
+        }
+
+        private func recordLodProgress(_ progress: TerrainLODProgress, surfaceOnly: Bool) {
+            lock.lock()
+            if surfaceOnly {
+                surfaceLodProgress = progress
+            } else {
+                lodProgress = progress
+            }
+            lock.unlock()
+        }
+
+        private func clearLodProgress(surfaceOnly: Bool) {
+            lock.lock()
+            if surfaceOnly {
+                surfaceLodProgress = nil
+            } else {
+                lodProgress = nil
+            }
+            lock.unlock()
         }
 
         static func normalizedSampleStride(_ requestedStride: Int) -> Int {
@@ -1392,26 +2523,33 @@ final class TerrainRenderer {
         private func buildGreedyMesh(
             coord: ChunkCoord,
             chunk: CompactChunk,
-            neighbors: [ChunkCoord: CompactChunk],
-            sampleStrideByChunk: [ChunkCoord: Int]
+            neighbors: [ChunkCoord: CompactChunk]
         ) -> (origin: SIMD3<Int>, vertices: [VulkanEngine.Vertex3D]) {
-            let chunkSampleStride = sampleStrideByChunk[coord] ?? 1
-            var firstSolidSection = Int.max
-            var lastSolidSection = Int.min
-            for sectionIndex in 0..<chunk.sectionCount {
-                guard let section = chunk.section(at: sectionIndex, sampleStride: chunkSampleStride),
-                      section.hasAnySolid else {
-                    continue
-                }
-                firstSolidSection = min(firstSolidSection, sectionIndex)
-                lastSolidSection = max(lastSolidSection, sectionIndex)
+            if chunk.isSurfaceOnly {
+                return buildSurfaceMesh(
+                    coord: coord,
+                    chunk: chunk,
+                    neighbors: neighbors
+                )
             }
+            return buildVolumeGreedyMesh(
+                coord: coord,
+                chunk: chunk,
+                neighbors: neighbors
+            )
+        }
 
+        private func buildVolumeGreedyMesh(
+            coord: ChunkCoord,
+            chunk: CompactChunk,
+            neighbors: [ChunkCoord: CompactChunk]
+        ) -> (origin: SIMD3<Int>, vertices: [VulkanEngine.Vertex3D]) {
             let emptyOrigin = SIMD3<Int>(coord.x * 16, chunk.minY, coord.z * 16)
             let originX = coord.x * 16
             let originZ = coord.z * 16
 
-            guard firstSolidSection != Int.max, lastSolidSection != Int.min else {
+            guard let firstSolidSection = chunk.firstSolidSection,
+                  let lastSolidSection = chunk.lastSolidSection else {
                 return (emptyOrigin, [])
             }
 
@@ -1433,8 +2571,7 @@ final class TerrainRenderer {
                 return chunk.biomeEntry(
                     atLocalX: x,
                     y: absoluteLocalY,
-                    z: z,
-                    sampleStride: chunkSampleStride
+                    z: z
                 )?.packedColor
                     ?? biomeColorPalette.packedRGBA8(forBiomeID: nil)
             }
@@ -1448,7 +2585,6 @@ final class TerrainRenderer {
                 guard let queryChunk = neighbors[queryCoord] else {
                     return false
                 }
-                let querySampleStride = sampleStrideByChunk[queryCoord] ?? 1
                 let localX = floorMod(worldX, 16)
                 let localZ = floorMod(worldZ, 16)
                 let localY = worldY - queryChunk.minY
@@ -1458,8 +2594,7 @@ final class TerrainRenderer {
                 return queryChunk.isSolid(
                     atLocalX: localX,
                     y: localY,
-                    z: localZ,
-                    sampleStride: querySampleStride
+                    z: localZ
                 )
             }
 
@@ -1613,6 +2748,414 @@ final class TerrainRenderer {
             return (origin, vertices)
         }
 
+        private func buildSurfaceMesh(
+            coord: ChunkCoord,
+            chunk: CompactChunk,
+            neighbors: [ChunkCoord: CompactChunk]
+        ) -> (origin: SIMD3<Int>, vertices: [VulkanEngine.Vertex3D]) {
+            let origin = SIMD3<Int>(coord.x * 16, chunk.minY, coord.z * 16)
+            guard chunk.surfaceHeights != nil else {
+                return (origin, [])
+            }
+
+            var vertices: [VulkanEngine.Vertex3D] = []
+            vertices.reserveCapacity(2_304)
+
+            @inline(__always)
+            func localSurfaceHeight(_ x: Int, _ z: Int) -> Int32? {
+                chunk.surfaceHeight(atLocalX: x, z: z)
+            }
+
+            @inline(__always)
+            func localSurfaceCellSize(_ x: Int, _ z: Int) -> Int {
+                chunk.surfaceCellSize(atLocalX: x, z: z) ?? 1
+            }
+
+            @inline(__always)
+            func localSurfaceCellOriginX(_ x: Int, _ z: Int) -> Int {
+                chunk.surfaceCellOriginX(atLocalX: x, z: z) ?? x
+            }
+
+            @inline(__always)
+            func localSurfaceCellOriginZ(_ x: Int, _ z: Int) -> Int {
+                chunk.surfaceCellOriginZ(atLocalX: x, z: z) ?? z
+            }
+
+            @inline(__always)
+            func packedBiomeColor(_ x: Int, _ z: Int) -> UInt32 {
+                chunk.biomeEntry(atLocalX: x, y: 0, z: z)?.packedColor
+                    ?? biomeColorPalette.packedRGBA8(forBiomeID: nil)
+            }
+
+            @inline(__always)
+            func worldSurfaceHeight(_ worldX: Int, _ worldZ: Int) -> Int32? {
+                let queryCoord = ChunkCoord(
+                    x: floorDiv(worldX, 16),
+                    z: floorDiv(worldZ, 16)
+                )
+                guard let queryChunk = neighbors[queryCoord] else {
+                    return nil
+                }
+                let localX = floorMod(worldX, 16)
+                let localZ = floorMod(worldZ, 16)
+                return queryChunk.surfaceHeight(atLocalX: localX, z: localZ)
+            }
+
+            @inline(__always)
+            func worldSurfaceCellSize(_ worldX: Int, _ worldZ: Int) -> Int {
+                let queryCoord = ChunkCoord(
+                    x: floorDiv(worldX, 16),
+                    z: floorDiv(worldZ, 16)
+                )
+                guard let queryChunk = neighbors[queryCoord] else {
+                    return max(1, chunk.sampleStride)
+                }
+                let localX = floorMod(worldX, 16)
+                let localZ = floorMod(worldZ, 16)
+                return queryChunk.surfaceCellSize(atLocalX: localX, z: localZ) ?? max(1, queryChunk.sampleStride)
+            }
+
+            @inline(__always)
+            func localTopY(_ surfaceY: Int32) -> Float {
+                Float(surfaceY + 1 - Int32(chunk.minY))
+            }
+
+            let currentChunkWorldMinX = coord.x * ProtoChunk.sideLength
+            let currentChunkWorldMinZ = coord.z * ProtoChunk.sideLength
+            let nilNeighborDropY = Float(max(16, chunk.sampleStride * 4))
+
+            @inline(__always)
+            func sideBottomY(topY: Float, neighborSurfaceY: Int32?) -> Float {
+                if let neighborSurfaceY {
+                    return localTopY(neighborSurfaceY)
+                }
+                return max(0, topY - nilNeighborDropY)
+            }
+
+            @inline(__always)
+            func shouldRenderVerticalFace(
+                surfaceY: Int32,
+                localCellSize: Int,
+                neighborSurfaceY: Int32?,
+                neighborCellSize: Int
+            ) -> Bool {
+                guard let neighborSurfaceY else {
+                    return true
+                }
+                let drop = Int(surfaceY - neighborSurfaceY)
+                guard drop > 0 else {
+                    return false
+                }
+                if localCellSize == 1 && neighborCellSize == 1 {
+                    return true
+                }
+                return drop >= (localCellSize + neighborCellSize)
+            }
+
+            @inline(__always)
+            func appendTopRect(localX: Int, localZ: Int, width: Int, height: Int, surfaceY: Int32, packedColor: UInt32) {
+                let topY = localTopY(surfaceY)
+                appendQuad(
+                    &vertices,
+                    a: SIMD3<Float>(Float(localX), topY, Float(localZ)),
+                    b: SIMD3<Float>(Float(localX), topY, Float(localZ + height)),
+                    c: SIMD3<Float>(Float(localX + width), topY, Float(localZ + height)),
+                    d: SIMD3<Float>(Float(localX + width), topY, Float(localZ)),
+                    color: shadedBiomeColor(
+                        packedBaseColor: packedColor,
+                        axis: 1,
+                        positiveFace: true
+                    )
+                )
+            }
+
+            @inline(__always)
+            func appendWestFace(localX: Int, startZ: Int, endZ: Int, topY: Float, bottomY: Float, packedColor: UInt32) {
+                appendQuad(
+                    &vertices,
+                    a: SIMD3<Float>(Float(localX), topY, Float(startZ)),
+                    b: SIMD3<Float>(Float(localX), bottomY, Float(startZ)),
+                    c: SIMD3<Float>(Float(localX), bottomY, Float(endZ)),
+                    d: SIMD3<Float>(Float(localX), topY, Float(endZ)),
+                    color: shadedBiomeColor(packedBaseColor: packedColor, axis: 0, positiveFace: false)
+                )
+            }
+
+            @inline(__always)
+            func appendEastFace(localX: Int, startZ: Int, endZ: Int, topY: Float, bottomY: Float, packedColor: UInt32) {
+                appendQuad(
+                    &vertices,
+                    a: SIMD3<Float>(Float(localX), topY, Float(endZ)),
+                    b: SIMD3<Float>(Float(localX), bottomY, Float(endZ)),
+                    c: SIMD3<Float>(Float(localX), bottomY, Float(startZ)),
+                    d: SIMD3<Float>(Float(localX), topY, Float(startZ)),
+                    color: shadedBiomeColor(packedBaseColor: packedColor, axis: 0, positiveFace: true)
+                )
+            }
+
+            @inline(__always)
+            func appendNorthFace(localZ: Int, startX: Int, endX: Int, topY: Float, bottomY: Float, packedColor: UInt32) {
+                appendQuad(
+                    &vertices,
+                    a: SIMD3<Float>(Float(endX), topY, Float(localZ)),
+                    b: SIMD3<Float>(Float(endX), bottomY, Float(localZ)),
+                    c: SIMD3<Float>(Float(startX), bottomY, Float(localZ)),
+                    d: SIMD3<Float>(Float(startX), topY, Float(localZ)),
+                    color: shadedBiomeColor(packedBaseColor: packedColor, axis: 2, positiveFace: false)
+                )
+            }
+
+            @inline(__always)
+            func appendSouthFace(localZ: Int, startX: Int, endX: Int, topY: Float, bottomY: Float, packedColor: UInt32) {
+                appendQuad(
+                    &vertices,
+                    a: SIMD3<Float>(Float(startX), topY, Float(localZ)),
+                    b: SIMD3<Float>(Float(startX), bottomY, Float(localZ)),
+                    c: SIMD3<Float>(Float(endX), bottomY, Float(localZ)),
+                    d: SIMD3<Float>(Float(endX), topY, Float(localZ)),
+                    color: shadedBiomeColor(packedBaseColor: packedColor, axis: 2, positiveFace: true)
+                )
+            }
+
+            for localZ in 0..<ProtoChunk.sideLength {
+                for localX in 0..<ProtoChunk.sideLength {
+                    guard let surfaceY = localSurfaceHeight(localX, localZ) else {
+                        continue
+                    }
+
+                    let cellSize = localSurfaceCellSize(localX, localZ)
+                    let cellOriginX = localSurfaceCellOriginX(localX, localZ)
+                    let cellOriginZ = localSurfaceCellOriginZ(localX, localZ)
+                    let localStartX = max(0, cellOriginX)
+                    let localStartZ = max(0, cellOriginZ)
+                    guard localX == localStartX, localZ == localStartZ else {
+                        continue
+                    }
+
+                    let localEndX = min(ProtoChunk.sideLength, cellOriginX + cellSize)
+                    let localEndZ = min(ProtoChunk.sideLength, cellOriginZ + cellSize)
+                    guard localStartX < localEndX, localStartZ < localEndZ else {
+                        continue
+                    }
+
+                    let packedColor = packedBiomeColor(localX, localZ)
+                    let topY = localTopY(surfaceY)
+                    appendTopRect(
+                        localX: localStartX,
+                        localZ: localStartZ,
+                        width: localEndX - localStartX,
+                        height: localEndZ - localStartZ,
+                        surfaceY: surfaceY,
+                        packedColor: packedColor
+                    )
+
+                    let worldStartX = currentChunkWorldMinX + localStartX
+                    let worldStartZ = currentChunkWorldMinZ + localStartZ
+                    let worldEndX = currentChunkWorldMinX + localEndX
+                    let worldEndZ = currentChunkWorldMinZ + localEndZ
+
+                    var runStartZ: Int? = nil
+                    var runBottomY: Float = 0
+                    for edgeWorldZ in worldStartZ..<worldEndZ {
+                        let neighborSurfaceY = worldSurfaceHeight(worldStartX - 1, edgeWorldZ)
+                        let neighborCellSize = worldSurfaceCellSize(worldStartX - 1, edgeWorldZ)
+                        if shouldRenderVerticalFace(
+                            surfaceY: surfaceY,
+                            localCellSize: cellSize,
+                            neighborSurfaceY: neighborSurfaceY,
+                            neighborCellSize: neighborCellSize
+                        ) {
+                            let bottomY = sideBottomY(topY: topY, neighborSurfaceY: neighborSurfaceY)
+                            if runStartZ == nil {
+                                runStartZ = edgeWorldZ
+                                runBottomY = bottomY
+                            } else if bottomY != runBottomY {
+                                appendWestFace(
+                                    localX: localStartX,
+                                    startZ: runStartZ! - currentChunkWorldMinZ,
+                                    endZ: edgeWorldZ - currentChunkWorldMinZ,
+                                    topY: topY,
+                                    bottomY: runBottomY,
+                                    packedColor: packedColor
+                                )
+                                runStartZ = edgeWorldZ
+                                runBottomY = bottomY
+                            }
+                        } else if let currentRunStartZ = runStartZ {
+                            appendWestFace(
+                                localX: localStartX,
+                                startZ: currentRunStartZ - currentChunkWorldMinZ,
+                                endZ: edgeWorldZ - currentChunkWorldMinZ,
+                                topY: topY,
+                                bottomY: runBottomY,
+                                packedColor: packedColor
+                            )
+                            runStartZ = nil
+                        }
+                    }
+                    if let currentRunStartZ = runStartZ {
+                        appendWestFace(
+                            localX: localStartX,
+                            startZ: currentRunStartZ - currentChunkWorldMinZ,
+                            endZ: worldEndZ - currentChunkWorldMinZ,
+                            topY: topY,
+                            bottomY: runBottomY,
+                            packedColor: packedColor
+                        )
+                    }
+
+                    runStartZ = nil
+                    for edgeWorldZ in worldStartZ..<worldEndZ {
+                        let neighborSurfaceY = worldSurfaceHeight(worldEndX, edgeWorldZ)
+                        let neighborCellSize = worldSurfaceCellSize(worldEndX, edgeWorldZ)
+                        if shouldRenderVerticalFace(
+                            surfaceY: surfaceY,
+                            localCellSize: cellSize,
+                            neighborSurfaceY: neighborSurfaceY,
+                            neighborCellSize: neighborCellSize
+                        ) {
+                            let bottomY = sideBottomY(topY: topY, neighborSurfaceY: neighborSurfaceY)
+                            if runStartZ == nil {
+                                runStartZ = edgeWorldZ
+                                runBottomY = bottomY
+                            } else if bottomY != runBottomY {
+                                appendEastFace(
+                                    localX: localEndX,
+                                    startZ: runStartZ! - currentChunkWorldMinZ,
+                                    endZ: edgeWorldZ - currentChunkWorldMinZ,
+                                    topY: topY,
+                                    bottomY: runBottomY,
+                                    packedColor: packedColor
+                                )
+                                runStartZ = edgeWorldZ
+                                runBottomY = bottomY
+                            }
+                        } else if let currentRunStartZ = runStartZ {
+                            appendEastFace(
+                                localX: localEndX,
+                                startZ: currentRunStartZ - currentChunkWorldMinZ,
+                                endZ: edgeWorldZ - currentChunkWorldMinZ,
+                                topY: topY,
+                                bottomY: runBottomY,
+                                packedColor: packedColor
+                            )
+                            runStartZ = nil
+                        }
+                    }
+                    if let currentRunStartZ = runStartZ {
+                        appendEastFace(
+                            localX: localEndX,
+                            startZ: currentRunStartZ - currentChunkWorldMinZ,
+                            endZ: worldEndZ - currentChunkWorldMinZ,
+                            topY: topY,
+                            bottomY: runBottomY,
+                            packedColor: packedColor
+                        )
+                    }
+
+                    var runStartX: Int? = nil
+                    for edgeWorldX in worldStartX..<worldEndX {
+                        let neighborSurfaceY = worldSurfaceHeight(edgeWorldX, worldStartZ - 1)
+                        let neighborCellSize = worldSurfaceCellSize(edgeWorldX, worldStartZ - 1)
+                        if shouldRenderVerticalFace(
+                            surfaceY: surfaceY,
+                            localCellSize: cellSize,
+                            neighborSurfaceY: neighborSurfaceY,
+                            neighborCellSize: neighborCellSize
+                        ) {
+                            let bottomY = sideBottomY(topY: topY, neighborSurfaceY: neighborSurfaceY)
+                            if runStartX == nil {
+                                runStartX = edgeWorldX
+                                runBottomY = bottomY
+                            } else if bottomY != runBottomY {
+                                appendNorthFace(
+                                    localZ: localStartZ,
+                                    startX: runStartX! - currentChunkWorldMinX,
+                                    endX: edgeWorldX - currentChunkWorldMinX,
+                                    topY: topY,
+                                    bottomY: runBottomY,
+                                    packedColor: packedColor
+                                )
+                                runStartX = edgeWorldX
+                                runBottomY = bottomY
+                            }
+                        } else if let currentRunStartX = runStartX {
+                            appendNorthFace(
+                                localZ: localStartZ,
+                                startX: currentRunStartX - currentChunkWorldMinX,
+                                endX: edgeWorldX - currentChunkWorldMinX,
+                                topY: topY,
+                                bottomY: runBottomY,
+                                packedColor: packedColor
+                            )
+                            runStartX = nil
+                        }
+                    }
+                    if let currentRunStartX = runStartX {
+                        appendNorthFace(
+                            localZ: localStartZ,
+                            startX: currentRunStartX - currentChunkWorldMinX,
+                            endX: worldEndX - currentChunkWorldMinX,
+                            topY: topY,
+                            bottomY: runBottomY,
+                            packedColor: packedColor
+                        )
+                    }
+
+                    runStartX = nil
+                    for edgeWorldX in worldStartX..<worldEndX {
+                        let neighborSurfaceY = worldSurfaceHeight(edgeWorldX, worldEndZ)
+                        let neighborCellSize = worldSurfaceCellSize(edgeWorldX, worldEndZ)
+                        if shouldRenderVerticalFace(
+                            surfaceY: surfaceY,
+                            localCellSize: cellSize,
+                            neighborSurfaceY: neighborSurfaceY,
+                            neighborCellSize: neighborCellSize
+                        ) {
+                            let bottomY = sideBottomY(topY: topY, neighborSurfaceY: neighborSurfaceY)
+                            if runStartX == nil {
+                                runStartX = edgeWorldX
+                                runBottomY = bottomY
+                            } else if bottomY != runBottomY {
+                                appendSouthFace(
+                                    localZ: localEndZ,
+                                    startX: runStartX! - currentChunkWorldMinX,
+                                    endX: edgeWorldX - currentChunkWorldMinX,
+                                    topY: topY,
+                                    bottomY: runBottomY,
+                                    packedColor: packedColor
+                                )
+                                runStartX = edgeWorldX
+                                runBottomY = bottomY
+                            }
+                        } else if let currentRunStartX = runStartX {
+                            appendSouthFace(
+                                localZ: localEndZ,
+                                startX: currentRunStartX - currentChunkWorldMinX,
+                                endX: edgeWorldX - currentChunkWorldMinX,
+                                topY: topY,
+                                bottomY: runBottomY,
+                                packedColor: packedColor
+                            )
+                            runStartX = nil
+                        }
+                    }
+                    if let currentRunStartX = runStartX {
+                        appendSouthFace(
+                            localZ: localEndZ,
+                            startX: currentRunStartX - currentChunkWorldMinX,
+                            endX: worldEndX - currentChunkWorldMinX,
+                            topY: topY,
+                            bottomY: runBottomY,
+                            packedColor: packedColor
+                        )
+                    }
+                }
+            }
+
+            return (origin, vertices)
+        }
+
         private func appendQuad(
             _ vertices: inout [VulkanEngine.Vertex3D],
             a: SIMD3<Float>,
@@ -1688,6 +3231,7 @@ final class TerrainRenderer {
     let fastMoveMultiplier: Float
     let zoomMultiplier: Float
     let mouseSensitivity: Float
+    let surfaceOnly: Bool
     private let profilingEnabled = ProcessInfo.processInfo.environment["MINESCENE_PROFILE"] == "1"
     let streamer: Streamer
     let hudShadowColor = SIMD4<Float>(0.08, 0.10, 0.16, 1.0)
@@ -1744,6 +3288,7 @@ final class TerrainRenderer {
     var keyframePlaybackSpeed: Double = 8.0
     var showsKeyframes = true
     var isRenderingForExport = false
+    var suspendStreamingUpdates = false
 
     var keyW = false
     var keyA = false
@@ -1764,6 +3309,7 @@ final class TerrainRenderer {
     var activeCommandLogHistoryIndex: Int?
     var cachedCinematicPath: CinematicPath?
     var cinematicPlaybackSession: CinematicPlaybackSession?
+    var programScenePreparationStatus: ProgramScenePreparationStatus?
 
     init(
         worldGenerator: WorldGenerator,
@@ -1772,6 +3318,7 @@ final class TerrainRenderer {
         terrainLodNearDistance: Int = 128,
         terrainLodStepDistance: Int = 128,
         terrainLodMaxScale: Int = 8,
+        surfaceOnly: Bool = false,
         moveSpeed: Float = 32.0,
         fastMoveMultiplier: Float = 4.0,
         zoomMultiplier: Float = 4.0,
@@ -1782,6 +3329,7 @@ final class TerrainRenderer {
         self.fastMoveMultiplier = fastMoveMultiplier
         self.zoomMultiplier = max(1, zoomMultiplier)
         self.mouseSensitivity = mouseSensitivity
+        self.surfaceOnly = surfaceOnly
         self.streamer = Streamer(
             worldGenerator: worldGenerator,
             renderRadius: renderRadius,
@@ -1792,8 +3340,13 @@ final class TerrainRenderer {
                 nearDistance: max(0, terrainLodNearDistance),
                 stepDistance: max(1, terrainLodStepDistance),
                 maxSampleStride: Streamer.normalizedSampleStride(terrainLodMaxScale)
-            )
+            ),
+            surfaceOnly: surfaceOnly
         )
+    }
+
+    deinit {
+        streamer.shutdown()
     }
 
     func render(
@@ -1855,20 +3408,22 @@ final class TerrainRenderer {
         }
         let renderFinished = renderFinishedByImage[Int(imageIndex)]
 
-        var batches: [VulkanEngine.DrawBatch3D] = chunkMeshes.keys.sorted { lhs, rhs in
-            if lhs.z != rhs.z { return lhs.z < rhs.z }
-            return lhs.x < rhs.x
-        }.compactMap { coord in
-            guard let mesh = chunkMeshes[coord], mesh.vertexCount > 0 else {
-                return nil
-            }
+        var batches: [VulkanEngine.DrawBatch3D] = []
+        batches.reserveCapacity(chunkMeshes.count + (keyframeOverlayVertexCount > 0 ? 1 : 0))
+        for mesh in chunkMeshes.values where mesh.vertexCount > 0 {
             let modelOffset = SIMD4<Float>(
                 Float(Double(mesh.origin.x) - cameraPosition.x),
                 Float(Double(mesh.origin.y) - cameraPosition.y),
                 Float(Double(mesh.origin.z) - cameraPosition.z),
                 0
             )
-            return .init(buffer: mesh.buffer, vertexCount: mesh.vertexCount, modelOffset: modelOffset)
+            batches.append(
+                .init(
+                    buffer: mesh.buffer,
+                    vertexCount: mesh.vertexCount,
+                    modelOffset: modelOffset
+                )
+            )
         }
         if let keyframeOverlayBuffer, keyframeOverlayVertexCount > 0 {
             batches.append(
@@ -1988,6 +3543,38 @@ final class TerrainRenderer {
 
     func discardChunkMeshes() {
         chunkMeshes.removeAll()
+    }
+
+    func takeChunkMeshes() -> [ChunkCoord: ChunkRenderMesh] {
+        let meshes = chunkMeshes
+        chunkMeshes = [:]
+        return meshes
+    }
+
+    func replaceChunkMeshes(with meshes: [ChunkCoord: ChunkRenderMesh]) {
+        chunkMeshes = meshes
+    }
+
+    func discardChunkStateKeepingMeshes() {
+        streamer.discardChunkStateKeepingMeshes()
+    }
+
+    func primeStreamingTargetToCurrentCamera() {
+        let cameraBlock = SIMD3<Int>(
+            Int(floor(cameraPosition.x)),
+            Int(floor(cameraPosition.y)),
+            Int(floor(cameraPosition.z))
+        )
+        let cameraChunk = ChunkCoord(
+            x: floorDiv(cameraBlock.x, 16),
+            z: floorDiv(cameraBlock.z, 16)
+        )
+        streamer.primeTarget(center: cameraChunk, cameraBlock: cameraBlock)
+    }
+
+    func shutdownStreaming() {
+        suspendStreamingUpdates = true
+        streamer.shutdown()
     }
 
     func requestChunkMeshRebuild() {

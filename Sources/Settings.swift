@@ -117,6 +117,31 @@ struct IntSettingValue: SettingValueType {
     }
 }
 
+struct BoolSettingValue: SettingValueType {
+    static let typeDescription = "boolean"
+
+    let value: Bool
+
+    static func decode(from string: String) throws -> Self {
+        switch string.lowercased() {
+        case "true", "1", "yes", "on":
+            return BoolSettingValue(value: true)
+        case "false", "0", "no", "off":
+            return BoolSettingValue(value: false)
+        default:
+            throw SettingError.invalidValue(setting: "<unknown>", value: string, reason: "expected boolean")
+        }
+    }
+
+    var encodedString: String {
+        value ? "true" : "false"
+    }
+
+    var displayString: String {
+        encodedString
+    }
+}
+
 struct KeybindSettingValue: SettingValueType {
     static let typeDescription = "key"
 

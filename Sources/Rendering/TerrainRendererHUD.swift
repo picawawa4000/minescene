@@ -206,19 +206,62 @@ extension TerrainRenderer {
     private func currentDebugHudLines() -> [String] {
         let status = streamer.debugStatus()
         var lines: [String] = []
+        if let programPreparationStatus = programScenePreparationStatus {
+            lines.append(contentsOf: preparationStatusLines(
+                prefix: "SCENE \(programPreparationStatus.sceneIndex)",
+                status: programPreparationStatus.preparation
+            ))
+        }
         if let preparationStatus = currentCinematicPreparationStatus {
-            lines.append(
-                "CINEMATIC: \(preparationStatus.readyChunks)/\(preparationStatus.totalChunks) READY"
-            )
-            lines.append(
-                "PREP: GEN \(preparationStatus.generatingChunks) MESH \(preparationStatus.meshingChunks)"
-            )
+            lines.append(contentsOf: preparationStatusLines(
+                prefix: "CINEMATIC",
+                status: preparationStatus
+            ))
+        }
+        if let lodCompletedChunks = status.lodCompletedChunks,
+           let lodTotalChunks = status.lodTotalChunks {
+            if let lodCompletedSamples = status.lodCompletedSamples,
+               let lodTotalSamples = status.lodTotalSamples {
+                lines.append(
+                    "LOD: \(lodCompletedChunks)/\(lodTotalChunks) SAMPLES \(lodCompletedSamples)/\(lodTotalSamples)"
+                )
+            } else {
+                lines.append("LOD: \(lodCompletedChunks)/\(lodTotalChunks)")
+            }
         }
         lines.append(contentsOf: [
             "CHUNKS: \(status.generatedChunks)/\(status.totalTargetChunks)",
-            "GEN: \(status.inFlightGenerationChunks) MESH: \(status.inFlightMeshChunks)",
+            "GEN: \(status.inFlightGenerationChunks) LODGEN: \(status.inFlightLodBuildChunks) MESH: \(status.inFlightMeshChunks)",
             "DIRTY: \(status.dirtyMeshChunks) DRAWN: \(chunkMeshes.count)"
         ])
+        return lines
+    }
+
+    private func preparationStatusLines(
+        prefix: String,
+        status: CinematicPreparationStatus
+    ) -> [String] {
+        var lines: [String] = []
+        if let lodCompletedChunks = status.lodCompletedChunks,
+           let lodTotalChunks = status.lodTotalChunks {
+            if let lodCompletedSamples = status.lodCompletedSamples,
+               let lodTotalSamples = status.lodTotalSamples {
+                lines.append(
+                    "\(prefix): LOD \(lodCompletedChunks)/\(lodTotalChunks) SAMPLES \(lodCompletedSamples)/\(lodTotalSamples)"
+                )
+            } else {
+                lines.append("\(prefix): LOD \(lodCompletedChunks)/\(lodTotalChunks)")
+            }
+            lines.append(
+                "BUILD: READY \(status.readyChunks)/\(status.totalChunks) GEN \(status.generatingChunks) LOD \(status.lodBuildingChunks) MESH \(status.meshingChunks)"
+            )
+            return lines
+        }
+
+        lines.append("\(prefix): \(status.readyChunks)/\(status.totalChunks) READY")
+        lines.append(
+            "BUILD: GEN \(status.generatingChunks) LOD \(status.lodBuildingChunks) MESH \(status.meshingChunks)"
+        )
         return lines
     }
 

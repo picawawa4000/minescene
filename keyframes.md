@@ -25,6 +25,7 @@ The following program attributes along with their values are supported:
 * `LOD-STEP-DISTANCE`: an integer representing the number of chunks between levels of distance. Equivalent to the `video.terrainLodStepDistance` setting. Must be >0.
 * `MOTION-SPEED`: a real representing the motion speed in blocks per second. Must be >0. Defaults to 1.
 * `SPIN-SPEED`: a real representing the base rotation speed in degrees per second (unit of measure subject to change based on technical demands). Only used for spin keyframes. Must be >0. Defaults to 10.
+* `SURFACE-ONLY`: a boolean representing whether only the surface should be rendered. Defaults to false.
 
 It is not required to express any program attributes.
 
@@ -44,6 +45,15 @@ The seed is the seed that the scene is to be rendered on. It must be a valid see
 The position is the base position in the world (the "scene anchor"). Keyframes are expressed relative to this position.
 
 Scene attribues are currently the same as program attributes. They override program attributes where possible. If a given attribute is not expressed in either the program or scene header and has no default, an error is thrown. It is not required to express any scene attributes.
+
+The following shorthand is also supported:
+
+```text
+SCENE <index> WAYPOINT <waypoint> [OFFSET <delta-x> <delta-y> <delta-z>] [WITH <scene-attribute> <value>] ...
+[KEYFRAME-LIST]
+```
+
+This is the same as the above header format, except the seed and position are to be loaded from the given waypoint. The offset is from the origin specified in the waypoint.
 
 The body of a scene consists of keyframes. It is illegal for a scene to have no keyframes. There are different kinds of keyframes, such as position keyframes or spin keyframes, and each one represents an instruction to the renderer.
 

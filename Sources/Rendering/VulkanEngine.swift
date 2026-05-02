@@ -85,6 +85,15 @@ final class VulkanEngine {
         }
     }
 
+    @inline(__always)
+    private static func packRGBA8(_ color: SIMD4<Float>) -> UInt32 {
+        let r = UInt32(clamping: Int((max(0, min(1, color.x)) * 255).rounded()))
+        let g = UInt32(clamping: Int((max(0, min(1, color.y)) * 255).rounded()))
+        let b = UInt32(clamping: Int((max(0, min(1, color.z)) * 255).rounded()))
+        let a = UInt32(clamping: Int((max(0, min(1, color.w)) * 255).rounded()))
+        return r | (g << 8) | (b << 16) | (a << 24)
+    }
+
     deinit {
         shutdown()
     }
@@ -109,8 +118,17 @@ final class VulkanEngine {
     }
 
     struct Vertex3D {
-        var position: SIMD3<Float>
-        var color: SIMD4<Float>
+        var x: Float
+        var y: Float
+        var z: Float
+        var color: UInt32
+
+        init(position: SIMD3<Float>, color: SIMD4<Float>) {
+            self.x = position.x
+            self.y = position.y
+            self.z = position.z
+            self.color = VulkanEngine.packRGBA8(color)
+        }
     }
 
     struct DrawBatch2D {
@@ -1392,7 +1410,7 @@ final class VulkanEngine {
             stride: UInt32(MemoryLayout<Vertex3D>.stride),
             inputRate: VK_VERTEX_INPUT_RATE_VERTEX
         )
-        let positionOffset = UInt32(MemoryLayout<Vertex3D>.offset(of: \.position) ?? 0)
+        let positionOffset: UInt32 = 0
         let colorOffset = UInt32(MemoryLayout<Vertex3D>.offset(of: \.color) ?? 0)
         let attributes = [
             VkVertexInputAttributeDescription(
@@ -1404,7 +1422,7 @@ final class VulkanEngine {
             VkVertexInputAttributeDescription(
                 location: 1,
                 binding: 0,
-                format: VK_FORMAT_R32G32B32A32_SFLOAT,
+                format: VK_FORMAT_R8G8B8A8_UNORM,
                 offset: colorOffset
             )
         ]

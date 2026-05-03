@@ -323,7 +323,7 @@ final class MineSceneApp {
         let surface = try createVulkanSurface(from: window, instance: instance)
         self.surface = surface
 
-        let seed: Int64 = 8608000014473684604
+        let seed: Int64 = 8500081009970950196
         Self.logStartupStep("loading persisted settings")
         Self.loadSettingsFromDisk(settingsByName: settings.byName)
         self.currentWorldSeed = seed

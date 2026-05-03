@@ -28,7 +28,15 @@ func simd_length_squared(_ vector: SIMD3<Float>) -> Float {
     simd_dot(vector, vector)
 }
 
+func simd_length_squared(_ vector: SIMD3<Double>) -> Double {
+    simd_dot(vector, vector)
+}
+
 func simd_length(_ vector: SIMD3<Float>) -> Float {
+    sqrt(simd_length_squared(vector))
+}
+
+func simd_length(_ vector: SIMD3<Double>) -> Double {
     sqrt(simd_length_squared(vector))
 }
 
@@ -51,4 +59,9 @@ func simd_cross(_ lhs: SIMD3<Float>, _ rhs: SIMD3<Float>) -> SIMD3<Float> {
 func simd_dot(_ lhs: SIMD3<Float>, _ rhs: SIMD3<Float>) -> Float {
     lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z
 }
+
+func simd_dot(_ lhs: SIMD3<Double>, _ rhs: SIMD3<Double>) -> Double {
+    lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z
+}
+
 #endif

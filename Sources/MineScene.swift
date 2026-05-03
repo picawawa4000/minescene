@@ -55,6 +55,17 @@ final class MineSceneApp {
         set <setting> <value>: set a value immediately.
         help [setting]: list settings, or show one setting's description and default.
         """
+
+        static let keyframe = """
+        Usage: /keyframe <subcommand>
+        list: print all keyframes with ID, position, and rotation.
+        play: move to the first keyframe, preload all needed chunks, and play the animation.
+        remove <id>: remove one keyframe by array index.
+        speed [blocks-per-second]: get or set constant playback speed.
+        export: render the current keyframe path to an mp4 in the animations directory.
+        program run <name>: render a .kfp program from the programs directory into one mp4.
+        show|hide: show or hide keyframe markers and the spline path overlay.
+        """
     }
 
     private enum ActiveRenderer {
@@ -65,6 +76,78 @@ final class MineSceneApp {
     private struct Waypoint {
         let position: SIMD3<Double>
         let seed: Int64
+    }
+
+    private struct TerrainRendererStateSnapshot {
+        let cameraPosition: SIMD3<Double>
+        let cameraYaw: Float
+        let cameraPitch: Float
+        let smoothedFps: Float
+        let keyframes: [TerrainRenderer.Keyframe]
+        let showsKeyframes: Bool
+        let keyframePlaybackSpeed: Double
+        let renderDistance: Int
+        let surfaceOnly: Bool
+    }
+
+    private enum CinematicExportSceneSource {
+        case prebuilt(path: TerrainRenderer.CinematicPath)
+        case program(scene: CompiledKeyframeProgram.Scene)
+    }
+
+    private struct CinematicExportScenePlan {
+        let label: String
+        let sceneNumber: Int?
+        let seed: Int64
+        let renderDistance: Int
+        let lodNearDistance: Int
+        let lodStepDistance: Int
+        let maxSampleStride: Int
+        let surfaceOnly: Bool
+        var source: CinematicExportSceneSource?
+    }
+
+    private struct ActiveCinematicExportScene {
+        let label: String
+        let sceneNumber: Int?
+        let seed: Int64
+        let renderDistance: Int
+        let lodNearDistance: Int
+        let lodStepDistance: Int
+        let maxSampleStride: Int
+        let surfaceOnly: Bool
+        let path: TerrainRenderer.CinematicPath
+        let pinnedChunkSquares: [TerrainRenderer.PinnedChunkSquare]
+        let totalPinnedChunks: Int
+        let frameCount: Int
+
+        var initialSample: TerrainRenderer.CinematicPathSample {
+            path.samples[0]
+        }
+    }
+
+    private struct CinematicExportSnapshot {
+        let originalSeed: Int64
+        let originalNoiseSettingsKey: RegistryKey<NoiseSettings>
+        let rendererSnapshot: TerrainRendererStateSnapshot
+    }
+
+    private enum CinematicExportPhase {
+        case preparing(initialized: Bool)
+        case rendering(frameIndex: Int)
+    }
+
+    private struct CinematicExportSession {
+        let outputURL: URL
+        let frameRate: Int
+        var currentScenePlan: CinematicExportScenePlan
+        var remainingScenePlans: ArraySlice<CinematicExportScenePlan>
+        let snapshot: CinematicExportSnapshot
+        var activeScene: ActiveCinematicExportScene?
+        var phase: CinematicExportPhase
+        var writer: AnimationVideoWriter?
+        var renderedFrameCount = 0
+        var lastPreparationReadyCount = -1
     }
 
     private enum CommandError: Error, CustomStringConvertible {
@@ -80,6 +163,7 @@ final class MineSceneApp {
         case invalidWaypointFile(line: Int, reason: String)
         case colormapFileReadFailed(String)
         case invalidColormapFile(line: Int, reason: String)
+        case exportFailed(String)
 
         var description: String {
             switch self {
@@ -107,6 +191,8 @@ final class MineSceneApp {
                 return "failed to read colormap file '\(name)'"
             case .invalidColormapFile(let line, let reason):
                 return "invalid colormap file at line \(line): \(reason)"
+            case .exportFailed(let reason):
+                return "failed to export animation: \(reason)"
             }
         }
     }
@@ -142,9 +228,14 @@ final class MineSceneApp {
     private var biomeMapRenderer: BiomeMapViewRenderer?
     private var imageAvailable: VulkanOwnedSemaphore?
     private var renderFinishedByImage: [VulkanOwnedSemaphore] = []
+    private var renderFinishedSemaphores: [VkSemaphore] = []
     private var biomeColorPalette = BiomeColorPalette.defaultPalette()
     private let defaultNoiseSettingsKey = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
     private let renderDistanceSetting: Setting<IntSettingValue>
+    private let terrainLodNearDistanceSetting: Setting<IntSettingValue>
+    private let terrainLodStepDistanceSetting: Setting<IntSettingValue>
+    private let terrainLodMaxScaleSetting: Setting<IntSettingValue>
+    private let surfaceOnlySetting: Setting<BoolSettingValue>
     private let keybindSettings: [KeybindAction: Setting<KeybindSettingValue>]
     private let settingsByName: [String: any SettingProtocol]
     private var dataPacks: [DataPack] = []
@@ -153,6 +244,7 @@ final class MineSceneApp {
     private var currentBiomeDimensionKey = RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld")
     private var waypoints: [String: Waypoint] = [:]
     private var activeRenderer: ActiveRenderer = .terrain
+    private var cinematicExportSession: CinematicExportSession?
 
     deinit {
         tearDownRuntime()
@@ -162,6 +254,10 @@ final class MineSceneApp {
         Self.logStartupStep("initializing settings")
         let settings = Self.makeSettings()
         self.renderDistanceSetting = settings.renderDistance
+        self.terrainLodNearDistanceSetting = settings.terrainLodNearDistance
+        self.terrainLodStepDistanceSetting = settings.terrainLodStepDistance
+        self.terrainLodMaxScaleSetting = settings.terrainLodMaxScale
+        self.surfaceOnlySetting = settings.surfaceOnly
         self.keybindSettings = settings.keybinds
         self.settingsByName = settings.byName
 
@@ -267,6 +363,7 @@ final class MineSceneApp {
             self.renderFinishedByImage = try engine.swapchainImages.map { _ in
                 try engine.device.createSemaphore()
             }
+            self.renderFinishedSemaphores = renderFinishedByImage.map(\.semaphore)
         } catch {
             Self.logStartupError("creating synchronization primitives", error: error)
             throw error
@@ -371,7 +468,10 @@ final class MineSceneApp {
                 case .keyDown:
                     if !event.key.repeat,
                        keyMatches(event.key.key, action: .toggleBiomeMap),
-                       (activeRenderer == .biomeMap || terrainRenderer?.isCommandPromptActive != true) {
+                       (
+                           activeRenderer == .biomeMap ||
+                           (terrainRenderer?.isCommandPromptActive != true && terrainRenderer?.isCinematicActive != true)
+                       ) {
                         toggleRendererMode()
                         continue
                     }
@@ -391,6 +491,7 @@ final class MineSceneApp {
             let deltaTime = Float(nowNs - previousTickNs) / 1_000_000_000.0
             previousTickNs = nowNs
             updateRenderer(deltaTime: deltaTime)
+            try updateCinematicExportIfNeeded()
 
             try renderFrame()
             SDL_Delay(16)
@@ -410,10 +511,12 @@ final class MineSceneApp {
     }
 
     private func tearDownRuntime() {
+        terrainRenderer?.shutdownStreaming()
         terrainRenderer = nil
         biomeMapRenderer = nil
         imageAvailable = nil
         renderFinishedByImage.removeAll()
+        renderFinishedSemaphores.removeAll()
         engine?.shutdown()
         engine = nil
         worldGenerator = nil
@@ -435,17 +538,30 @@ final class MineSceneApp {
     }
 
     private func renderFrame() throws {
-        guard let engine, let imageAvailable, !renderFinishedByImage.isEmpty else {
+        guard let engine, let imageAvailable, !renderFinishedSemaphores.isEmpty else {
             return
+        }
+        if let session = cinematicExportSession {
+            switch session.phase {
+            case .rendering:
+                try renderCinematicExportFrame(
+                    engine: engine,
+                    imageAvailable: imageAvailable,
+                    renderFinishedSemaphores: renderFinishedSemaphores
+                )
+                return
+            case .preparing:
+                break
+            }
         }
         switch activeRenderer {
         case .terrain:
             guard let terrainRenderer else { return }
-            try terrainRenderer.render(
+            _ = try terrainRenderer.render(
                 engine: engine,
                 window: window?.pointer,
                 imageAvailable: imageAvailable.semaphore,
-                renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
+                renderFinishedByImage: renderFinishedSemaphores
             )
         case .biomeMap:
             guard let biomeMapRenderer else { return }
@@ -453,7 +569,7 @@ final class MineSceneApp {
                 engine: engine,
                 window: window?.pointer,
                 imageAvailable: imageAvailable.semaphore,
-                renderFinishedByImage: renderFinishedByImage.map(\.semaphore)
+                renderFinishedByImage: renderFinishedSemaphores
             )
         }
     }
@@ -478,6 +594,10 @@ final class MineSceneApp {
 
     private static func makeSettings() -> (
         renderDistance: Setting<IntSettingValue>,
+        terrainLodNearDistance: Setting<IntSettingValue>,
+        terrainLodStepDistance: Setting<IntSettingValue>,
+        terrainLodMaxScale: Setting<IntSettingValue>,
+        surfaceOnly: Setting<BoolSettingValue>,
         keybinds: [KeybindAction: Setting<KeybindSettingValue>],
         byName: [String: any SettingProtocol]
     ) {
@@ -488,6 +608,40 @@ final class MineSceneApp {
             validator: { value in
                 value.value >= 0 ? nil : "must be zero or greater"
             }
+        )
+        let terrainLodNearDistanceSetting = Setting(
+            name: "video.terrainLodNearDistance",
+            summary: "Distance in blocks before terrain starts using coarse sampling.",
+            defaultValue: IntSettingValue(value: 128),
+            validator: { value in
+                value.value >= 0 ? nil : "must be zero or greater"
+            }
+        )
+        let terrainLodStepDistanceSetting = Setting(
+            name: "video.terrainLodStepDistance",
+            summary: "Distance in blocks between each terrain LOD scale increase.",
+            defaultValue: IntSettingValue(value: 128),
+            validator: { value in
+                value.value > 0 ? nil : "must be greater than zero"
+            }
+        )
+        let terrainLodMaxScaleSetting = Setting(
+            name: "video.terrainLodMaxScale",
+            summary: "Maximum terrain LOD block scale. Supported values: 1, 2, 4, 8, 16.",
+            defaultValue: IntSettingValue(value: 8),
+            validator: { value in
+                switch value.value {
+                case 1, 2, 4, 8, 16:
+                    return nil
+                default:
+                    return "must be one of 1, 2, 4, 8, or 16"
+                }
+            }
+        )
+        let surfaceOnlySetting = Setting(
+            name: "video.surfaceOnly",
+            summary: "Render a surface heightfield using DPReader's sampleSurfaceLOD path.",
+            defaultValue: BoolSettingValue(value: false)
         )
 
         var keybindSettings: [KeybindAction: Setting<KeybindSettingValue>] = [:]
@@ -500,7 +654,11 @@ final class MineSceneApp {
         }
 
         var settingsByName: [String: any SettingProtocol] = [
-            renderDistanceSetting.name: renderDistanceSetting
+            renderDistanceSetting.name: renderDistanceSetting,
+            terrainLodNearDistanceSetting.name: terrainLodNearDistanceSetting,
+            terrainLodStepDistanceSetting.name: terrainLodStepDistanceSetting,
+            terrainLodMaxScaleSetting.name: terrainLodMaxScaleSetting,
+            surfaceOnlySetting.name: surfaceOnlySetting
         ]
         for setting in keybindSettings.values {
             settingsByName[setting.name] = setting
@@ -508,6 +666,10 @@ final class MineSceneApp {
 
         return (
             renderDistance: renderDistanceSetting,
+            terrainLodNearDistance: terrainLodNearDistanceSetting,
+            terrainLodStepDistance: terrainLodStepDistanceSetting,
+            terrainLodMaxScale: terrainLodMaxScaleSetting,
+            surfaceOnly: surfaceOnlySetting,
             keybinds: keybindSettings,
             byName: settingsByName
         )
@@ -524,11 +686,15 @@ final class MineSceneApp {
         )
     }
 
-    private func makeTerrainRenderer(worldGenerator: WorldGenerator) -> TerrainRenderer {
+    private func makeTerrainRenderer(worldGenerator: WorldGenerator, surfaceOnlyOverride: Bool? = nil) -> TerrainRenderer {
         let renderer = TerrainRenderer(
             worldGenerator: worldGenerator,
             biomeColorPalette: biomeColorPalette,
-            renderRadius: renderDistanceSetting.value.value
+            renderRadius: renderDistanceSetting.value.value,
+            terrainLodNearDistance: terrainLodNearDistanceSetting.value.value,
+            terrainLodStepDistance: terrainLodStepDistanceSetting.value.value,
+            terrainLodMaxScale: terrainLodMaxScaleSetting.value.value,
+            surfaceOnly: surfaceOnlyOverride ?? surfaceOnlySetting.value.value
         )
         renderer.externalCommandExecutor = { [weak self] commandName, arguments, terrainRenderer in
             guard let self else {
@@ -549,6 +715,48 @@ final class MineSceneApp {
         return renderer
     }
 
+    private func rebuildWorldGeneratorAndTerrainRenderer(
+        seed: Int64,
+        noiseSettingsKey: RegistryKey<NoiseSettings>,
+        preserveKeyframes: Bool,
+        surfaceOnlyOverride: Bool? = nil,
+        carryChunkMeshes: Bool = false
+    ) throws {
+        let newWorldGenerator = try makeWorldGenerator(seed: seed, noiseSettingsKey: noiseSettingsKey)
+        waitForGpuToFinishCurrentFrame()
+
+        var transferredChunkMeshes: [TerrainRenderer.ChunkCoord: TerrainRenderer.ChunkRenderMesh] = [:]
+        if carryChunkMeshes, let terrainRenderer {
+            transferredChunkMeshes = terrainRenderer.takeChunkMeshes()
+        } else {
+            terrainRenderer?.discardChunkMeshes()
+        }
+        biomeMapRenderer?.discardData()
+
+        worldGenerator = newWorldGenerator
+        currentWorldSeed = seed
+        currentNoiseSettingsKey = noiseSettingsKey
+        currentBiomeDimensionKey = biomeDimensionKey(for: noiseSettingsKey)
+        replaceTerrainRenderer(
+            worldGenerator: newWorldGenerator,
+            preserveKeyframes: preserveKeyframes,
+            surfaceOnlyOverride: surfaceOnlyOverride
+        )
+        if !transferredChunkMeshes.isEmpty {
+            terrainRenderer?.replaceChunkMeshes(with: transferredChunkMeshes)
+        }
+
+        if activeRenderer == .biomeMap, let terrainRenderer {
+            let biomeMapRenderer = BiomeMapViewRenderer(
+                worldGenerator: newWorldGenerator,
+                biomeColorPalette: biomeColorPalette
+            )
+            biomeMapRenderer.dimensionKey = currentBiomeDimensionKey
+            biomeMapRenderer.recenter(on: terrainRenderer.currentCameraPosition)
+            self.biomeMapRenderer = biomeMapRenderer
+        }
+    }
+
     private func handleTerrainCommand(
         commandName: String,
         arguments: String,
@@ -565,6 +773,7 @@ final class MineSceneApp {
                     "/seed <subcommand>: view or change the world seed.",
                     "/dimension <subcommand>: view or change the active worldgen noise settings.",
                     "/waypoint <subcommand>: manage saved waypoints.",
+                    "/keyframe <subcommand>: manage cinematic keyframes.",
                     "/colormap <file>: load a biome colormap file.",
                     "/setting <subcommand>: view or change settings."
                 ], renderer: renderer)
@@ -719,6 +928,67 @@ final class MineSceneApp {
                 throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
             }
             return true
+        case "keyframe":
+            var parser = TerrainRendererCommandArgumentParser(arguments)
+            let subcommand = try parser.getNextString()
+            switch subcommand {
+            case "list":
+                try parser.end()
+                if renderer.keyframes.isEmpty {
+                    renderer.logCommandMessage("No keyframes saved.")
+                } else {
+                    for (id, keyframe) in renderer.keyframes.enumerated() {
+                        renderer.logCommandMessage(renderer.formatKeyframeDescription(id: id, keyframe: keyframe))
+                    }
+                }
+            case "play":
+                try parser.end()
+                try renderer.startKeyframePlayback()
+            case "remove":
+                let id = try parser.getNextInt()
+                try parser.end()
+                let removedKeyframe = try renderer.removeKeyframe(id: id)
+                renderer.logCommandMessage(
+                    "Removed keyframe \(id) at \(renderer.formatCommandPosition(removedKeyframe.position))."
+                )
+            case "show":
+                try parser.end()
+                renderer.showsKeyframes = true
+                renderer.logCommandMessage("Showing keyframes and cinematic path.")
+            case "hide":
+                try parser.end()
+                renderer.showsKeyframes = false
+                renderer.logCommandMessage("Hiding keyframes and cinematic path.")
+            case "speed":
+                if parser.remainingCount == 0 {
+                    try parser.end()
+                    renderer.logCommandMessage("Keyframe speed is \(renderer.formatPlaybackSpeed(renderer.keyframePlaybackSpeed)).")
+                } else {
+                    let speed = try parser.getNextDouble()
+                    try parser.end()
+                    guard speed > 0 else {
+                        throw TerrainRendererCommandParseError.invalidArguments("speed must be greater than zero")
+                    }
+                    renderer.setKeyframePlaybackSpeed(speed)
+                    renderer.logCommandMessage("Set keyframe speed to \(renderer.formatPlaybackSpeed(renderer.keyframePlaybackSpeed)).")
+                }
+            case "export":
+                try parser.end()
+                try startKeyframeExport(renderer: renderer)
+            case "program":
+                let programSubcommand = try parser.getNextString()
+                switch programSubcommand {
+                case "run":
+                    let programName = try parser.getNextLocalFilepath()
+                    try parser.end()
+                    try startKeyframeProgramRun(named: programName)
+                default:
+                    throw CommandError.unknownSubcommand(command: "keyframe program", subcommand: programSubcommand)
+                }
+            default:
+                throw CommandError.unknownSubcommand(command: commandName, subcommand: subcommand)
+            }
+            return true
         case "colormap":
             var parser = TerrainRendererCommandArgumentParser(arguments)
             let filepath = try parser.getNextLocalFilepath()
@@ -774,27 +1044,11 @@ final class MineSceneApp {
         seed: Int64,
         noiseSettingsKey: RegistryKey<NoiseSettings>
     ) throws {
-        let newWorldGenerator = try makeWorldGenerator(seed: seed, noiseSettingsKey: noiseSettingsKey)
-        waitForGpuToFinishCurrentFrame()
-
-        terrainRenderer?.discardChunkMeshes()
-        biomeMapRenderer?.discardData()
-
-        worldGenerator = newWorldGenerator
-        currentWorldSeed = seed
-        currentNoiseSettingsKey = noiseSettingsKey
-        currentBiomeDimensionKey = biomeDimensionKey(for: noiseSettingsKey)
-        replaceTerrainRenderer(worldGenerator: newWorldGenerator)
-
-        if activeRenderer == .biomeMap, let terrainRenderer {
-            let biomeMapRenderer = BiomeMapViewRenderer(
-                worldGenerator: newWorldGenerator,
-                biomeColorPalette: biomeColorPalette
-            )
-            biomeMapRenderer.dimensionKey = currentBiomeDimensionKey
-            biomeMapRenderer.recenter(on: terrainRenderer.currentCameraPosition)
-            self.biomeMapRenderer = biomeMapRenderer
-        }
+        try rebuildWorldGeneratorAndTerrainRenderer(
+            seed: seed,
+            noiseSettingsKey: noiseSettingsKey,
+            preserveKeyframes: false
+        )
     }
 
     private func copyTextToClipboard(_ text: String) throws {
@@ -851,6 +1105,8 @@ final class MineSceneApp {
             return CommandHelp.dimension.split(separator: "\n").map(String.init)
         case "waypoint":
             return CommandHelp.waypoint.split(separator: "\n").map(String.init)
+        case "keyframe":
+            return CommandHelp.keyframe.split(separator: "\n").map(String.init)
         case "colormap":
             return CommandHelp.colormap.split(separator: "\n").map(String.init)
         case "setting":
@@ -884,11 +1140,376 @@ final class MineSceneApp {
     private func applyRuntimeSettingIfNeeded(named name: String) {
         if name == renderDistanceSetting.name {
             terrainRenderer?.setRenderRadius(renderDistanceSetting.value.value)
+            return
+        }
+        if name == surfaceOnlySetting.name {
+            guard let worldGenerator else {
+                return
+            }
+            replaceTerrainRenderer(worldGenerator: worldGenerator, preserveKeyframes: true)
+            return
+        }
+        if name == terrainLodNearDistanceSetting.name ||
+            name == terrainLodStepDistanceSetting.name ||
+            name == terrainLodMaxScaleSetting.name {
+            terrainRenderer?.setTerrainLodSettings(
+                nearDistance: terrainLodNearDistanceSetting.value.value,
+                stepDistance: terrainLodStepDistanceSetting.value.value,
+                maxSampleStride: terrainLodMaxScaleSetting.value.value
+            )
         }
     }
 
     private func updateRenderDistanceSetting(_ renderDistance: Int) {
         try? renderDistanceSetting.setValue(from: String(renderDistance))
+    }
+
+    private func startKeyframeExport(renderer: TerrainRenderer) throws {
+        guard cinematicExportSession == nil else {
+            throw CommandError.exportFailed("another cinematic export is already in progress")
+        }
+
+        let preparation = try renderer.currentCinematicPreparationPlan()
+        let frameRate = 60
+        let scenePlan = CinematicExportScenePlan(
+            label: "animation",
+            sceneNumber: nil,
+            seed: currentWorldSeed,
+            renderDistance: renderer.currentRenderRadius(),
+            lodNearDistance: terrainLodNearDistanceSetting.value.value,
+            lodStepDistance: terrainLodStepDistanceSetting.value.value,
+            maxSampleStride: terrainLodMaxScaleSetting.value.value,
+            surfaceOnly: renderer.surfaceOnly,
+            source: .prebuilt(path: preparation.path)
+        )
+        let activeScene = ActiveCinematicExportScene(
+            label: scenePlan.label,
+            sceneNumber: scenePlan.sceneNumber,
+            seed: scenePlan.seed,
+            renderDistance: scenePlan.renderDistance,
+            lodNearDistance: scenePlan.lodNearDistance,
+            lodStepDistance: scenePlan.lodStepDistance,
+            maxSampleStride: scenePlan.maxSampleStride,
+            surfaceOnly: scenePlan.surfaceOnly,
+            path: preparation.path,
+            pinnedChunkSquares: preparation.pinnedChunkSquares,
+            totalPinnedChunks: preparation.totalPinnedChunks,
+            frameCount: frameCount(for: preparation.path, frameRate: frameRate)
+        )
+
+        let outputURL = try animationFileURLForCurrentTime()
+        cinematicExportSession = CinematicExportSession(
+            outputURL: outputURL,
+            frameRate: frameRate,
+            currentScenePlan: scenePlan,
+            remainingScenePlans: [],
+            snapshot: CinematicExportSnapshot(
+                originalSeed: currentWorldSeed,
+                originalNoiseSettingsKey: currentNoiseSettingsKey,
+                rendererSnapshot: snapshotRendererState(renderer)
+            ),
+            activeScene: activeScene,
+            phase: .preparing(initialized: false)
+        )
+        renderer.logCommandMessage(
+            "Started animation export to \(outputURL.path). Preparing \(activeScene.totalPinnedChunks) chunks at \(renderer.formatPlaybackSpeed(renderer.keyframePlaybackSpeed))."
+        )
+    }
+
+    private func startKeyframeProgramRun(named localPath: String) throws {
+        guard let renderer = terrainRenderer else {
+            throw CommandError.exportFailed("renderer is not ready")
+        }
+        guard cinematicExportSession == nil else {
+            throw CommandError.exportFailed("another cinematic export is already in progress")
+        }
+
+        let fileURL = try keyframeProgramFileURL(for: localPath)
+        let displayName = keyframeProgramFileDisplayName(for: localPath)
+        let program = try KeyframeProgramLoader.load(from: fileURL, displayName: displayName)
+        let compiledProgram = try KeyframeProgramCompiler.compile(program) { [waypoints] scene in
+            switch scene.location {
+            case .absolute(let seed, let anchor):
+                return (seed, anchor)
+            case .waypoint(let name, let offset):
+                guard let waypoint = waypoints[name] else {
+                    throw KeyframeProgramError.unknownWaypoint(name, line: scene.line)
+                }
+                return (waypoint.seed, waypoint.position + offset)
+            }
+        }
+
+        let outputURL = try keyframeProgramAnimationFileURL(programName: localPath)
+        let frameRate = 60
+        let scenePlans = compiledProgram.scenes.map { scene -> CinematicExportScenePlan in
+            let lodNearDistanceBlocks = scene.settings.lodNearDistance * ProtoChunk.sideLength
+            let lodStepDistanceBlocks = scene.settings.lodStepDistance * ProtoChunk.sideLength
+            return CinematicExportScenePlan(
+                label: "scene \(scene.index)",
+                sceneNumber: scene.index,
+                seed: scene.seed,
+                renderDistance: scene.settings.renderDistance,
+                lodNearDistance: lodNearDistanceBlocks,
+                lodStepDistance: lodStepDistanceBlocks,
+                maxSampleStride: terrainLodMaxScaleSetting.value.value,
+                surfaceOnly: scene.settings.surfaceOnly,
+                source: .program(scene: scene)
+            )
+        }
+        guard let firstScenePlan = scenePlans.first else {
+            throw CommandError.exportFailed("keyframe program did not produce any scenes")
+        }
+
+        cinematicExportSession = CinematicExportSession(
+            outputURL: outputURL,
+            frameRate: frameRate,
+            currentScenePlan: firstScenePlan,
+            remainingScenePlans: scenePlans.dropFirst(),
+            snapshot: CinematicExportSnapshot(
+                originalSeed: currentWorldSeed,
+                originalNoiseSettingsKey: currentNoiseSettingsKey,
+                rendererSnapshot: snapshotRendererState(renderer)
+            ),
+            activeScene: nil,
+            phase: .preparing(initialized: false)
+        )
+        renderer.logCommandMessage("Started keyframe program export to \(outputURL.path).")
+    }
+
+    private func updateCinematicExportIfNeeded() throws {
+        guard var session = cinematicExportSession else {
+            return
+        }
+
+        switch session.phase {
+        case .preparing(let initialized):
+            if !initialized {
+                try initializeCinematicExportScene(session: &session)
+                session.phase = .preparing(initialized: true)
+                cinematicExportSession = session
+                return
+            }
+
+            guard let renderer = terrainRenderer else {
+                throw CommandError.exportFailed("renderer is not ready")
+            }
+            guard let scene = session.activeScene else {
+                throw CommandError.exportFailed("active export scene is not ready")
+            }
+            let status = renderer.streamer.pinnedChunkPreparationStatus()
+            if let sceneNumber = scene.sceneNumber {
+                renderer.programScenePreparationStatus = TerrainRenderer.ProgramScenePreparationStatus(
+                    sceneIndex: sceneNumber,
+                    preparation: status
+                )
+            }
+
+            if status.readyChunks == status.totalChunks {
+                renderer.programScenePreparationStatus = nil
+                renderer.suspendStreamingUpdates = true
+                renderer.discardChunkStateKeepingMeshes()
+                renderer.streamer.setPinnedChunkSquares([])
+                renderer.logCommandMessage("Starting \(scene.label) export.")
+                session.lastPreparationReadyCount = -1
+                session.phase = .rendering(frameIndex: 0)
+            } else if status.readyChunks != session.lastPreparationReadyCount {
+/*
+                if let sceneNumber = scene.sceneNumber {
+                    renderer.logCommandMessage(
+                        "Scene \(sceneNumber) prep: \(status.readyChunks)/\(status.totalChunks) ready, gen \(status.generatingChunks), mesh \(status.meshingChunks)."
+                    )
+                } else {
+                    renderer.logCommandMessage(
+                        "Export prep: \(status.readyChunks)/\(status.totalChunks) ready, gen \(status.generatingChunks), mesh \(status.meshingChunks)."
+                    )
+                }
+*/
+                session.lastPreparationReadyCount = status.readyChunks
+            }
+
+            cinematicExportSession = session
+        case .rendering:
+            break
+        }
+    }
+
+    private func initializeCinematicExportScene(session: inout CinematicExportSession) throws {
+        guard let renderer = terrainRenderer else {
+            throw CommandError.exportFailed("renderer is not ready")
+        }
+        if session.activeScene == nil {
+            session.activeScene = try makeActiveCinematicExportScene(
+                from: session.currentScenePlan,
+                renderer: renderer,
+                frameRate: session.frameRate
+            )
+            session.currentScenePlan.source = nil
+        }
+        guard let scene = session.activeScene else {
+            throw CommandError.exportFailed("active export scene is not ready")
+        }
+
+        let exportNoiseSettingsKey = session.snapshot.originalNoiseSettingsKey
+        let worldStateChanged =
+            currentWorldSeed != scene.seed
+            || currentNoiseSettingsKey != exportNoiseSettingsKey
+        if worldStateChanged {
+            try applyWorldGenerationState(
+                seed: scene.seed,
+                noiseSettingsKey: exportNoiseSettingsKey
+            )
+        }
+        if let worldGenerator, !worldStateChanged {
+            waitForGpuToFinishCurrentFrame()
+            terrainRenderer?.discardChunkMeshes()
+            replaceTerrainRenderer(
+                worldGenerator: worldGenerator,
+                preserveKeyframes: true,
+                surfaceOnlyOverride: scene.surfaceOnly
+            )
+        } else if let worldGenerator, terrainRenderer?.surfaceOnly != scene.surfaceOnly {
+            replaceTerrainRenderer(
+                worldGenerator: worldGenerator,
+                preserveKeyframes: false,
+                surfaceOnlyOverride: scene.surfaceOnly
+            )
+        }
+        guard let renderer = terrainRenderer else {
+            throw CommandError.exportFailed("renderer is not ready")
+        }
+
+        renderer.setRenderRadius(scene.renderDistance)
+        renderer.setTerrainLodSettings(
+            nearDistance: scene.lodNearDistance,
+            stepDistance: scene.lodStepDistance,
+            maxSampleStride: scene.maxSampleStride
+        )
+        renderer.resetMovementKeys()
+        renderer.cameraPosition = scene.initialSample.position
+        renderer.cameraYaw = scene.initialSample.yaw
+        renderer.cameraPitch = scene.initialSample.pitch
+        renderer.cinematicPlaybackSession = nil
+        renderer.isRenderingForExport = false
+        renderer.suspendStreamingUpdates = false
+        renderer.programScenePreparationStatus = nil
+        renderer.primeStreamingTargetToCurrentCamera()
+        renderer.streamer.setPinnedChunkSquares(scene.pinnedChunkSquares)
+
+        renderer.logCommandMessage(
+            "Preparing \(scene.label) on seed \(scene.seed) across \(scene.totalPinnedChunks) chunks."
+        )
+    }
+
+    private func makeActiveCinematicExportScene(
+        from scenePlan: CinematicExportScenePlan,
+        renderer: TerrainRenderer,
+        frameRate: Int
+    ) throws -> ActiveCinematicExportScene {
+        let path: TerrainRenderer.CinematicPath
+        guard let source = scenePlan.source else {
+            throw CommandError.exportFailed("scene plan payload is not available")
+        }
+        switch source {
+        case .prebuilt(let prebuiltPath):
+            path = prebuiltPath
+        case .program(let programScene):
+            path = try programScene.makePath(renderer: renderer)
+        }
+        let preparation = try renderer.cinematicPreparationPlan(
+            for: path,
+            renderDistance: scenePlan.renderDistance
+        )
+        return ActiveCinematicExportScene(
+            label: scenePlan.label,
+            sceneNumber: scenePlan.sceneNumber,
+            seed: scenePlan.seed,
+            renderDistance: scenePlan.renderDistance,
+            lodNearDistance: scenePlan.lodNearDistance,
+            lodStepDistance: scenePlan.lodStepDistance,
+            maxSampleStride: scenePlan.maxSampleStride,
+            surfaceOnly: scenePlan.surfaceOnly,
+            path: path,
+            pinnedChunkSquares: preparation.pinnedChunkSquares,
+            totalPinnedChunks: preparation.totalPinnedChunks,
+            frameCount: frameCount(for: path, frameRate: frameRate)
+        )
+    }
+
+    private func renderCinematicExportFrame(
+        engine: VulkanEngine,
+        imageAvailable: VulkanOwnedSemaphore,
+        renderFinishedSemaphores: [VkSemaphore]
+    ) throws {
+        guard var session = cinematicExportSession else {
+            return
+        }
+        guard case .rendering(let frameIndex) = session.phase else {
+            return
+        }
+        guard let renderer = terrainRenderer else {
+            throw CommandError.exportFailed("renderer is not ready")
+        }
+        guard let scene = session.activeScene else {
+            throw CommandError.exportFailed("active export scene is not ready")
+        }
+        let time = min(Double(frameIndex) / Double(session.frameRate), scene.path.totalDuration)
+        let sample = renderer.samplePlaybackPath(scene.path, at: time)
+        renderer.cameraPosition = sample.position
+        renderer.cameraYaw = sample.yaw
+        renderer.cameraPitch = sample.pitch
+        renderer.isRenderingForExport = true
+
+        guard let capturedFrame = try renderer.render(
+            engine: engine,
+            window: window?.pointer,
+            imageAvailable: imageAvailable.semaphore,
+            renderFinishedByImage: renderFinishedSemaphores
+        ) else {
+            throw CommandError.exportFailed("failed to capture frame \(frameIndex) for \(scene.label)")
+        }
+
+        if session.writer == nil {
+            session.writer = try AnimationVideoWriter(
+                outputURL: session.outputURL,
+                width: capturedFrame.width,
+                height: capturedFrame.height,
+                framesPerSecond: session.frameRate
+            )
+        }
+        try session.writer?.appendFrame(capturedFrame, frameIndex: session.renderedFrameCount)
+        session.renderedFrameCount += 1
+
+        let nextFrameIndex = frameIndex + 1
+        if nextFrameIndex < scene.frameCount {
+            session.phase = .rendering(frameIndex: nextFrameIndex)
+            cinematicExportSession = session
+            return
+        }
+
+        renderer.isRenderingForExport = false
+        renderer.suspendStreamingUpdates = false
+        renderer.programScenePreparationStatus = nil
+        session.activeScene = nil
+
+        if let nextScenePlan = session.remainingScenePlans.first {
+            session.currentScenePlan = nextScenePlan
+            session.remainingScenePlans = session.remainingScenePlans.dropFirst()
+            session.phase = .preparing(initialized: false)
+            session.lastPreparationReadyCount = -1
+            cinematicExportSession = session
+            return
+        }
+
+        try session.writer?.finish()
+        renderer.logCommandMessage("Exported animation to \(session.outputURL.path).")
+        renderer.streamer.setPinnedChunkSquares([])
+        let snapshot = session.snapshot
+        cinematicExportSession = nil
+        restoreRendererState(
+            originalSeed: snapshot.originalSeed,
+            originalNoiseSettingsKey: snapshot.originalNoiseSettingsKey,
+            snapshot: snapshot.rendererSnapshot
+        )
     }
 
     private func sortedWaypoints() -> [(name: String, waypoint: Waypoint)] {
@@ -1016,8 +1637,16 @@ final class MineSceneApp {
         Self.appDataDirectoryURL().appendingPathComponent("waypoints", isDirectory: true)
     }
 
+    private func keyframeProgramFilesDirectoryURL() -> URL {
+        Self.appDataDirectoryURL().appendingPathComponent("programs", isDirectory: true)
+    }
+
     private func colormapFilesDirectoryURL() -> URL {
         Self.appDataDirectoryURL().appendingPathComponent("colormaps", isDirectory: true)
+    }
+
+    private func animationFilesDirectoryURL() -> URL {
+        Self.appDataDirectoryURL().appendingPathComponent("animations", isDirectory: true)
     }
 
     private func waypointFileURL(for localPath: String) throws -> URL {
@@ -1040,6 +1669,26 @@ final class MineSceneApp {
         return "\(Self.appDataDirectoryDisplayName())/waypoints/\(normalizedPath)"
     }
 
+    private func keyframeProgramFileURL(for localPath: String) throws -> URL {
+        let normalizedPath: String
+        if localPath.hasSuffix(".kfp") {
+            normalizedPath = localPath
+        } else {
+            normalizedPath = "\(localPath).kfp"
+        }
+        return keyframeProgramFilesDirectoryURL().appendingPathComponent(normalizedPath, isDirectory: false)
+    }
+
+    private func keyframeProgramFileDisplayName(for localPath: String) -> String {
+        let normalizedPath: String
+        if localPath.hasSuffix(".kfp") {
+            normalizedPath = localPath
+        } else {
+            normalizedPath = "\(localPath).kfp"
+        }
+        return "\(Self.appDataDirectoryDisplayName())/programs/\(normalizedPath)"
+    }
+
     private func colormapFileURL(for localPath: String) throws -> URL {
         let normalizedPath: String
         if localPath.hasSuffix(".txt") {
@@ -1058,6 +1707,100 @@ final class MineSceneApp {
             normalizedPath = "\(localPath).txt"
         }
         return "\(Self.appDataDirectoryDisplayName())/colormaps/\(normalizedPath)"
+    }
+
+    private func animationFileURLForCurrentTime() throws -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyy-MM-dd.HH-mm-ss.SSS"
+        let fileName = "\(formatter.string(from: Date())).mp4"
+        let directoryURL = animationFilesDirectoryURL()
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        return directoryURL.appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private func keyframeProgramAnimationFileURL(programName: String) throws -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyy-MM-dd.HH-mm-ss.SSS"
+        let sanitizedProgramName = programName.replacingOccurrences(of: "/", with: "-")
+        let fileName = "\(sanitizedProgramName).\(formatter.string(from: Date())).mp4"
+        let directoryURL = animationFilesDirectoryURL()
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        return directoryURL.appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private func snapshotRendererState(_ renderer: TerrainRenderer) -> TerrainRendererStateSnapshot {
+        TerrainRendererStateSnapshot(
+            cameraPosition: renderer.cameraPosition,
+            cameraYaw: renderer.cameraYaw,
+            cameraPitch: renderer.cameraPitch,
+            smoothedFps: renderer.smoothedFps,
+            keyframes: renderer.keyframes,
+            showsKeyframes: renderer.showsKeyframes,
+            keyframePlaybackSpeed: renderer.keyframePlaybackSpeed,
+            renderDistance: renderer.currentRenderRadius(),
+            surfaceOnly: renderer.surfaceOnly
+        )
+    }
+
+    private func restoreRendererState(
+        originalSeed: Int64,
+        originalNoiseSettingsKey: RegistryKey<NoiseSettings>,
+        snapshot: TerrainRendererStateSnapshot
+    ) {
+        do {
+            let worldStateChanged = currentWorldSeed != originalSeed || currentNoiseSettingsKey != originalNoiseSettingsKey
+            if currentWorldSeed != originalSeed || currentNoiseSettingsKey != originalNoiseSettingsKey {
+                try applyWorldGenerationState(seed: originalSeed, noiseSettingsKey: originalNoiseSettingsKey)
+            }
+            if let worldGenerator, !worldStateChanged {
+                waitForGpuToFinishCurrentFrame()
+                terrainRenderer?.discardChunkMeshes()
+                replaceTerrainRenderer(
+                    worldGenerator: worldGenerator,
+                    preserveKeyframes: true,
+                    surfaceOnlyOverride: snapshot.surfaceOnly
+                )
+            } else if let worldGenerator, terrainRenderer?.surfaceOnly != snapshot.surfaceOnly {
+                replaceTerrainRenderer(
+                    worldGenerator: worldGenerator,
+                    preserveKeyframes: true,
+                    surfaceOnlyOverride: snapshot.surfaceOnly
+                )
+            }
+
+            guard let renderer = terrainRenderer else {
+                return
+            }
+            renderer.cameraPosition = snapshot.cameraPosition
+            renderer.cameraYaw = snapshot.cameraYaw
+            renderer.cameraPitch = snapshot.cameraPitch
+            renderer.smoothedFps = snapshot.smoothedFps
+            renderer.keyframes = snapshot.keyframes
+            renderer.showsKeyframes = snapshot.showsKeyframes
+            renderer.keyframePlaybackSpeed = snapshot.keyframePlaybackSpeed
+            renderer.cinematicPlaybackSession = nil
+            renderer.isRenderingForExport = false
+            renderer.suspendStreamingUpdates = false
+            renderer.programScenePreparationStatus = nil
+            renderer.streamer.setPinnedChunkSquares([])
+            renderer.setRenderRadius(snapshot.renderDistance)
+            renderer.setTerrainLodSettings(
+                nearDistance: terrainLodNearDistanceSetting.value.value,
+                stepDistance: terrainLodStepDistanceSetting.value.value,
+                maxSampleStride: terrainLodMaxScaleSetting.value.value
+            )
+        } catch {
+            terrainRenderer?.logCommandMessage("Failed to restore renderer state after keyframe program run: \(error)", isError: true)
+        }
+    }
+
+    private func frameCount(for path: TerrainRenderer.CinematicPath, frameRate: Int) -> Int {
+        let duration = max(path.totalDuration, 0)
+        return max(1, Int(ceil(duration * Double(frameRate))) + 1)
     }
 
     private func saveWaypoints(to fileURL: URL, displayName: String) throws {
@@ -1180,7 +1923,7 @@ final class MineSceneApp {
         terrainRenderer?.discardChunkMeshes()
         biomeMapRenderer?.discardData()
         biomeColorPalette = palette
-        replaceTerrainRenderer(worldGenerator: worldGenerator)
+        replaceTerrainRenderer(worldGenerator: worldGenerator, preserveKeyframes: true)
 
         if activeRenderer == .biomeMap, let terrainRenderer {
             let biomeMapRenderer = BiomeMapViewRenderer(
@@ -1193,21 +1936,37 @@ final class MineSceneApp {
         }
     }
 
-    private func replaceTerrainRenderer(worldGenerator: WorldGenerator) {
-        let previousCameraPosition = terrainRenderer?.cameraPosition ?? SIMD3<Double>(x: 0, y: 160, z: 0)
-        let previousCameraYaw = terrainRenderer?.cameraYaw ?? -.pi / 4.0
-        let previousCameraPitch = terrainRenderer?.cameraPitch ?? -.pi / 5.5
-        let previousSmoothedFps = terrainRenderer?.smoothedFps ?? 0
-        let previousCommandLogEntries = terrainRenderer?.commandLogEntries ?? []
-        let previousCommandPromptHistory = terrainRenderer?.commandPromptHistory ?? []
+    private func replaceTerrainRenderer(
+        worldGenerator: WorldGenerator,
+        preserveKeyframes: Bool,
+        surfaceOnlyOverride: Bool? = nil
+    ) {
+        let previousRenderer = terrainRenderer
+        let previousCameraPosition = previousRenderer?.cameraPosition ?? SIMD3<Double>(x: 0, y: 160, z: 0)
+        let previousCameraYaw = previousRenderer?.cameraYaw ?? -.pi / 4.0
+        let previousCameraPitch = previousRenderer?.cameraPitch ?? -.pi / 5.5
+        let previousSmoothedFps = previousRenderer?.smoothedFps ?? 0
+        let previousCommandLogEntries = previousRenderer?.commandLogEntries ?? []
+        let previousCommandPromptHistory = previousRenderer?.commandPromptHistory ?? []
+        let previousKeyframes = preserveKeyframes ? (previousRenderer?.keyframes ?? []) : []
+        let previousShowsKeyframes = preserveKeyframes ? (previousRenderer?.showsKeyframes ?? false) : false
+        let previousKeyframePlaybackSpeed = previousRenderer?.keyframePlaybackSpeed ?? 8.0
 
-        let newTerrainRenderer = makeTerrainRenderer(worldGenerator: worldGenerator)
+        previousRenderer?.shutdownStreaming()
+
+        let newTerrainRenderer = makeTerrainRenderer(
+            worldGenerator: worldGenerator,
+            surfaceOnlyOverride: surfaceOnlyOverride
+        )
         newTerrainRenderer.cameraPosition = previousCameraPosition
         newTerrainRenderer.cameraYaw = previousCameraYaw
         newTerrainRenderer.cameraPitch = previousCameraPitch
         newTerrainRenderer.smoothedFps = previousSmoothedFps
         newTerrainRenderer.commandLogEntries = previousCommandLogEntries
         newTerrainRenderer.commandPromptHistory = previousCommandPromptHistory
+        newTerrainRenderer.keyframePlaybackSpeed = previousKeyframePlaybackSpeed
+        newTerrainRenderer.keyframes = previousKeyframes
+        newTerrainRenderer.showsKeyframes = previousShowsKeyframes
         terrainRenderer = newTerrainRenderer
     }
 

@@ -117,6 +117,31 @@ struct IntSettingValue: SettingValueType {
     }
 }
 
+struct BoolSettingValue: SettingValueType {
+    static let typeDescription = "boolean"
+
+    let value: Bool
+
+    static func decode(from string: String) throws -> Self {
+        switch string.lowercased() {
+        case "true", "1", "yes", "on":
+            return BoolSettingValue(value: true)
+        case "false", "0", "no", "off":
+            return BoolSettingValue(value: false)
+        default:
+            throw SettingError.invalidValue(setting: "<unknown>", value: string, reason: "expected boolean")
+        }
+    }
+
+    var encodedString: String {
+        value ? "true" : "false"
+    }
+
+    var displayString: String {
+        encodedString
+    }
+}
+
 struct KeybindSettingValue: SettingValueType {
     static let typeDescription = "key"
 
@@ -213,6 +238,7 @@ enum KeybindAction: CaseIterable {
     case zoom
     case decreaseRenderDistance
     case increaseRenderDistance
+    case addKeyframe
     case openCommandPrompt
     case toggleBiomeMap
     case quitApplication
@@ -239,6 +265,8 @@ enum KeybindAction: CaseIterable {
             return "keybind.decreaseRenderDistance"
         case .increaseRenderDistance:
             return "keybind.increaseRenderDistance"
+        case .addKeyframe:
+            return "keybind.addKeyframe"
         case .openCommandPrompt:
             return "keybind.openCommandPrompt"
         case .toggleBiomeMap:
@@ -270,6 +298,8 @@ enum KeybindAction: CaseIterable {
             return "Key for decreasing render distance."
         case .increaseRenderDistance:
             return "Key for increasing render distance."
+        case .addKeyframe:
+            return "Key for adding a cinematic keyframe at the current camera transform."
         case .openCommandPrompt:
             return "Key for opening the command prompt."
         case .toggleBiomeMap:
@@ -301,6 +331,8 @@ enum KeybindAction: CaseIterable {
             return KeybindSettingValue(keycode: SDLK_LEFTBRACKET)
         case .increaseRenderDistance:
             return KeybindSettingValue(keycode: SDLK_RIGHTBRACKET)
+        case .addKeyframe:
+            return KeybindSettingValue(keycode: SDLK_K)
         case .openCommandPrompt:
             return KeybindSettingValue(keycode: SDLK_SLASH)
         case .toggleBiomeMap:

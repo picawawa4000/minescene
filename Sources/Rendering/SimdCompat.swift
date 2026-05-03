@@ -28,8 +28,12 @@ func simd_length_squared(_ vector: SIMD3<Float>) -> Float {
     simd_dot(vector, vector)
 }
 
+func simd_length(_ vector: SIMD3<Float>) -> Float {
+    sqrt(simd_length_squared(vector))
+}
+
 func simd_normalize(_ vector: SIMD3<Float>) -> SIMD3<Float> {
-    let length = sqrt(simd_length_squared(vector))
+    let length = simd_length(vector)
     guard length > 0 else {
         return .zero
     }
